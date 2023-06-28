@@ -17,6 +17,7 @@ evdev = { version = "0.12", features = ["tokio"] }
 futures = "0.3"
 futures-core = "0.3"
 futures-lite = "1"
+notify = "6.0"
 rkyv = { version = "0.7", features = ["validation"] }
 tide = { version = "0.16", default-features = false, features = ["h1-server"] }
 toml = "0.7"
