@@ -1,6 +1,6 @@
 mod devicewatch;
 mod logging;
-mod wg;
+mod transport;
 
 use anyhow::{anyhow, bail, Result};
 use async_std::task;
@@ -74,7 +74,22 @@ impl DeviceHandler for ComboHandler {
 fn main() -> Result<()> {
     logging::init_logging();
 
-    wg::foo()?;
+    let listen_addr: std::net::SocketAddr = "127.0.0.1:5000".parse()?;
+    let listen_addr2 = listen_addr.clone();
+    let known_certs = transport::load_known_certs()?;
+    let known_certs2 = known_certs.clone();
+    task::spawn(async move {
+        if let Err(e) = transport::start_server(listen_addr, known_certs).await {
+            error!("server fail: {}", e);
+        }
+    });
+    task::block_on(async {
+        if let Err(e) = transport::start_client(listen_addr2, known_certs2).await {
+            error!("client fail: {}", e);
+        }
+    });
+
+    bail!("ok cya");
 
     // TODO args for user-specified key combos. require at least one key
     let combo_keys = vec![
