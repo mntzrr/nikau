@@ -8,7 +8,7 @@ anyhow = "1.0"
 async-channel = "1.5"
 async-std = { version = "1.8", features = ["tokio1"] }
 bit-vec = "0.6"
-clap = { version = "4.0", features = ["derive", "env"] }
+clap = "4.0"
 evdev = { version = "0.12", features = ["tokio"] }
 futures = "0.3"
 home = "0.5"

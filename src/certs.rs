@@ -1,6 +1,4 @@
 use anyhow::{bail, Context, Result};
-use async_std::io as aio;
-use async_std::task;
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
@@ -8,8 +6,6 @@ use std::fs;
 use std::io::{self, prelude::*};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::{Duration, SystemTime};
 
 pub fn load_known_certs() -> Result<Vec<rustls::Certificate>> {
     let mut certs = vec![];
@@ -58,153 +54,17 @@ pub fn load_keypair() -> Result<(rustls::Certificate, rustls::PrivateKey)> {
     }
 }
 
-pub struct ManualServerVerification {
-    our_cert_sig: String,
-    known_certs: Vec<rustls::Certificate>,
-}
-
-impl ManualServerVerification {
-    pub fn new(our_cert: &rustls::Certificate, known_certs: Vec<rustls::Certificate>) -> Arc<Self> {
-        Arc::new(ManualServerVerification {
-            our_cert_sig: signature(our_cert),
-            known_certs,
-        })
-    }
-}
-
-impl rustls::client::ServerCertVerifier for ManualServerVerification {
-    fn verify_server_cert(
-        &self,
-        server_cert: &rustls::Certificate,
-        _intermediates: &[rustls::Certificate],
-        _server_name: &rustls::ServerName,
-        _scts: &mut dyn Iterator<Item = &[u8]>,
-        _ocsp_response: &[u8],
-        _now: SystemTime,
-    ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
-        if self.known_certs.contains(server_cert) {
-            info!("[client] server cert found in known certificates: {}", signature(&server_cert));
-            Ok(rustls::client::ServerCertVerified::assertion())
-        } else {
-            prompt_unknown_cert(server_cert, &self.our_cert_sig, false, rustls::client::ServerCertVerified::assertion())
-        }
-    }
-}
-
-pub struct ManualClientVerification {
-    our_cert_sig: String,
-    known_certs: Vec<rustls::Certificate>,
-}
-
-impl ManualClientVerification {
-    pub fn new(our_cert: &rustls::Certificate, known_certs: Vec<rustls::Certificate>) -> Arc<Self> {
-        Arc::new(ManualClientVerification {
-            our_cert_sig: signature(our_cert),
-            known_certs,
-        })
-    }
-}
-
-impl rustls::server::ClientCertVerifier for ManualClientVerification {
-    fn client_auth_root_subjects(&self) -> &[rustls::DistinguishedName] {
-        &[]
-    }
-
-    fn verify_client_cert(
-        &self,
-        client_cert: &rustls::Certificate,
-        _intermediates: &[rustls::Certificate],
-        _now: SystemTime,
-    ) -> Result<rustls::server::ClientCertVerified, rustls::Error> {
-        if self.known_certs.contains(client_cert) {
-            info!("[server] client cert found in known certificates: {}", signature(&client_cert));
-            Ok(rustls::server::ClientCertVerified::assertion())
-        } else {
-            prompt_unknown_cert(client_cert, &self.our_cert_sig, true, rustls::server::ClientCertVerified::assertion())
-        }
-    }
-}
-
-fn signature(cert: &rustls::Certificate) -> String {
+/// Returns the sha256 fingerprint of this certificate.
+/// We use this for cert filenames and for comparing certs in confirmation prompts.
+/// This should match the output of "openssl x509 -in <filename> -noout -sha256 -fingerprint"
+pub fn fingerprint(cert: &rustls::Certificate) -> String {
     format!("{:x}", Sha256::digest(&cert))
 }
 
-fn prompt_unknown_cert<T>(their_cert: &rustls::Certificate, our_cert_sig: &String, we_are_server: bool, approved_obj: T) -> Result<T, rustls::Error> {
-    let their_cert_sig = signature(&their_cert);
-    // Let's assume the user will typically see this only once during initial setup of one client and one server.
-    // Make it easier to compare by showing the same server/client info across both systems.
-    let server_cert_sig: &String;
-    let client_cert_sig: &String;
-    if we_are_server {
-        server_cert_sig = our_cert_sig;
-        client_cert_sig = &their_cert_sig;
-    } else {
-        server_cert_sig = &their_cert_sig;
-        client_cert_sig = our_cert_sig;
-    }
-    let message = format!("New connection, approval needed...
-
-Check that the following hashes look the same on the server and on the client:
-- Server hash: {}
-- Client hash: {}
-
-Confirm new connection? [y/N]", server_cert_sig, client_cert_sig);
-    if prompt_yn(&message, false) {
-        info!("Cert approved by user: {}", their_cert_sig);
-        if let Err(e) = write_approved_cert(their_cert) {
-            warn!("Couldn't store approved cert: {}", e);
-        }
-        Ok(approved_obj)
-    } else {
-        info!("Cert denied by user: {}", their_cert_sig);
-        Err(rustls::Error::General(format!("Server cert was not approved: {}", signature(&their_cert))))
-    }
-}
-
-fn prompt_yn(msg: &str, default: bool) -> bool {
-    match prompt_internal(msg) {
-        Ok(input) => {
-            if input.is_empty() {
-                return default;
-            }
-            match input.chars().nth(0).expect("Failed to get first char") {
-                'y' | 'Y' | 't' | 'T' => true,
-                _ => false,
-            }
-        },
-        Err(e) => {
-            warn!("Failed to prompt for confirmation, assuming {}: {}", if default { "Yes" } else { "No" }, e);
-            return default;
-        }
-    }
-}
-
-fn prompt_internal(msg: &str) -> Result<String> {
-    let msg_formatted = format!("{}: ", msg);
-    let mut stdout = io::stdout();
-    stdout
-        .write_all(msg_formatted.as_bytes())
-        .context("Failed to write prompt to stdout")?;
-    stdout.flush().expect("Failed to flush stdout");
-    let mut response = String::new();
-    task::block_on(async {
-        let timeout_secs = 60;
-        match aio::timeout(Duration::from_secs(timeout_secs), aio::stdin().read_line(&mut response)).await {
-            Ok(_) => {
-                return Ok(());
-            },
-            Err(_e) => {
-                // Skip output to next line so that logs don't print on top of the prompt
-                println!("");
-                bail!("Prompt timed out after {}s", timeout_secs)
-            },
-        }
-    })?;
-    Ok(response.trim().to_string())
-}
-
-fn write_approved_cert(cert: &rustls::Certificate) -> Result<()> {
-    let file_path = init_known_certs_dir().context("Failed to init known_certs dir")?.join(signature(cert));
+pub fn write_approved_cert(cert: &rustls::Certificate) -> Result<()> {
+    let file_path = init_known_certs_dir()
+        .context("Failed to init known_certs dir")?
+        .join(format!("{}.pem", fingerprint(cert)));
     let content = pem::encode_config(
         &pem::Pem::new("CERTIFICATE", cert.0.clone()),
         pem::EncodeConfig { line_ending: pem::LineEnding::LF }

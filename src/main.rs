@@ -1,7 +1,9 @@
+mod approval;
 mod certs;
 mod client;
 mod devicewatch;
 mod logging;
+mod messages;
 mod server;
 mod transport;
 
@@ -44,7 +46,7 @@ async fn read_device_events(mut stream: EventStream, combo_keys: &Vec<Key>) {
             Ok(event) => {
                 if check_combo(&event, &combo_keys, &mut keys_on) {
                     // Combo has been reached on this device
-                    // TODO emit signal to switch output target, which will then signal this device task to grab or ungrab the device
+                    // TODO emit signal to switch output target, which may then signal this device task to grab or ungrab the device if it's switching to local or remote
                     info!("COMBO!!!!!");
                 } else {
                     info!("event for {:?}: {:?}", stream.device().name(), event);
@@ -75,6 +77,10 @@ impl DeviceHandler for ComboHandler {
 }
 
 fn main() -> Result<()> {
+    // TODO args:
+    // - server: left/right shortcuts, ip/port to listen on, cert hash(es) to auto-accept
+    // - client: server to connect to, cert hash(es) to auto-accept
+
     logging::init_logging();
 
     let listen_addr: std::net::SocketAddr = "127.0.0.1:5000".parse()?;

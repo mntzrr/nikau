@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::approval;
 use crate::certs;
 
 const ALPN_QUIC_HTTP: &[&[u8]] = &[b"hq-29"];
@@ -15,7 +16,7 @@ pub fn build_client(bind_addr: SocketAddr, known_server_certs: Vec<rustls::Certi
     let (client_cert, client_privkey) = certs::load_keypair().context("Failed to load client keypair")?;
     let mut rustls_config = rustls::ClientConfig::builder()
         .with_safe_defaults()
-        .with_custom_certificate_verifier(certs::ManualServerVerification::new(&client_cert, known_server_certs))
+        .with_custom_certificate_verifier(approval::ManualServerVerification::new(&client_cert, known_server_certs))
         .with_single_cert(vec![client_cert], client_privkey)?;
     rustls_config.alpn_protocols = ALPN_QUIC_HTTP.iter().map(|&x| x.into()).collect();
     let mut transport_config = TransportConfig::default();
@@ -36,7 +37,7 @@ pub fn build_server(listen_addr: SocketAddr, known_client_certs: Vec<rustls::Cer
     let (server_cert, server_privkey) = certs::load_keypair().context("Failed to load server keypair")?;
     let mut rustls_config = rustls::ServerConfig::builder()
         .with_safe_defaults() // includes TLS1.3 required by QUIC
-        .with_client_cert_verifier(certs::ManualClientVerification::new(&server_cert, known_client_certs))
+        .with_client_cert_verifier(approval::ManualClientVerification::new(&server_cert, known_client_certs))
         .with_single_cert(vec![server_cert], server_privkey)?;
     rustls_config.alpn_protocols = ALPN_QUIC_HTTP.iter().map(|&x| x.into()).collect();
     rustls_config.max_early_data_size = u32::MAX; // required by QUIC
