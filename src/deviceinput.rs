@@ -6,17 +6,28 @@ use tracing::{debug, info, warn};
 
 use std::str::FromStr;
 
+use crate::deviceutil;
 use crate::devicewatch::DeviceHandler;
+use crate::messages;
 use crate::server;
 
 pub struct InputHandler {
+    config: HandlerConfig,
+}
+
+#[derive(Clone)]
+struct HandlerConfig {
     combo_keys_next: Vec<Key>,
     combo_keys_prev: Vec<Key>,
     event_tx: async_channel::Sender<server::Event>,
 }
 
 impl InputHandler {
-    pub fn new(keys_next: &str, keys_prev: Option<&str>, event_tx: async_channel::Sender<server::Event>) -> Result<InputHandler> {
+    pub fn new(
+        keys_next: &str,
+        keys_prev: Option<&str>,
+        event_tx: async_channel::Sender<server::Event>
+    ) -> Result<InputHandler> {
         let mut combo_keys_next = vec![];
         let mut combo_keys_prev = vec![];
         for key in keys_next.split(",") {
@@ -36,30 +47,35 @@ impl InputHandler {
         if combo_keys_next.is_empty() && combo_keys_prev.is_empty() {
             bail!("At least one key must be provided for switching between devices");
         }
-        Ok(InputHandler{combo_keys_next, combo_keys_prev, event_tx})
+        Ok(InputHandler {
+            config: HandlerConfig{
+                combo_keys_next,
+                combo_keys_prev,
+                event_tx,
+            },
+        })
     }
 }
 
 impl DeviceHandler for InputHandler {
     fn handle_device_stream(&mut self, stream: EventStream) -> Result<task::JoinHandle<()>> {
-        let combo_keys_next = self.combo_keys_next.clone();
-        let combo_keys_prev = self.combo_keys_prev.clone();
-        let event_tx = self.event_tx.clone();
+        let config = self.config.clone();
         task::Builder::new().name(format!("device: {:?}", stream.device().name())).spawn(async move {
-            read_device_events(stream, &combo_keys_next, &combo_keys_prev, event_tx).await
+            read_device_events(stream, config).await
         }).map_err(|e| anyhow!(e))
     }
 }
 
-async fn read_device_events(mut stream: EventStream, combo_keys_next: &Vec<Key>, combo_keys_prev: &Vec<Key>, event_tx: async_channel::Sender<server::Event>) {
-    let mut pressed_keys_next = bit_vec::BitVec::from_elem(combo_keys_next.len(), false);
-    let mut pressed_keys_prev = bit_vec::BitVec::from_elem(combo_keys_prev.len(), false);
+async fn read_device_events(mut stream: EventStream, c: HandlerConfig) {
+    let mut pressed_keys_next = bit_vec::BitVec::from_elem(c.combo_keys_next.len(), false);
+    let mut pressed_keys_prev = bit_vec::BitVec::from_elem(c.combo_keys_prev.len(), false);
+    let (device_target, device_dims) = deviceutil::device_info(&stream.device());
     while let Some(event) = stream.next().await {
         match event {
             Ok(event) => {
                 // No short-circuit: Ensure that all pressed_keys_* state has a chance to be updated
-                let combo_next = check_combo(&event, &combo_keys_next, &mut pressed_keys_next);
-                let combo_prev = check_combo(&event, &combo_keys_prev, &mut pressed_keys_prev);
+                let combo_next = check_combo(&event, &c.combo_keys_next, &mut pressed_keys_next);
+                let combo_prev = check_combo(&event, &c.combo_keys_prev, &mut pressed_keys_prev);
                 let event = if combo_next {
                     info!("COMBO NEXT!!!!!");
                     server::Event::SwitchNext
@@ -67,10 +83,35 @@ async fn read_device_events(mut stream: EventStream, combo_keys_next: &Vec<Key>,
                     info!("COMBO PREV!!!!!");
                     server::Event::SwitchPrev
                 } else {
-                    debug!("event for {:?}: {:?}", stream.device().name(), event);
-                    server::Event::Input(event)
+                    debug!("event for {} {:?}: {:?}", device_target, stream.device().name(), event);
+                    match event.kind() {
+                        evdev::InputEventKind::AbsAxis(axis) => {
+                            if let Some(axis_dims) = device_dims.get(&axis.0) {
+                                // Apply scaling to [0.0, 1.0]
+                                server::Event::Input(messages::InputEventV1{
+                                    target: device_target.clone(),
+                                    i32event: None,
+                                    f64event: Some(messages::F64EventV1::from_evdev(event, axis_dims.0, axis_dims.1)),
+                                })
+                            } else {
+                                // No scaling for this axis
+                                server::Event::Input(messages::InputEventV1{
+                                    target: device_target.clone(),
+                                    i32event: Some(messages::I32EventV1::from_evdev(event)),
+                                    f64event: None,
+                                })
+                            }
+                        },
+                        _ => {
+                            server::Event::Input(messages::InputEventV1{
+                                target: device_target.clone(),
+                                i32event: Some(messages::I32EventV1::from_evdev(event)),
+                                f64event: None,
+                            })
+                        }
+                    }
                 };
-                if let Err(e) = event_tx.send(event).await {
+                if let Err(e) = c.event_tx.send(event).await {
                     warn!("Error trying to send event to server for routing: {}", e);
                 }
             },

@@ -3,6 +3,7 @@ mod certs;
 mod client;
 mod deviceinput;
 mod deviceoutput;
+mod deviceutil;
 mod devicewatch;
 mod logging;
 mod messages;

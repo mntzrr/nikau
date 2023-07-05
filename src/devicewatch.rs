@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use async_std::task;
-use evdev::{Device, EvdevEnum, EventStream, EventType};
+use evdev::{Device, EventStream, EventType};
 use futures::StreamExt;
 use notify::Watcher;
 use tracing::{debug, info, trace, warn};
@@ -130,45 +130,7 @@ fn compatible_device(d: &Device) -> bool {
     evts.contains(EventType::KEY) || evts.contains(EventType::RELATIVE) || evts.contains(EventType::ABSOLUTE)
 }
 
-pub fn log_device(device: &Device, path: &PathBuf) {
-    //info!("device {}", device);
-    let device_name = device.name().unwrap_or("(Unnamed device)").to_string();
-    let mut abs_entries = vec![];
-    if let Some(abs_axes) = device.supported_absolute_axes() {
-        if let Ok(state) = device.get_abs_state() {
-            let mut i = 0;
-            for s in state {
-                let type_ = evdev::AbsoluteAxisType::from_index(i);
-                if abs_axes.contains(type_) {
-                    abs_entries.push(format!("{:?}:{:?}", type_, s));
-                }
-                i += 1;
-            }
-        }
-    }
-    info!(
-        "Input device: {} @ {}:
-  props: {:?}
-  misc: {:?}
-  events: {:?}
-  keys: {:?}
-  leds: {:?}
-  rel: {:?}
-  abs: {:?}",
-        device_name,
-        path.to_string_lossy(),
-        device.properties(),
-        device.misc_properties(),
-        device.supported_events(),
-        device.supported_keys(),
-        device.supported_leds(),
-        device.supported_relative_axes(),
-        abs_entries,
-    );
-}
-
 fn start_device_stream(device: Device, path: &PathBuf) -> Result<EventStream> {
-    log_device(&device, path);
     device.into_event_stream()
         .with_context(|| format!("Failed to initialize async fd for device: {}", path.to_string_lossy()))
 }

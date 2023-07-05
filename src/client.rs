@@ -23,6 +23,7 @@ pub async fn run_client(bind_addr: &SocketAddr, server_addr: &SocketAddr, known_
         bytes.extend_from_slice(&*resp.bytes);
 
         let mut input_events = vec![];
+        // if there are multiple, only retain the last one
         let mut latest_switch_event = None;
 
         let mut offset = 0;
@@ -32,19 +33,19 @@ pub async fn run_client(bind_addr: &SocketAddr, server_addr: &SocketAddr, known_
             let consumed = resp.bytes.len() - resp_remainder.len() - offset;
             debug!("consumed event at offset={}: {} ({} bytes)", offset, networkmsg, consumed);
             match networkmsg {
-                NetworkMessageV1::Input(e) => {
-                    input_events.push(e)
-                },
                 NetworkMessageV1::Switch(e) => {
                     latest_switch_event = Some(e);
+                },
+                NetworkMessageV1::Input(e) => {
+                    input_events.push(e)
                 },
             }
             offset += consumed;
         }
 
-        // TODO do something with the events: switch should create or drop device(s), input should write to the device(s)
+        // TODO do something with the events: switch should reset devices, input should write to the respective devices (with scaling by SCALED_DIM_SIZE)
         // see also https://www.kernel.org/doc/html/latest/input/uinput.html
-        info!("batch: input({})={:?}, switch={:?}", input_events.len(), input_events.into_iter().map(|e| e.to_evdev()).collect::<Vec<_>>(), latest_switch_event);
+        info!("batch: input({})={:?} switch={:?}", input_events.len(), input_events, latest_switch_event);
 
         bytes.clear();
     }

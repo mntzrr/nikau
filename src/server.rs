@@ -11,7 +11,7 @@ use crate::messages;
 use crate::transport;
 
 pub enum Event {
-    Input(evdev::InputEvent),
+    Input(messages::InputEventV1),
     SwitchNext,
     SwitchPrev,
 }
@@ -158,7 +158,7 @@ pub async fn run_server(
         while let Some(event) = input_rx.next().await {
             match event {
                 Event::Input(evt) => {
-                    rotation2.lock().await.send(messages::NetworkMessageV1::Input(messages::InputEventV1::from_evdev(evt))).await;
+                    rotation2.lock().await.send(messages::NetworkMessageV1::Input(evt)).await;
                 },
                 Event::SwitchNext => {
                     rotation2.lock().await.next_client().await;
