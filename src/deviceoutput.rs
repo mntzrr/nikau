@@ -139,6 +139,7 @@ pub fn mouse(pid: u32) -> Result<uinput::VirtualDevice> {
     Ok(device)
 }
 
+// TODO touchpad still needs work: removing and reapplying finger causes cursor to hop to new absolute coords, and two finger scrolling doesnt work
 pub fn touchpad(pid: u32) -> Result<uinput::VirtualDevice> {
     let mut props = AttributeSet::<evdev::PropType>::new();
     // Doesn't seem to be required, but real touchpads have it:
