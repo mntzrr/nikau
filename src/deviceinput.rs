@@ -4,7 +4,7 @@ use anyhow::{anyhow, bail, Result};
 use async_std::task;
 use evdev::{EventStream, EventType, InputEvent, Key};
 use futures::StreamExt;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use crate::devicewatch::DeviceHandler;
 use crate::{deviceutil, messages};
@@ -82,14 +82,12 @@ async fn read_device_events(mut stream: EventStream, c: HandlerConfig) {
                 let combo_next = check_combo(&event, &c.combo_keys_next, &mut pressed_keys_next);
                 let combo_prev = check_combo(&event, &c.combo_keys_prev, &mut pressed_keys_prev);
                 let event = if combo_next {
-                    info!("COMBO NEXT!!!!!");
                     Event::SwitchNext
                 } else if combo_prev {
-                    info!("COMBO PREV!!!!!");
                     Event::SwitchPrev
                 } else {
                     debug!(
-                        "event for {} {:?}: {:?}",
+                        "{} event {:?}: {:?}",
                         device_target,
                         stream.device().name(),
                         event

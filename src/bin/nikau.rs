@@ -1,36 +1,138 @@
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use async_std::task;
+use clap::{Args, Parser, Subcommand};
+use futures::StreamExt;
+use signal_hook::consts::signal;
 use tracing::{error, info};
 
 use nikau::{approval, client, deviceinput, devicewatch, logging, server};
 
-fn main() -> Result<()> {
-    // TODO server args: left/right shortcuts, ip/port to listen on, cert hash(es) to auto-accept, whether to automatically stop grabbing after N seconds for testing
-    // TODO client args: server to connect to, cert hash(es) to auto-accept
+#[derive(Parser)]
+#[command(author, version, about, long_about = None)]
+#[command(propagate_version = true)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
 
-    logging::init_logging();
+#[derive(Subcommand)]
+enum Commands {
+    /// Runs a Nikau server
+    Server(ServerArgs),
 
-    let approved_cert_fingerprints = vec![];
-    let verifier = approval::NikauCertVerification::new(approved_cert_fingerprints)?;
+    /// Runs a Nikau client
+    Client(ClientArgs),
+}
 
-    // TODO first arg: <server/client/approve>
-    if true {
-        server(verifier)
-    } else {
-        let connect_addr: std::net::SocketAddr = "127.0.0.1:5000".parse()?;
-        client(connect_addr, verifier)
+#[derive(Args)]
+struct ServerArgs {
+    /// Keyboard shortcut for switching to the next client
+    #[arg(long, default_value = "leftalt,n")]
+    shortcut: String,
+
+    /// Key shortcut for switching to the previous client
+    #[arg(long)]
+    shortcut_prev: Option<String>,
+
+    /// Server listen IP
+    #[arg(short = 'l', long, default_value = "0.0.0.0")]
+    listen: IpAddr,
+
+    /// Server port
+    #[arg(short = 'p', long, default_value_t = 1213)]
+    port: u16,
+
+    /// Client certificate fingerprints to automatically accept without prompting
+    #[arg(long)]
+    fingerprints: Option<Vec<String>>,
+
+    /// TODO Number of seconds to wait before automatically exiting the server, to safely test configuration
+    #[arg(long)]
+    exit_secs: Option<u32>,
+}
+
+#[derive(Args)]
+struct ClientArgs {
+    /// Server hostname or IP
+    host: String,
+
+    /// Server port
+    #[arg(short = 'p', long, default_value_t = 1213)]
+    port: u16,
+
+    /// Server certificate fingerprints to automatically accept without prompting
+    #[arg(long)]
+    fingerprints: Option<Vec<String>>,
+}
+
+/// Listens for SIGUSR1 and SIGUSR2, treating them as "switch to next client" and "switch to prev client" respectively.
+async fn handle_signals(mut signals: signal_hook_async_std::Signals, out: async_channel::Sender<deviceinput::Event>) {
+    while let Some(signal) = signals.next().await {
+        match signal {
+            signal::SIGUSR1 => {
+                if let Err(e) = out.send(deviceinput::Event::SwitchNext).await {
+                    error!("Failed to submit SwitchNext event for SIGUSR1: {}", e);
+                }
+            },
+            signal::SIGUSR2 => {
+                if let Err(e) = out.send(deviceinput::Event::SwitchPrev).await {
+                    error!("Failed to submit SwitchPrev event for SIGUSR2: {}", e);
+                }
+            },
+            _ => continue,
+        }
     }
 }
 
-fn server(verifier: Arc<approval::NikauCertVerification>) -> Result<()> {
-    let listen_addr: std::net::SocketAddr = "127.0.0.1:5000".parse()?;
+fn main() -> Result<()> {
+    logging::init_logging();
 
+    let cli = Cli::parse();
+    match cli.command {
+        Commands::Server(args) => {
+            let listen_addr = SocketAddr::new(args.listen, args.port);
+            let verifier = approval::NikauCertVerification::new(args.fingerprints.unwrap_or(vec![]))?;
+            server(listen_addr, &args.shortcut, args.shortcut_prev.as_deref(), verifier)
+        },
+        Commands::Client(args) => {
+            let connect_addr: SocketAddr = if let Ok(host_ip) = args.host.parse::<IpAddr>() {
+                // It's an IP.
+                SocketAddr::new(host_ip, args.port)
+            } else {
+                // Its a hostname? Try resolving it.
+                let mut socket_addrs = format!("{}:{}", args.host, args.port).to_socket_addrs()
+                    .map_err(|e| anyhow!("Failed to resolve --host={}: {}", args.host, e))?;
+                if let Some(first) = socket_addrs.next() {
+                    first
+                } else {
+                    bail!("Provided --host={} didn't resolve to an IP", args.host);
+                }
+            };
+            let verifier = approval::NikauCertVerification::new(args.fingerprints.unwrap_or(vec![]))?;
+            client(connect_addr, verifier)
+        },
+    }
+}
+
+fn server(
+    listen_addr: SocketAddr,
+    next_keys: &str,
+    prev_keys: Option<&str>,
+    verifier: Arc<approval::NikauCertVerification>
+) -> Result<()> {
     let (event_tx, event_rx): (
         async_channel::Sender<deviceinput::Event>,
         async_channel::Receiver<deviceinput::Event>,
     ) = async_channel::bounded(32);
+
+    let event_tx2 = event_tx.clone();
+    let signals = signal_hook_async_std::Signals::new(&[signal::SIGUSR1, signal::SIGUSR2])?;
+    task::spawn(async move {
+        handle_signals(signals, event_tx2).await;
+    });
 
     task::spawn(async move {
         info!("Listening for clients: {}", listen_addr);
@@ -39,8 +141,7 @@ fn server(verifier: Arc<approval::NikauCertVerification>) -> Result<()> {
         }
     });
 
-    // TODO args for user-specified key combos. require at least one key
-    let input_handler = deviceinput::InputHandler::new("rightctrl,leftshift,f", None, event_tx)?;
+    let input_handler = deviceinput::InputHandler::new(&next_keys, prev_keys, event_tx)?;
 
     task::block_on(async move {
         if let Err(e) = devicewatch::watch_loop(input_handler).await {
@@ -51,14 +152,8 @@ fn server(verifier: Arc<approval::NikauCertVerification>) -> Result<()> {
     bail!("Exiting due to server failure")
 }
 
-fn client(
-    connect_addr: std::net::SocketAddr,
-    verifier: Arc<approval::NikauCertVerification>,
-) -> Result<()> {
-    logging::init_logging();
-
-    let bind_addr: std::net::SocketAddr = "0.0.0.0:0".parse()?;
-
+fn client(connect_addr: SocketAddr, verifier: Arc<approval::NikauCertVerification>) -> Result<()> {
+    let bind_addr: SocketAddr = "0.0.0.0:0".parse()?;
     task::block_on(async move {
         // TODO connection loop: handle server not up yet, or server restarting
         loop {

@@ -127,7 +127,6 @@ pub async fn watch_loop<F: DeviceHandler>(mut handler: F) -> Result<()> {
                     info!("Removing device: {}", event.path.to_string_lossy());
                     join_handle.cancel().await;
                 }
-                info!("Handling {} devices following removal", devices.len());
             }
         }
     }

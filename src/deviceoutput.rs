@@ -44,17 +44,19 @@ impl VirtualDevices {
             events.push(e.to_evdev(SCALED_DIM_MIN, SCALED_DIM_MAX));
         } else if let Some(e) = net_event.i32event {
             if e.type_ == evdev::EventType::SYNCHRONIZATION.0 {
-                // If it's a sync event, then flush the queued events.
+                // If it's a sync event, then flush the queued events if any.
                 // We only do this queueing because VirtualDevice::emit() internally
                 // writes its own sync event that we can't skip.
-                debug!(
-                    "Sending {} events to {} device: {:?}",
-                    events.len(),
-                    net_event.target,
-                    events
-                );
-                device.emit(&events)?;
-                events.clear();
+                if !events.is_empty() {
+                    debug!(
+                        "Sending {} events to {} device: {:?}",
+                        events.len(),
+                        net_event.target,
+                        events
+                    );
+                    device.emit(&events)?;
+                    events.clear();
+                }
             } else {
                 events.push(e.to_evdev());
             }

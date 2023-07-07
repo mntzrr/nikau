@@ -125,8 +125,8 @@ impl Rotation {
 
     async fn update_current_client(&mut self, new_client: Option<SocketAddr>) {
         info!(
-            "Client switch: {:?} => {:?} (all: {:?}",
-            self.current_client, new_client, self.clients
+            "Client switch: {:?} => {:?} (all: {:?})",
+            self.current_client, new_client, self.clients.iter().map(|c| c.endpoint).collect::<Vec<SocketAddr>>()
         );
         if let Some(_old_client) = self.current_client {
             // Try to send switch{false} to last current_client.

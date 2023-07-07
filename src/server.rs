@@ -49,6 +49,7 @@ pub async fn run_server(
             .await
             .add_client(conn.remote_address(), netmsg_tx);
         task::spawn(async move {
+            // TODO if client is ctrl+C'ed, we don't seem to automatically clean it up
             if let Err(e) = handle_connection(conn, netmsg_rx).await {
                 error!("Client connection error: {}", e);
             }

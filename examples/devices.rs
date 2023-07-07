@@ -3,7 +3,7 @@ use nikau::{deviceoutput, deviceutil, devicewatch, logging};
 use anyhow::{anyhow, bail, Context, Result};
 use async_std::task;
 use evdev::{AbsoluteAxisType, EventType, InputEvent, Key};
-use futures::stream::StreamExt;
+use futures::StreamExt;
 use tracing::{error, info, warn};
 
 use std::thread;

@@ -22,9 +22,8 @@ pub async fn run_client(
         .await
         .context("failed to send protocol version")?;
     let mut bytes = Vec::with_capacity(1024);
-
     let mut virtual_devices = deviceoutput::VirtualDevices::new()?;
-
+    info!("Waiting to be activated by server...");
     loop {
         // Incoming data may contain one or more messages, but I've never seen fragments of messages.
         let resp = recv
