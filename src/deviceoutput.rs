@@ -75,7 +75,7 @@ impl VirtualDevices {
     }
 
     pub fn switch(&mut self, enabled: bool) -> Result<()> {
-        info!("Client is {}", if enabled { "active" } else { "inactive" });
+        info!("This client is {}", if enabled { "active" } else { "inactive" });
         // TODO(feature): clear device state for client switches, to avoid e.g. leaving a device with a repeating key. but this requires subscribing and keeping track of device state.
         // TODO(feature): flash LEDs on the OTHER, NON-virtual edvices when this client becomes enabled
         if !self.key_events.is_empty() {

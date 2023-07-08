@@ -1,0 +1,34 @@
+image: debian/testing
+packages:
+- buildah
+# required to avoid Dockerfile RUN errors around 'fork/exec : no such file or directory'
+- podman
+# both required to avoid Dockerfile RUN errors around 'Exec format error'
+- binfmt-support
+- qemu-user-static
+secrets:
+# creates /home/build/.docker/config.json
+- 199f277e-04fa-454d-a0b7-40aa2b7719d7
+environment:
+  REPO_NAME: nikau
+  IMAGE_NAME: ghcr.io/nickbp/nikau
+  # Disable arm64 for now: Seeing 'Killed' in sourcehut build
+  #IMAGE_PLATFORMS: linux/amd64,linux/arm64
+  IMAGE_PLATFORMS: linux/amd64
+  BUILDAH_FORMAT: docker # 'oci' default doesn't list architectures on hub.docker.com
+tasks:
+# build amd64+arm64 images
+- docker: |
+    # required to fix errors like "potentially insufficient UIDs or GIDs available in user namespace"
+    sudo touch /etc/subuid /etc/subgid
+    sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $USER
+
+    cd $REPO_NAME/
+    GIT_REV="$(git rev-parse --short HEAD)"
+
+    # build amd64+arm64 images to named manifest. requires buildah >=1.23.1 and takes a long time
+    # see also https://podman.io/blogs/2021/10/11/multiarch.html
+    buildah build --manifest "${REPO_NAME}_${GIT_REV}" --jobs=1 --platform="${IMAGE_PLATFORMS}" .
+
+    # push manifest and built amd64+arm64 images to both rev and branch tags
+    buildah manifest push --all "${REPO_NAME}_${GIT_REV}" "docker://${IMAGE_NAME}:${GIT_REV}"

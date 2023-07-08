@@ -140,7 +140,7 @@ impl Rotation {
 
         self.set_current_client(new_client).await;
 
-        if new_client.is_some() {
+        if let Some(new_client) = new_client {
             // Try to send switch{true} to the newly assigned current_client.
             // If it fails then current_client is cleaned up.
             self.send(messages::NetworkMessageV1::Switch(
@@ -149,7 +149,7 @@ impl Rotation {
             .await;
 
             info!(
-                "Switched to client: {:?} (clients: {:?})",
+                "Switched to client: {} (clients: {:?})",
                 new_client,
                 self.clients
                     .iter()
@@ -181,7 +181,7 @@ impl Rotation {
                         .netmsg_tx;
                     if let Err(_) = netmsg_tx.send(netmsg).await {
                         info!(
-                            "Client has disconnected, reverting to local machine: {}",
+                            "Client has {} disconnected, switching to local machine",
                             current_client
                         );
                         // Client is dead, remove it and switch to local machine

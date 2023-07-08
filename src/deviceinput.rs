@@ -4,7 +4,7 @@ use anyhow::{anyhow, bail, Result};
 use async_std::task;
 use evdev::{EventStream, EventType, InputEvent, Key};
 use futures::{select, FutureExt, StreamExt};
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use crate::devicewatch::{DeviceHandle, DeviceHandler, GrabEvent};
 use crate::{deviceutil, messages};
@@ -161,13 +161,13 @@ async fn read_device_events(
                 if let Some(grab) = grab {
                     match grab {
                         GrabEvent::Grab => {
-                            info!("Grabbing device: {:?}", stream.device().name());
+                            debug!("Grabbing device: {:?}", stream.device().name().unwrap_or("(Unnamed device)"));
                             if let Err(e) = stream.device_mut().grab() {
                                 panic!("Failed to grab device {:?}: {}", stream.device().name(), e);
                             }
                         },
                         GrabEvent::Ungrab => {
-                            info!("Ungrabbing device: {:?}", stream.device().name());
+                            debug!("Ungrabbing device: {:?}", stream.device().name().unwrap_or("(Unnamed device)"));
                             if let Err(e) = stream.device_mut().ungrab() {
                                 panic!("Failed to ungrab device {:?}: {}", stream.device().name(), e);
                             }

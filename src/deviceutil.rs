@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use evdev::{AbsoluteAxisType, Device, EvdevEnum, EventType};
-use tracing::{debug, info, trace};
+use tracing::{debug, trace};
 
 use crate::messages;
 
@@ -71,9 +71,8 @@ fn log_device(device: &Device, target: &messages::EventTargetV1, dims: &BTreeMap
             }
         }
     }
-    info!("Adding input {} device: {}", target, device_name);
     debug!(
-        "{} details:
+        "Input {} device {} details:
   props: {:?}
   misc: {:?}
   events: {:?}
@@ -82,6 +81,7 @@ fn log_device(device: &Device, target: &messages::EventTargetV1, dims: &BTreeMap
   rel: {:?}
   abs: {:?}
   dims: {:?}",
+        target,
         device_name,
         device.properties(),
         device.misc_properties(),

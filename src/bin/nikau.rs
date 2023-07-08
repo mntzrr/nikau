@@ -95,8 +95,10 @@ fn main() -> Result<()> {
     logging::init_logging();
 
     let cli = Cli::parse();
+
     match cli.command {
         Commands::Server(args) => {
+            splash("server");
             let listen_addr = SocketAddr::new(args.listen, args.port);
             let verifier =
                 approval::NikauCertVerification::new(args.fingerprints.unwrap_or(vec![]))?;
@@ -109,6 +111,7 @@ fn main() -> Result<()> {
             )
         }
         Commands::Client(args) => {
+            splash("client");
             let connect_addr: SocketAddr = if let Ok(host_ip) = args.host.parse::<IpAddr>() {
                 // It's an IP.
                 SocketAddr::new(host_ip, args.port)
@@ -128,6 +131,16 @@ fn main() -> Result<()> {
             client(connect_addr, verifier)
         }
     }
+}
+
+fn splash(label: &str) {
+    println!(r"
+\\ //
+ \V/
+  U
+  |
+  | nikau {}
+", label);
 }
 
 fn server(

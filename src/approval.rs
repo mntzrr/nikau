@@ -59,6 +59,12 @@ impl NikauCertVerification {
         let (our_cert, our_privkey) =
             certs::load_keypair().context("Failed to load our keypair")?;
         let our_cert_fingerprint = certs::fingerprint(&our_cert);
+        // Convert e.g. "18:AE:75:F2..." (openssl style) => "18ae75f2..." (our style)
+        // Can get the openssl style from: openssl x509 -noout -sha256 -fingerprint -in /path/to/private.pem
+        let approved_cert_fingerprints = approved_cert_fingerprints
+            .into_iter()
+            .map(|fingerprint| fingerprint.to_lowercase().replace(":", ""))
+            .collect();
         Ok(Arc::new(NikauCertVerification {
             our_cert,
             our_cert_fingerprint,
@@ -88,10 +94,10 @@ impl NikauCertVerification {
                 .contains(&their_cert_fingerprint)
             {
                 info!(
-                    "{} approved via --approved-certs: {}",
+                    "{} approved via --fingerprints: {}",
                     their_name, their_cert_fingerprint
                 );
-                // Don't save the cert to disk for --approved-certs.
+                // Don't save the cert to disk for --fingerprints.
                 // Saving to disk creates weird behavior if the user later changes the certs they approve.
                 // Maybe they don't WANT old certs to still be approved if the arg changes? Play it safe.
                 known_certs.push(their_cert.clone());
@@ -101,11 +107,6 @@ impl NikauCertVerification {
                     warn!(
                         "{} approved, but couldn't save cert to disk: {}",
                         their_name, e
-                    );
-                } else {
-                    info!(
-                        "{} approved and saved to known certs: {}",
-                        their_name, their_cert_fingerprint
                     );
                 }
                 // Store the approved cert locally so that we don't e.g. reprompt on reconnect later on
