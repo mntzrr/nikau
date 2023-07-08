@@ -2,14 +2,14 @@ use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use async_std::task;
 use clap::{Args, Parser, Subcommand};
 use futures::StreamExt;
 use signal_hook::consts::signal;
 use tracing::{error, info};
 
-use nikau::{approval, client, deviceinput, devicewatch, logging, server};
+use nikau::{approval, client, deviceinput, deviceoutput, devicewatch, logging, server};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -183,12 +183,17 @@ fn server(
 }
 
 fn client(connect_addr: SocketAddr, verifier: Arc<approval::NikauCertVerification>) -> Result<()> {
+    // Try to set up virtual devices up-front - exit early if we aren't root
+    let mut virtual_devices = deviceoutput::VirtualDevices::new()
+        .context("Failed to create virtual devices, are you root?")?;
     let bind_addr: SocketAddr = "0.0.0.0:0".parse()?;
     task::block_on(async move {
         loop {
             let verifier2 = verifier.clone();
             info!("Connecting to server: {}", connect_addr);
-            if let Err(e) = client::run_client(&bind_addr, &connect_addr, verifier2).await {
+            if let Err(e) =
+                client::run_client(&bind_addr, &connect_addr, &mut virtual_devices, verifier2).await
+            {
                 error!("Client failure: {}", e);
             }
         }

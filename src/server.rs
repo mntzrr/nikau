@@ -41,17 +41,9 @@ pub async fn run_server(
 
     let server_endpoint = transport::build_server(listen_addr, cert_verifier)?;
     while let Some(conn) = server_endpoint.accept().await {
-        let (netmsg_tx, netmsg_rx): (
-            async_channel::Sender<messages::NetworkMessageV1>,
-            async_channel::Receiver<messages::NetworkMessageV1>,
-        ) = async_channel::bounded(32);
-        rotation
-            .lock()
-            .await
-            .add_client(conn.remote_address(), netmsg_tx)
-            .await;
+        let rotation3 = rotation.clone();
         task::spawn(async move {
-            if let Err(e) = handle_connection(conn, netmsg_rx).await {
+            if let Err(e) = handle_connection(conn, rotation3).await {
                 error!("Client connection error: {}", e);
             }
         });
@@ -62,7 +54,7 @@ pub async fn run_server(
 
 async fn handle_connection(
     conn: quinn::Connecting,
-    mut netmsg_rx: async_channel::Receiver<messages::NetworkMessageV1>,
+    rotation: Arc<Mutex<rotation::Rotation>>,
 ) -> Result<()> {
     let connection = conn.await?;
 
@@ -97,6 +89,17 @@ async fn handle_connection(
         } else {
             bail!("Client version isn't supported, dropping client");
         }
+
+        // Add client to the rotation after a successful handshake
+        let (netmsg_tx, mut netmsg_rx): (
+            async_channel::Sender<messages::NetworkMessageV1>,
+            async_channel::Receiver<messages::NetworkMessageV1>,
+        ) = async_channel::bounded(32);
+        rotation
+            .lock()
+            .await
+            .add_client(connection.remote_address(), netmsg_tx)
+            .await;
 
         while let Some(netmsg) = netmsg_rx.next().await {
             // Serialize message data: postcard with cobs encoding for event framing

@@ -9,17 +9,19 @@ use tracing::{error, info, warn};
 use std::thread;
 use std::time::Duration;
 
-struct StubHandler {}
+struct StubHandler {
+    grab_tx: async_channel::Sender<devicewatch::GrabEvent>,
+}
 
 impl devicewatch::DeviceHandler for StubHandler {
     fn handle_device_stream(
         &mut self,
         mut stream: evdev::EventStream,
-    ) -> Result<task::JoinHandle<()>> {
-        task::Builder::new()
+    ) -> Result<devicewatch::DeviceHandle> {
+        let handle = task::Builder::new()
             .name(format!("device: {:?}", stream.device().name()))
             .spawn(async move {
-                let (_device_target, _device_dims) = deviceutil::device_info(&stream.device());
+                let _device_info = deviceutil::device_info(&stream.device());
                 let device_name = stream
                     .device()
                     .name()
@@ -36,15 +38,20 @@ impl devicewatch::DeviceHandler for StubHandler {
                     }
                 }
             })
-            .map_err(|e| anyhow!(e))
+            .map_err(|e| anyhow!(e))?;
+        Ok(devicewatch::DeviceHandle {
+            handle,
+            grab_tx: self.grab_tx.clone(),
+        })
     }
 }
 
 fn main() -> Result<()> {
     logging::init_logging();
 
+    let (grab_tx, grab_rx) = async_channel::bounded(32);
     let handler = task::spawn(async move {
-        if let Err(e) = devicewatch::watch_loop(StubHandler {}).await {
+        if let Err(e) = devicewatch::watch_loop(StubHandler { grab_tx }, grab_rx).await {
             error!("Input device watch failure: {}", e);
         }
     });
