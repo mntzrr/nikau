@@ -88,7 +88,7 @@ pub async fn watch_loop<F: DeviceHandler>(
                     trace!("Updating {} devices with grab state: {:?}", devices.len(), grab);
                     for device in devices.values() {
                         if let Err(e) = device.grab_tx.send(grab.clone()).await {
-                            panic!("Failed to notify device of grab event, exiting server to avoid bad grab state: {}", e);
+                            panic!("Failed to notify device of grab event, exiting server to avoid bad grab state: {:?}", e);
                         }
                     }
                 }
@@ -237,7 +237,7 @@ fn send_device_events(event: notify::Event, device_event_tx: &async_channel::Sen
                         })
                         .await
                     {
-                        warn!("Failed to queue device create event: {}", e);
+                        warn!("Failed to queue device create event: {:?}", e);
                     }
                 }
             });
@@ -253,7 +253,7 @@ fn send_device_events(event: notify::Event, device_event_tx: &async_channel::Sen
                         })
                         .await
                     {
-                        warn!("Failed to queue device delete event: {}", e);
+                        warn!("Failed to queue device delete event: {:?}", e);
                     }
                 }
             })

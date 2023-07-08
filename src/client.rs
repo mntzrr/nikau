@@ -39,7 +39,7 @@ pub async fn run_client(
         while offset < bytes.len() {
             let (networkmsg, resp_remainder) =
                 postcard::take_from_bytes_cobs::<messages::NetworkMessageV1>(&mut bytes[offset..])
-                    .map_err(|e| anyhow!("Failed to deserialize message: {}", e))?;
+                    .map_err(|e| anyhow!("Failed to deserialize message: {:?}", e))?;
             let consumed = resp.bytes.len() - resp_remainder.len() - offset;
             trace!(
                 "Consumed event at offset={}: {} ({} bytes)",

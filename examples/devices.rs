@@ -33,7 +33,7 @@ impl devicewatch::DeviceHandler for StubHandler {
                             info!("Event for {}: {:?}", device_name, event);
                         }
                         Err(e) => {
-                            warn!("Error event for {}, removing device: {}", device_name, e);
+                            warn!("Error event for {}, removing device: {:?}", device_name, e);
                         }
                     }
                 }
@@ -52,7 +52,7 @@ fn main() -> Result<()> {
     let (grab_tx, grab_rx) = async_channel::bounded(32);
     let handler = task::spawn(async move {
         if let Err(e) = devicewatch::watch_loop(StubHandler { grab_tx }, grab_rx).await {
-            error!("Input device watch failure: {}", e);
+            error!("Input device watch failure: {:?}", e);
         }
     });
 

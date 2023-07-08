@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use quinn::{ClientConfig, Endpoint, IdleTimeout, ServerConfig, TransportConfig, VarInt};
 
 use crate::approval;
@@ -36,7 +36,8 @@ pub fn build_server(
     server_config
         .use_retry(true)
         .transport_config(transport_config());
-    Ok(Endpoint::server(server_config, listen_addr.clone())?)
+    Ok(Endpoint::server(server_config, listen_addr.clone())
+       .with_context(|| format!("Failed to listen on {}", listen_addr))?)
 }
 
 fn transport_config() -> Arc<TransportConfig> {

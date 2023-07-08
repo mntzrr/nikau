@@ -44,7 +44,7 @@ pub async fn run_server(
         let rotation3 = rotation.clone();
         task::spawn(async move {
             if let Err(e) = handle_connection(conn, rotation3).await {
-                error!("Client connection error: {}", e);
+                error!("Client connection error: {:?}", e);
             }
         });
     }
@@ -71,7 +71,7 @@ async fn handle_connection(
                 break;
             }
             Err(e) => {
-                bail!("Connection error: {}", e);
+                bail!("Connection error: {:?}", e);
             }
             Ok(stream) => stream,
         };
@@ -104,7 +104,7 @@ async fn handle_connection(
         while let Some(netmsg) = netmsg_rx.next().await {
             // Serialize message data: postcard with cobs encoding for event framing
             let serializedmsg = postcard::to_slice_cobs(&netmsg, &mut buf)
-                .map_err(|e| anyhow!("Failed to serialize message: {}", e))?;
+                .map_err(|e| anyhow!("Failed to serialize message: {:?}", e))?;
             trace!(
                 "Sending {} byte event: {:X?}",
                 serializedmsg.len(),

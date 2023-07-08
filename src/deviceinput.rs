@@ -163,13 +163,13 @@ async fn read_device_events(
                         GrabEvent::Grab => {
                             debug!("Grabbing device: {:?}", stream.device().name().unwrap_or("(Unnamed device)"));
                             if let Err(e) = stream.device_mut().grab() {
-                                panic!("Failed to grab device {:?}: {}", stream.device().name(), e);
+                                panic!("Failed to grab device {:?}: {:?}", stream.device().name(), e);
                             }
                         },
                         GrabEvent::Ungrab => {
                             debug!("Ungrabbing device: {:?}", stream.device().name().unwrap_or("(Unnamed device)"));
                             if let Err(e) = stream.device_mut().ungrab() {
-                                panic!("Failed to ungrab device {:?}: {}", stream.device().name(), e);
+                                panic!("Failed to ungrab device {:?}: {:?}", stream.device().name(), e);
                             }
                         }
                     }
@@ -199,7 +199,7 @@ async fn read_device_event(
             f64event: None,
         });
         if let Err(e) = event_tx.send(orig_event).await {
-            warn!("Error trying to send event to server for routing: {}", e);
+            warn!("Error trying to send event to server for routing: {:?}", e);
         }
         // Follow up with our injected switch event reflecting the combo completion
         if combo_next {
@@ -244,6 +244,6 @@ async fn read_device_event(
         }
     };
     if let Err(e) = event_tx.send(event).await {
-        warn!("Error trying to send event to server for routing: {}", e);
+        warn!("Error trying to send event to server for routing: {:?}", e);
     }
 }

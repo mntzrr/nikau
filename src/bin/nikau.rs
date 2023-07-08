@@ -78,12 +78,12 @@ async fn handle_signals(
         match signal {
             signal::SIGUSR1 => {
                 if let Err(e) = out.send(deviceinput::Event::SwitchNext).await {
-                    error!("Failed to submit SwitchNext event for SIGUSR1: {}", e);
+                    error!("Failed to submit SwitchNext event for SIGUSR1: {:?}", e);
                 }
             }
             signal::SIGUSR2 => {
                 if let Err(e) = out.send(deviceinput::Event::SwitchPrev).await {
-                    error!("Failed to submit SwitchPrev event for SIGUSR2: {}", e);
+                    error!("Failed to submit SwitchPrev event for SIGUSR2: {:?}", e);
                 }
             }
             _ => continue,
@@ -119,7 +119,7 @@ fn main() -> Result<()> {
                 // Its a hostname? Try resolving it.
                 let mut socket_addrs = format!("{}:{}", args.host, args.port)
                     .to_socket_addrs()
-                    .map_err(|e| anyhow!("Failed to resolve --host={}: {}", args.host, e))?;
+                    .map_err(|e| anyhow!("Failed to resolve --host={}: {:?}", args.host, e))?;
                 if let Some(first) = socket_addrs.next() {
                     first
                 } else {
@@ -169,31 +169,31 @@ fn server(
         async_channel::Receiver<devicewatch::GrabEvent>,
     ) = async_channel::bounded(32);
 
+    let input_handler = deviceinput::InputHandler::new(&next_keys, prev_keys, event_tx)?;
+
     task::spawn(async move {
-        info!("Listening for clients: {}", listen_addr);
-        if let Err(e) = server::run_server(&listen_addr, verifier, event_rx, grab_tx).await {
-            error!("server fail: {}", e);
+        if let Err(e) = devicewatch::watch_loop(input_handler, grab_rx).await {
+            error!("Input device watch failure: {:?}", e);
         }
     });
 
-    let input_handler = deviceinput::InputHandler::new(&next_keys, prev_keys, event_tx)?;
-
-    let watch_loop = async move {
-        if let Err(e) = devicewatch::watch_loop(input_handler, grab_rx).await {
-            error!("Input device watch failure: {}", e);
+    let server_task = async move {
+        info!("Listening for clients: {}", listen_addr);
+        if let Err(e) = server::run_server(&listen_addr, verifier, event_rx, grab_tx).await {
+            error!("Server failure: {:?}", e);
         }
     };
 
     if let Some(exit_secs) = exit_secs {
         info!("Exiting in {} seconds...", exit_secs);
-        task::spawn(watch_loop);
+        task::spawn(server_task);
         task::block_on(async {
             task::sleep(Duration::from_secs(exit_secs as u64)).await;
         });
         info!("Exiting following --exit-secs={}", exit_secs);
         Ok(())
     } else {
-        task::block_on(watch_loop);
+        task::block_on(server_task);
         bail!("Exiting due to server failure")
     }
 }
@@ -210,7 +210,7 @@ fn client(connect_addr: SocketAddr, verifier: Arc<approval::NikauCertVerificatio
             if let Err(e) =
                 client::run_client(&bind_addr, &connect_addr, &mut virtual_devices, verifier2).await
             {
-                error!("Client failure: {}", e);
+                error!("Client failure: {:?}", e);
             }
         }
     });
