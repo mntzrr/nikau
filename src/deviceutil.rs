@@ -61,7 +61,7 @@ pub fn log_event(event: &InputEvent) -> String {
         InputEventKind::Key(_key) => {
             // Replace the key with an X to avoid logging passwords etc
             InputEventKind::Key(Key::KEY_X)
-        },
+        }
         k => k,
     };
     format!("{:?}={}", kind, event.value())
