@@ -127,10 +127,7 @@ impl NikauCertVerification {
         // Must release lock on self.known_certs during prompt to avoid breaking connectivity,
         // especially on the server, where it can break all clients until the server is restarted.
         if prompt_unknown_cert(their_cert, we_are_server) {
-            info!(
-                "{} cert approved: {}",
-                their_name, their_cert_fingerprint
-            );
+            info!("{} cert approved: {}", their_name, their_cert_fingerprint);
             if let Err(e) = certs::write_approved_cert(their_cert) {
                 warn!(
                     "{} was approved, but couldn't save cert to disk: {}",
@@ -223,7 +220,8 @@ Comfirm that the client startup image has this fingerprint:
 
 Allow this new client and save its certificate for future connections? ({}s timeout) [y/N]
 ",
-            their_cert_fingerprint, PROMPT_TIMEOUT_SECS)
+            their_cert_fingerprint, PROMPT_TIMEOUT_SECS
+        )
     } else {
         format!(
             "NEW UNKNOWN SERVER CONNECTION: Approval needed
@@ -237,7 +235,8 @@ Confirm that the server startup image has this fingerprint:
 
 Allow this new server and save its certificate for future connections? ({}s timeout) [y/N]
 ",
-            their_cert_fingerprint, PROMPT_TIMEOUT_SECS)
+            their_cert_fingerprint, PROMPT_TIMEOUT_SECS
+        )
     };
     prompt_yn(&message, false)
 }
