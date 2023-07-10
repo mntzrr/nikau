@@ -68,7 +68,7 @@ async fn handle_connection(
                 rotation
                     .lock()
                     .await
-                    .remove_client(connection.remote_address());
+                    .remove_client(connection.remote_address()).await;
                 break;
             }
             Ok(stream) => stream,

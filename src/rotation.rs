@@ -50,12 +50,13 @@ impl Rotation {
         );
     }
 
-    pub fn remove_client(&mut self, endpoint: SocketAddr) {
+    pub async fn remove_client(&mut self, endpoint: SocketAddr) {
         if let Ok(idx) = self.clients.binary_search_by(|c| c.endpoint.cmp(&endpoint)) {
             self.clients.remove(idx);
             if let Some(current_client) = self.current_client {
                 if current_client == endpoint {
-                    self.current_client = None;
+                    // Ensure ungrab is done!
+                    self.set_current_client(None).await;
                 }
             }
             info!(
