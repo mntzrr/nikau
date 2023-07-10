@@ -18,9 +18,9 @@ Nikau relies on the Linux uinput API, and supports Wayland, X11, and plain Linux
 
 It is packaged as a single executable which supports both server and client modes.
 
-The server is where the input devices are plugged in. The clients receive input events from the server, and emit them using virtual uinput devices.
+Input devices are connected to the server, which sends nput events to a selected client. Clients receive and emit input events from the server using virtual uinput devices.
 
-When a key is pressed or mouse is moved on the server, Nikau will encode and send the event over the network to the currently enabled client (if any). That client will then write the event to a virtual device, to be picked up by the host OS.
+When a key is pressed or mouse is moved on the server, Nikau will encode and send the event over the network to a selected client, if any. That client will then write the event to a virtual device, to be picked up by the OS.
 
 Key combinations are used to rotate between machines. The default is `LeftAlt+N` to go to the next machine, or `LeftAlt+P` to go to the previous machine. This is customized using commandline arguments on the server.
 
