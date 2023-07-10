@@ -3,8 +3,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{bail, Context, Result};
-use async_std::io as aio;
-use async_std::task;
+use async_std::{io as aio, task};
 use tracing::{error, info, warn};
 
 use crate::certs;
@@ -41,6 +40,13 @@ pub fn rustls_server_config(
     Ok(Arc::new(rustls_config))
 }
 
+struct ApprovalState {
+    /// Previously-approved certs found on disk, updated internally when approval prompts are confirmed
+    known_certs: Vec<rustls::Certificate>,
+    /// Whether a cert prompt is currently pending. We only allow one prompt to be pending at a time.
+    prompt_active: bool,
+}
+
 pub struct NikauCertVerification {
     /// Used for building rustls configs
     our_cert: rustls::Certificate,
@@ -48,8 +54,8 @@ pub struct NikauCertVerification {
     our_privkey: rustls::PrivateKey,
     /// Pre-approved cert fingerprints provided via commandline argument
     approved_cert_fingerprints: Vec<String>,
-    /// Previously-approved certs found on disk, updated internally when approval prompts are confirmed
-    known_certs: RwLock<Vec<rustls::Certificate>>,
+    /// Mutable certificate approval state
+    approval_state: RwLock<ApprovalState>,
 }
 
 impl NikauCertVerification {
@@ -66,7 +72,10 @@ impl NikauCertVerification {
             our_cert,
             our_privkey,
             approved_cert_fingerprints,
-            known_certs: RwLock::new(certs::load_known_certs()?),
+            approval_state: RwLock::new(ApprovalState {
+                known_certs: certs::load_known_certs()?,
+                prompt_active: false,
+            }),
         }))
     }
 
@@ -78,13 +87,13 @@ impl NikauCertVerification {
         approve_response: T,
     ) -> Result<T, rustls::Error> {
         let their_cert_fingerprint = certs::fingerprint(&their_cert);
-        if let Ok(mut known_certs) = self.known_certs.write() {
-            if known_certs.contains(their_cert) {
+        if let Ok(mut approval_state) = self.approval_state.write() {
+            if approval_state.known_certs.contains(their_cert) {
                 info!(
                     "{} cert has been approved before: {}",
                     their_name, their_cert_fingerprint
                 );
-                Ok(approve_response)
+                return Ok(approve_response);
             } else if self
                 .approved_cert_fingerprints
                 .contains(&their_cert_fingerprint)
@@ -96,33 +105,66 @@ impl NikauCertVerification {
                 // Don't save the cert to disk for --fingerprints.
                 // Saving to disk creates weird behavior if the user later changes the certs they approve.
                 // Maybe they don't WANT old certs to still be approved if the arg changes? Play it safe.
-                known_certs.push(their_cert.clone());
-                Ok(approve_response)
-            } else if prompt_unknown_cert(their_cert, we_are_server) {
-                if let Err(e) = certs::write_approved_cert(their_cert) {
-                    warn!(
-                        "{} was approved, but couldn't save cert to disk: {}",
-                        their_name, e
-                    );
-                }
-                // Store the approved cert locally so that we don't e.g. reprompt on reconnect later on
-                known_certs.push(their_cert.clone());
-                Ok(approve_response)
+                approval_state.known_certs.push(their_cert.clone());
+                return Ok(approve_response);
+            } else if approval_state.prompt_active {
+                // Only one prompt at a time, reject other prompts. They will retry connecting anyway.
+                return Err(rustls::Error::General(format!(
+                    "{} cert rejected: Approval prompt is already pending",
+                    their_name
+                )));
             } else {
-                info!(
-                    "{} cert not approved: {}",
-                    their_name, their_cert_fingerprint
-                );
-                Err(rustls::Error::General(format!(
-                    "{} cert wasn't approved by user: {}",
-                    their_name, their_cert_fingerprint
-                )))
+                approval_state.prompt_active = true;
+                // Prompt continues below after releasing lock
             }
         } else {
-            error!("Failed to get lock on known_certs");
-            Err(rustls::Error::General(
+            error!("Failed to get lock on known_certs for check");
+            return Err(rustls::Error::General(
                 "Failed to lock known certs".to_string(),
-            ))
+            ));
+        }
+
+        // Must release lock on self.known_certs during prompt to avoid breaking connectivity,
+        // especially on the server, where it can break all clients until the server is restarted.
+        if prompt_unknown_cert(their_cert, we_are_server) {
+            info!(
+                "{} cert approved: {}",
+                their_name, their_cert_fingerprint
+            );
+            if let Err(e) = certs::write_approved_cert(their_cert) {
+                warn!(
+                    "{} was approved, but couldn't save cert to disk: {}",
+                    their_name, e
+                );
+            }
+            // Store the approved cert locally so that we don't e.g. reprompt on reconnect later on
+            if let Ok(mut approval_state) = self.approval_state.write() {
+                approval_state.known_certs.push(their_cert.clone());
+                approval_state.prompt_active = false;
+            } else {
+                error!("Failed to get lock on known_certs for approval");
+                return Err(rustls::Error::General(
+                    "Failed to lock known certs".to_string(),
+                ));
+            }
+            Ok(approve_response)
+        } else {
+            info!(
+                "{} cert not approved: {}",
+                their_name, their_cert_fingerprint
+            );
+            if let Ok(mut approval_state) = self.approval_state.write() {
+                approval_state.prompt_active = false;
+            } else {
+                error!("Failed to get lock on known_certs for rejection");
+                return Err(rustls::Error::General(
+                    "Failed to lock mutable state".to_string(),
+                ));
+            }
+            Err(rustls::Error::General(format!(
+                "{} cert wasn't approved by user: {}",
+                their_name, their_cert_fingerprint
+            )))
         }
     }
 }
@@ -179,10 +221,8 @@ You will also likely need to confirm this connection on the client as well.
 Comfirm that the client startup image has this fingerprint:
     {}
 
-Answering yes allows the connection and saves the certificate as pre-approved for future connections.
-Answering no rejects the new client and closes the connection.
-
-Accept new client connection and save certificate as approved? ({}s timeout) [y/N]",
+Allow this new client and save its certificate for future connections? ({}s timeout) [y/N]
+",
             their_cert_fingerprint, PROMPT_TIMEOUT_SECS)
     } else {
         format!(
@@ -195,10 +235,8 @@ You will also likely need to confirm this connection on the server as well.
 Confirm that the server startup image has this fingerprint:
     {}
 
-Answering yes allows the connection and saves the certificate as pre-approved for future connections.
-Answering no rejects the new server and closes the connection.
-
-Accept new server connection and save certificate as approved? ({}s timeout) [y/N]",
+Allow this new server and save its certificate for future connections? ({}s timeout) [y/N]
+",
             their_cert_fingerprint, PROMPT_TIMEOUT_SECS)
     };
     prompt_yn(&message, false)
@@ -227,7 +265,7 @@ fn prompt_yn(msg: &str, default: bool) -> bool {
 }
 
 fn prompt_internal(msg: &str) -> Result<String> {
-    let msg_formatted = format!("{}: ", msg);
+    let msg_formatted = format!("{}", msg);
     let mut stdout = io::stdout();
     stdout
         .write_all(msg_formatted.as_bytes())

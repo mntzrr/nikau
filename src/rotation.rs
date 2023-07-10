@@ -122,9 +122,9 @@ impl Rotation {
             // Try to send switch{false} to last current_client.
             // If it fails then current_client is cleaned up.
             let _ = self
-                .send(messages::ServerMessageV1::Switch(
-                    messages::SwitchEventV1 { enabled: false },
-                ))
+                .send(messages::ServerMessageV1::Switch(messages::SwitchEventV1 {
+                    enabled: false,
+                }))
                 .await;
         }
 
@@ -134,9 +134,9 @@ impl Rotation {
             // Try to send switch{true} to the newly assigned current_client.
             // If it fails then current_client is cleaned up.
             if let Ok(()) = self
-                .send(messages::ServerMessageV1::Switch(
-                    messages::SwitchEventV1 { enabled: true },
-                ))
+                .send(messages::ServerMessageV1::Switch(messages::SwitchEventV1 {
+                    enabled: true,
+                }))
                 .await
             {
                 info!(

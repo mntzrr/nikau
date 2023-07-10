@@ -197,6 +197,8 @@ fn client(connect_addr: SocketAddr, verifier: Arc<approval::NikauCertVerificatio
                 client::run_client(&bind_addr, &connect_addr, &mut virtual_devices, verifier2).await
             {
                 error!("Client failure: {:?}", e);
+                // Wait a bit before retrying. Often happens when waiting for server to approve the cert.
+                task::sleep(Duration::from_secs(5)).await
             }
         }
     });
