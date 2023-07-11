@@ -8,7 +8,7 @@ packages:
 - qemu-user-static
 secrets:
 # creates /home/build/.docker/config.json
-- 199f277e-04fa-454d-a0b7-40aa2b7719d7
+- 53238824-89f5-4c14-bd90-5e1be107dd85
 environment:
   REPO_NAME: nikau
   IMAGE_NAME: ghcr.io/nickbp/nikau
