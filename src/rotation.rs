@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use quinn::SendStream;
@@ -6,16 +7,41 @@ use tracing::{info, trace, warn};
 
 use crate::{devicewatch, messages};
 
+/// If the selected client reconnects within 5 seconds of being removed, then reselect it automatically.
+/// This is intended to help with fast recovery following networking flakes.
+const REMOVED_CLIENT_RECOVERY_LIMIT: Duration = Duration::from_secs(5);
+
 #[derive(Debug)]
 struct ClientInfo {
     endpoint: SocketAddr,
     send: SendStream,
 }
 
+#[derive(Debug)]
+struct DefunctClientInfo {
+    endpoint: SocketAddr,
+    removed_at: Instant,
+}
+
+impl DefunctClientInfo {
+    /// Returns whether the specified endpoint should be reenabled as the selected client.
+    /// true is returned if the IPs match and if the defunct client was disconnected <= N seconds ago.
+    fn recoverable(&self, endpoint: SocketAddr, now: &Instant) -> bool {
+        // Only check IP, port is expected to change
+        endpoint.ip() == self.endpoint.ip() && !self.expired(now)
+    }
+
+    /// Returns whether this defunct client info has expired, in which case it can be cleared.
+    fn expired(&self, now: &Instant) -> bool {
+        now.duration_since(self.removed_at) > REMOVED_CLIENT_RECOVERY_LIMIT
+    }
+}
+
 pub struct Rotation {
     grab_tx: async_channel::Sender<devicewatch::GrabEvent>,
     clients: Vec<ClientInfo>,
     current_client: Option<SocketAddr>,
+    removed_current_client: Option<DefunctClientInfo>,
     buf: Vec<u8>,
 }
 
@@ -28,6 +54,7 @@ impl Rotation {
             grab_tx,
             clients: Vec::new(),
             current_client: None,
+            removed_current_client: None,
             buf,
         }
     }
@@ -48,6 +75,32 @@ impl Rotation {
                 .map(|c| c.endpoint)
                 .collect::<Vec<SocketAddr>>()
         );
+
+        // If the new client has the same IP as the currently enabled client, it's probably a fast retry
+        // where we haven't removed the prior session yet. Mark the new client as enabled/current.
+        // If two clients were connected from the same IP then this will result in spurious switches,
+        // but that shouldn't be the case in practice.
+        if let Some(current_client) = &self.current_client {
+            // Only check IP: port is expected to change between sessions
+            if current_client.ip() == endpoint.ip() {
+                self.update_current_client(Some(endpoint)).await;
+            }
+        }
+
+        // If the new client has the same IP as a recently disconnected client that was enabled,
+        // it's probably a slow reconnect. Mark the new client as enabled/current.
+        if let Some(removed_current_client) = &self.removed_current_client {
+            // Only check IP: port is expected to change between sessions
+            let now = Instant::now();
+            if removed_current_client.recoverable(endpoint, &now) {
+                // Enable this client automatically since it was recently disconnected
+                // This automatically unsets self.removed_current_client
+                self.update_current_client(Some(endpoint)).await;
+            } else if removed_current_client.expired(&now) {
+                // Clean up expired client info
+                self.removed_current_client = None;
+            }
+        }
     }
 
     pub async fn remove_client(&mut self, endpoint: SocketAddr) {
@@ -55,11 +108,15 @@ impl Rotation {
             self.clients.remove(idx);
             if let Some(current_client) = self.current_client {
                 if current_client == endpoint {
+                    // Current client is being removed. If it comes back soon, we can mark it current again.
+                    self.removed_current_client = Some(DefunctClientInfo{
+                        endpoint: current_client,
+                        removed_at: Instant::now()
+                    });
                     // Ensure ungrab is done!
                     self.set_current_client(None).await;
                 }
             }
-            // TODO if the client comes back in N seconds (quick disconnect/reconnect), maybe reactivate it automatically
             info!(
                 "Removed client {} from rotation: {:?}",
                 endpoint,
@@ -120,6 +177,10 @@ impl Rotation {
     }
 
     async fn update_current_client(&mut self, new_client: Option<SocketAddr>) {
+        // Either we automatically reenabled a client, or the user manually did.
+        // In either case, clear up any history of previously enabled clients.
+        self.removed_current_client = None;
+
         if let Some(_old_client) = self.current_client {
             // Try to send switch{false} to last current_client.
             // If it fails then current_client is cleaned up.
