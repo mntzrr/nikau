@@ -83,4 +83,4 @@ In order to have access to uinput devices, the client and server must both be ru
 
 ## License
 
-This project is [licensed](LICENCE.md) under the AGPLv3 and is copyright Nicholas Parker.
+This project is [licensed](LICENCE.md) under the AGPLv3 (or later) and is copyright Nicholas Parker.

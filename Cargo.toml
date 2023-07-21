@@ -2,7 +2,7 @@
 name = "nikau"
 version = "0.0.2"
 authors = ["Nick Parker <nick@nickbp.com>"]
-license-file = "LICENCE.md"
+license = "AGPL-3.0-or-later"
 edition = "2021"
 readme = "README-CRATES.md"
 description = "Linux network KVM for Wayland/X11/Console"
