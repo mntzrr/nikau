@@ -253,11 +253,20 @@ pub struct ClipboardTypes<'a> {
     /// Space-separated list of types that are supported by the current clipboard owner
     /// (Couldn't figure out how to have a vec or slice)
     pub types: &'a str,
+
+    /// Maximum size supported by the sender.
+    pub max_size_bytes: u64,
 }
 
 impl<'a> std::fmt::Display for ClipboardTypes<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        f.write_str(format!("ClipboardTypes(types=[{}])", self.types,).as_str())
+        f.write_str(
+            format!(
+                "ClipboardTypes(types=[{}], max_size_bytes={})",
+                self.types, self.max_size_bytes
+            )
+            .as_str(),
+        )
     }
 }
 
@@ -276,8 +285,8 @@ impl<'a> std::fmt::Display for ClipboardContentRequest<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         f.write_str(
             format!(
-                "ClipboardContentRequest(max_size_bytes={})",
-                self.max_size_bytes,
+                "ClipboardContentRequest(type={}, max_size_bytes={})",
+                self.type_, self.max_size_bytes,
             )
             .as_str(),
         )
@@ -292,15 +301,15 @@ pub struct ClipboardContentHeader<'a> {
     pub type_: &'a str,
 
     /// The length of the clipboard content that follows this header
-    pub content_bytes: u64,
+    pub content_len_bytes: u64,
 }
 
 impl<'a> std::fmt::Display for ClipboardContentHeader<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         f.write_str(
             format!(
-                "ClipboardContentHeader(type={}, content_bytes={})",
-                self.type_, self.content_bytes,
+                "ClipboardContentHeader(type={}, content_len_bytes={})",
+                self.type_, self.content_len_bytes,
             )
             .as_str(),
         )

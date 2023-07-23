@@ -1,5 +1,6 @@
 use anyhow::{anyhow, bail, Result};
-use tracing::debug;
+use async_std::task;
+use tracing::{debug, warn};
 use x11rb_async::connection::Connection;
 use x11rb_async::protocol::xproto::{Atom, AtomEnum, ConnectionExt, Property, Time};
 use x11rb_async::protocol::{xfixes, Event};
@@ -7,129 +8,37 @@ use x11rb_async::x11_utils::TryParse;
 
 use crate::x11clipboard::shared;
 
-pub struct ClipboardReader {
+/// Task that listens for updates to the clipboard types (local cut or copy).
+/// Sends out an event when an update occurs, indicating a new clipboard is available.
+pub struct ClipboardTypeWatcher {
     context: shared::XContext,
     atoms: shared::Atoms,
 }
 
-impl ClipboardReader {
-    pub async fn new() -> Result<Self> {
+impl ClipboardTypeWatcher {
+    // TODO(later) replace this DIY watching with tokio::sync::watch (fetch latest recved value)
+    pub async fn start(types_tx: async_channel::Sender<Vec<String>>) -> Result<()> {
         let context = shared::XContext::new().await?;
         let atoms = shared::Atoms::new(&context.conn).await?;
-        Ok(ClipboardReader { context, atoms })
-    }
-
-    async fn process_event(&self, buf: &mut Vec<u8>, target: Atom, property: Atom) -> Result<()> {
-        let mut is_incr = false;
-        loop {
-            let event = self.context.conn.wait_for_event().await?;
-            debug!("X11 reader event: {:?}", event);
-
-            match event {
-                Event::XfixesSelectionNotify(event) => {
-                    self.context
-                        .conn
-                        .convert_selection(
-                            self.context.window,
-                            self.atoms.clipboard,
-                            target,
-                            property,
-                            event.timestamp,
-                        )
-                        .await?
-                        .check()
-                        .await?;
-                }
-                Event::SelectionNotify(event) => {
-                    if event.selection != self.atoms.clipboard {
-                        continue;
-                    }
-                    if event.property == Atom::from(AtomEnum::NONE) {
-                        break;
-                    }
-
-                    let reply = self
-                        .context
-                        .conn
-                        .get_property(
-                            false,
-                            self.context.window,
-                            event.property,
-                            AtomEnum::NONE,
-                            buf.len() as u32,
-                            u32::MAX,
-                        )
-                        .await?
-                        .reply()
-                        .await?;
-
-                    if reply.type_ == self.atoms.incr {
-                        if let Some(mut value) = reply.value32() {
-                            if let Some(size) = value.next() {
-                                buf.reserve(size as usize);
-                            }
+        task::spawn(async move {
+            let mut watcher = Self { context, atoms };
+            loop {
+                match watcher.types_wait().await {
+                    Ok(types) => {
+                        if let Err(e) = types_tx.send(types).await {
+                            warn!("Failed to send updated types: {}", e);
                         }
-                        // Signal to other side that they should send more data:
-                        self.context
-                            .conn
-                            .delete_property(self.context.window, property)
-                            .await?
-                            .check()
-                            .await?;
-                        is_incr = true;
-                        continue;
                     }
-
-                    buf.extend_from_slice(&reply.value);
-                    break;
-                }
-                Event::PropertyNotify(event) if is_incr => {
-                    if event.state != Property::NEW_VALUE {
-                        continue;
-                    };
-
-                    let length = self
-                        .context
-                        .conn
-                        .get_property(false, self.context.window, property, AtomEnum::NONE, 0, 0)
-                        .await?
-                        .reply()
-                        .await?
-                        .bytes_after;
-
-                    let reply = self
-                        .context
-                        .conn
-                        .get_property(
-                            true,
-                            self.context.window,
-                            property,
-                            AtomEnum::NONE,
-                            0,
-                            length,
-                        )
-                        .await?
-                        .reply()
-                        .await?;
-                    if reply.type_ != target {
-                        continue;
-                    };
-
-                    let value = reply.value;
-
-                    if !value.is_empty() {
-                        buf.extend_from_slice(&value);
-                    } else {
-                        break;
+                    Err(e) => {
+                        warn!("Failed to wait for new types: {}", e)
                     }
                 }
-                _ => (),
             }
-        }
+        });
         Ok(())
     }
 
-    pub async fn types_wait(&mut self) -> Result<Vec<String>> {
+    async fn types_wait(&mut self) -> Result<Vec<String>> {
         let buf = self.read_wait(self.atoms.targets).await?;
         let mut atom_names = Vec::new();
         for atom in to_atoms(&buf)? {
@@ -138,39 +47,7 @@ impl ClipboardReader {
         Ok(atom_names)
     }
 
-    pub async fn read(&mut self, type_: &str) -> Result<Vec<u8>> {
-        let type_atom = self.atoms.to_atom(&self.context.conn, type_).await?;
-
-        self.context
-            .conn
-            .convert_selection(
-                self.context.window,
-                self.atoms.clipboard,
-                type_atom,
-                self.atoms.recv_clipboard,
-                Time::CURRENT_TIME,
-            )
-            .await?
-            .check()
-            .await?;
-
-        let mut buf = Vec::new();
-        self.process_event(&mut buf, type_atom, self.atoms.recv_clipboard)
-            .await?;
-
-        self.context
-            .conn
-            .delete_property(self.context.window, self.atoms.recv_clipboard)
-            .await?
-            .check()
-            .await?;
-
-        Ok(buf)
-    }
-
     async fn read_wait(&self, target: Atom) -> Result<Vec<u8>> {
-        let mut buf = Vec::new();
-
         let screen = &self
             .context
             .conn
@@ -199,8 +76,16 @@ impl ClipboardReader {
         .check()
         .await?;
 
-        self.process_event(&mut buf, target, self.atoms.recv_clipboard)
-            .await?;
+        let mut buf = Vec::new();
+        process_event(
+            &self.context,
+            &self.atoms,
+            &mut buf,
+            0,
+            target,
+            self.atoms.recv_clipboard,
+        )
+        .await?;
 
         self.context
             .conn
@@ -211,6 +96,169 @@ impl ClipboardReader {
 
         Ok(buf)
     }
+}
+
+pub struct ClipboardReader {
+    context: shared::XContext,
+    atoms: shared::Atoms,
+}
+
+impl ClipboardReader {
+    pub async fn new() -> Result<Self> {
+        let context = shared::XContext::new().await?;
+        let atoms = shared::Atoms::new(&context.conn).await?;
+        Ok(Self { context, atoms })
+    }
+
+    /// Reads the clipboard data for the specified type.
+    pub async fn read(&mut self, type_: &str, max_size_bytes: u64) -> Result<Vec<u8>> {
+        // TODO(later) check both request_max_size_bytes and client/server's configured max_size_bytes
+        let type_atom = self.atoms.to_atom(&self.context.conn, type_).await?;
+
+        self.context
+            .conn
+            .convert_selection(
+                self.context.window,
+                self.atoms.clipboard,
+                type_atom,
+                self.atoms.recv_clipboard,
+                Time::CURRENT_TIME,
+            )
+            .await?
+            .check()
+            .await?;
+
+        let mut buf = Vec::new();
+        process_event(
+            &self.context,
+            &self.atoms,
+            &mut buf,
+            max_size_bytes,
+            type_atom,
+            self.atoms.recv_clipboard,
+        )
+        .await?;
+
+        self.context
+            .conn
+            .delete_property(self.context.window, self.atoms.recv_clipboard)
+            .await?
+            .check()
+            .await?;
+
+        Ok(buf)
+    }
+}
+
+async fn process_event(
+    context: &shared::XContext,
+    atoms: &shared::Atoms,
+    buf: &mut Vec<u8>,
+    max_size_bytes: u64,
+    target: Atom,
+    property: Atom,
+) -> Result<()> {
+    let mut is_incr = false;
+    loop {
+        let event = context.conn.wait_for_event().await?;
+        debug!("X11 reader event: {:?}", event);
+
+        match event {
+            Event::XfixesSelectionNotify(event) => {
+                context
+                    .conn
+                    .convert_selection(
+                        context.window,
+                        atoms.clipboard,
+                        target,
+                        property,
+                        event.timestamp,
+                    )
+                    .await?
+                    .check()
+                    .await?;
+            }
+            Event::SelectionNotify(event) => {
+                if event.selection != atoms.clipboard {
+                    continue;
+                }
+                if event.property == Atom::from(AtomEnum::NONE) {
+                    break;
+                }
+
+                let reply = context
+                    .conn
+                    .get_property(
+                        false,
+                        context.window,
+                        event.property,
+                        AtomEnum::NONE,
+                        // Fetch data as of this offset
+                        buf.len() as u32,
+                        u32::MAX,
+                    )
+                    .await?
+                    .reply()
+                    .await?;
+
+                if reply.type_ == atoms.incr {
+                    if let Some(mut value) = reply.value32() {
+                        if let Some(size) = value.next() {
+                            buf.reserve(size as usize);
+                        }
+                    }
+                    context
+                        .conn
+                        .delete_property(context.window, property)
+                        .await?
+                        .check()
+                        .await?;
+                    is_incr = true;
+                    continue;
+                }
+
+                buf.extend_from_slice(&reply.value);
+
+                if max_size_bytes > 0 && buf.len() > max_size_bytes as usize {
+                    bail!("Aborting clipboard read: length={} exceeds max={}", buf.len(), max_size_bytes);
+                }
+                break;
+            }
+            Event::PropertyNotify(event) if is_incr => {
+                if event.state != Property::NEW_VALUE {
+                    continue;
+                };
+
+                let length = context
+                    .conn
+                    .get_property(false, context.window, property, AtomEnum::NONE, 0, 0)
+                    .await?
+                    .reply()
+                    .await?
+                    .bytes_after;
+
+                let reply = context
+                    .conn
+                    .get_property(true, context.window, property, AtomEnum::NONE, 0, length)
+                    .await?
+                    .reply()
+                    .await?;
+                if reply.type_ != target {
+                    continue;
+                };
+
+                let value = reply.value;
+
+                if !value.is_empty() {
+                    buf.extend_from_slice(&value);
+                } else {
+                    break;
+                }
+            }
+            _ => (),
+        }
+    }
+    Ok(())
 }
 
 fn to_atoms(buf: &Vec<u8>) -> Result<Vec<Atom>> {

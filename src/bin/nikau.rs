@@ -53,6 +53,11 @@ struct ServerArgs {
     /// Number of seconds to wait before automatically exiting the server, to safely test configuration
     #[arg(long)]
     exit_secs: Option<u32>,
+
+    // TODO(later) test behavior when server max is very small
+    /// Maximum size in bytes for transferring clipboard data
+    #[arg(long, default_value_t = 1048576)]
+    max_clipboard_size_bytes: u64,
 }
 
 #[derive(Args)]
@@ -67,6 +72,11 @@ struct ClientArgs {
     /// Server certificate fingerprints to automatically accept without prompting
     #[arg(long)]
     fingerprints: Option<Vec<String>>,
+
+    // TODO(later) test behavior when client max is very small
+    /// Maximum size in bytes for transferring clipboard data
+    #[arg(long, default_value_t = 1048576)]
+    max_clipboard_size_bytes: u64,
 }
 
 /// Listens for SIGUSR1 and SIGUSR2, treating them as "switch to next client" and "switch to prev client" respectively.
@@ -109,6 +119,7 @@ fn main() -> Result<()> {
                 args.shortcut_prev.as_deref(),
                 args.exit_secs,
                 verifier,
+                args.max_clipboard_size_bytes,
             )
         }
         Commands::Client(args) => {
@@ -130,7 +141,7 @@ fn main() -> Result<()> {
                 "client",
                 args.fingerprints.unwrap_or(vec![]),
             )?;
-            client(connect_addr, verifier)
+            client(connect_addr, verifier, args.max_clipboard_size_bytes)
         }
     }
 }
@@ -141,6 +152,7 @@ fn server(
     prev_keys: Option<&str>,
     exit_secs: Option<u32>,
     verifier: Arc<approval::NikauCertVerification>,
+    max_clipboard_size_bytes: u64,
 ) -> Result<()> {
     let (event_tx, event_rx): (
         async_channel::Sender<deviceinput::Event>,
@@ -168,7 +180,14 @@ fn server(
 
     let server_task = async move {
         info!("Listening for clients: {}", listen_addr);
-        server::run_server(&listen_addr, verifier, event_rx, grab_tx).await
+        server::run_server(
+            &listen_addr,
+            verifier,
+            event_rx,
+            grab_tx,
+            max_clipboard_size_bytes,
+        )
+        .await
     };
 
     if let Some(exit_secs) = exit_secs {
@@ -184,7 +203,11 @@ fn server(
     }
 }
 
-fn client(connect_addr: SocketAddr, verifier: Arc<approval::NikauCertVerification>) -> Result<()> {
+fn client(
+    connect_addr: SocketAddr,
+    verifier: Arc<approval::NikauCertVerification>,
+    max_clipboard_size_bytes: u64,
+) -> Result<()> {
     // Try to set up virtual devices up-front - exit early if we aren't root
     let mut virtual_devices = deviceoutput::VirtualDevices::new()
         .context("Failed to create virtual devices, are you root?")?;
@@ -193,8 +216,14 @@ fn client(connect_addr: SocketAddr, verifier: Arc<approval::NikauCertVerificatio
         loop {
             let verifier2 = verifier.clone();
             info!("Connecting to server: {}", connect_addr);
-            if let Err(e) =
-                client::run_client(&bind_addr, &connect_addr, &mut virtual_devices, verifier2).await
+            if let Err(e) = client::run_client(
+                &bind_addr,
+                &connect_addr,
+                &mut virtual_devices,
+                verifier2,
+                max_clipboard_size_bytes,
+            )
+            .await
             {
                 error!("Client error: {:?}", e);
                 // Wait a bit before retrying. Often happens when waiting for server to approve the cert.

@@ -17,7 +17,7 @@ use crate::x11clipboard::{shared, ClipboardData};
 /// A fetch request, and a path for sending the response.
 pub struct ClipboardFetch {
     /// The type that we want
-    pub desired_type: String,
+    pub type_: String,
 }
 
 pub struct ClipboardWriter {
@@ -46,8 +46,9 @@ impl ClipboardWriter {
         Ok(())
     }
 
+    /// Makes the provided clipboard data available to X11 for a paste operation
     pub async fn store_data(&self, data: ClipboardData) -> Result<()> {
-        // TODO check if we're expecting a fetch. discard the data if not
+        // TODO(later) check if we're expecting a fetch. discard the data if not
         self.data_tx.send(data).await?;
         Ok(())
     }
@@ -196,10 +197,10 @@ impl ClipboardServerState {
                         info!("Fetching clipboard for type {}={}", target.0, target.1);
                         fetch_tx
                             .send(ClipboardFetch {
-                                desired_type: target.1.clone(),
+                                type_: target.1.clone(),
                             })
                             .await?;
-                        // TODO timeout on retrieving data, where we mark the retrieval as closed
+                        // TODO(later) timeout on retrieving data, where we give up and return empty data?
                         let clipboard_data = data_rx
                             .next()
                             .await

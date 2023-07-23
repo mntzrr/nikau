@@ -1,11 +1,12 @@
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use quinn::SendStream;
+use serde::Serialize;
 use tracing::{debug, info, trace, warn};
 
-use crate::{devicewatch, messages};
+use crate::{devicewatch, messages, x11clipboard};
 
 /// If the selected client reconnects within 5 seconds of being removed, then reselect it automatically.
 /// This is intended to help with fast recovery following networking flakes.
@@ -15,6 +16,7 @@ const REMOVED_CLIENT_RECOVERY_LIMIT: Duration = Duration::from_secs(5);
 struct ClientInfo {
     endpoint: SocketAddr,
     events_send: SendStream,
+    bulk_send: SendStream,
 }
 
 #[derive(Debug)]
@@ -37,26 +39,45 @@ impl DefunctClientInfo {
     }
 }
 
+#[derive(Debug)]
+struct ClipboardInfo {
+    source: Option<SocketAddr>,
+    types: Vec<String>,
+    max_size_bytes: u64,
+}
+
+struct ClipboardRouting {
+    reader: x11clipboard::reader::ClipboardReader,
+    writer: x11clipboard::writer::ClipboardWriter,
+    current_clipboard: Option<ClipboardInfo>,
+}
+
 pub struct Rotation {
     grab_tx: async_channel::Sender<devicewatch::GrabEvent>,
     clients: Vec<ClientInfo>,
     current_client: Option<SocketAddr>,
     removed_current_client: Option<DefunctClientInfo>,
     buf: Vec<u8>,
+    clipboard_routing: ClipboardRouting,
 }
 
 impl Rotation {
-    pub fn new(grab_tx: async_channel::Sender<devicewatch::GrabEvent>) -> Rotation {
+    pub async fn new(grab_tx: async_channel::Sender<devicewatch::GrabEvent>, clipboard_fetch_tx: async_channel::Sender<x11clipboard::writer::ClipboardFetch>) -> Result<Self> {
         let mut buf = Vec::with_capacity(1024);
         // Init required for space to be usable
         buf.resize(buf.capacity(), 0);
-        Rotation {
+        Ok(Rotation {
             grab_tx,
             clients: Vec::new(),
             current_client: None,
             removed_current_client: None,
             buf,
-        }
+            clipboard_routing: ClipboardRouting {
+                reader: x11clipboard::reader::ClipboardReader::new().await?,
+                writer: x11clipboard::writer::ClipboardWriter::new(clipboard_fetch_tx).await?,
+                current_clipboard: None,
+            },
+        })
     }
 
     pub async fn add_client(
@@ -75,6 +96,7 @@ impl Rotation {
             ClientInfo {
                 endpoint,
                 events_send,
+                bulk_send,
             },
         );
 
@@ -124,26 +146,7 @@ impl Rotation {
             }
         };
 
-        self.clients.remove(idx);
-        if let Some(current_client) = self.current_client {
-            if current_client == endpoint {
-                // Current client is being removed. If it comes back soon, we can mark it current again.
-                self.removed_current_client = Some(DefunctClientInfo {
-                    endpoint: current_client,
-                    removed_at: Instant::now(),
-                });
-                // Ensure ungrab is done!
-                self.set_current_client(None).await;
-            }
-        }
-        info!(
-            "Removed client {} from rotation: {:?}",
-            endpoint,
-            self.clients
-                .iter()
-                .map(|c| c.endpoint)
-                .collect::<Vec<SocketAddr>>()
-        );
+        self.handle_client_removal(&endpoint, idx).await;
     }
 
     pub async fn prev_client(&mut self) {
@@ -195,32 +198,91 @@ impl Rotation {
         &mut self,
         source: Option<SocketAddr>,
         types: Vec<String>,
-    ) {
-        // TODO:
-        // - send types to active client now (or to local x11 if local)
-        // - automatically send types to future active clients (or to local x11 if using local)
-        // - keep track of source for serving clipboard requests
+        max_size_bytes: u64,
+    ) -> Result<()> {
+        debug!("Updating target clipboard: types={:?} from source={:?} with max_size_bytes={}", types, source, max_size_bytes);
+        // Save the clipboard types/source for future retrievals and client switches
+        self.clipboard_routing.current_clipboard = Some(ClipboardInfo {
+            source,
+            types: types.clone(),
+            max_size_bytes,
+        });
+        if self.current_client.is_some() {
+            // Store the types for advertising to X11 in the remote client
+            let types_str = types.join(" ");
+            let types_msg = messages::ServerMessage::ClipboardTypes(messages::ClipboardTypes {
+                types: &types_str,
+                max_size_bytes,
+            });
+            self.send_event(types_msg).await?;
+        } else {
+            // Currently on local machine, send types to local X11
+            self.clipboard_routing.writer.store_types(types).await?;
+        }
+        Ok(())
     }
 
     pub async fn clipboard_request_content(
         &mut self,
-        source: Option<SocketAddr>,
+        request_source: Option<SocketAddr>,
         type_: &str,
         max_size_bytes: u64,
-    ) {
-        // TODO:
-        // - send query to the last clipboard_update_source(source) (or read from local x11 if it was local)
-        // - keep track of the outstanding request for sending the data back to that client via their bulk_send
+    ) -> Result<()> {
+        debug!("Handling clipboard content request from source={:?} for type={} with max_size_bytes={}: have {:?}", request_source, type_, max_size_bytes, self.clipboard_routing.current_clipboard);
+        let current_clipboard = match &self.clipboard_routing.current_clipboard {
+            Some(c) => c,
+            None => {
+                bail!("No clipboard types available: request from {:?} for type {}", request_source, type_);
+            },
+        };
+        if !current_clipboard.types.contains(&type_.to_string()) {
+            bail!("Requested clipboard type {} isn't among available types: {:?}", type_, current_clipboard.types);
+        }
+
+        if let Some(clipboard_source) = &current_clipboard.source.clone() {
+            // Client has the clipboard: route request to them
+            let msg = messages::BulkMessage::ClipboardContentRequest(messages::ClipboardContentRequest {
+                type_,
+                max_size_bytes,
+            });
+            self.send_bulk(clipboard_source, msg, None).await
+        } else {
+            if let Some(request_source) = &request_source {
+                // Server has the clipboard: read and send back to request_source immediately.
+                let content = self.clipboard_routing.reader.read(type_, max_size_bytes).await?;
+                let msg = messages::BulkMessage::ClipboardContentHeader(messages::ClipboardContentHeader {
+                    type_,
+                    content_len_bytes: content.len() as u64,
+                });
+                self.send_bulk(request_source, msg, Some(content)).await
+            } else {
+                bail!("Request for server to get clipboard from itself?");
+            }
+        }
     }
 
-    pub async fn clipboard_send_content(&mut self, type_: &str, content: &[u8]) {
-        // TODO:
-        // - provide to local X11 if request was local, or send to the last requesting client via their bulk_send
+    pub async fn clipboard_send_content(
+        &mut self,
+        request_source: SocketAddr,
+        data: x11clipboard::ClipboardData,
+    ) -> Result<()> {
+        debug!("Handling clipboard content of type={} with len={} from source={:?} to current={:?}", data.type_, data.data.len(), request_source, self.current_client);
+        if let Some(_current_client) = &self.current_client {
+            // Send to remote client
+            let msg = messages::BulkMessage::ClipboardContentHeader(messages::ClipboardContentHeader {
+                type_: &data.type_,
+                content_len_bytes: data.data.len() as u64,
+            });
+            self.send_bulk(&request_source, msg, Some(data.data)).await
+        } else {
+            // Send to local X11
+            self.clipboard_routing.writer.store_data(data).await
+        }
     }
 
     async fn update_current_client(&mut self, new_client: Option<SocketAddr>) {
         // Either we automatically reenabled a client, or the user manually did.
-        // In either case, clear up any history of previously enabled clients.
+        // In either case, clear up any history of previously enabled disconnected clients.
         self.removed_current_client = None;
 
         if let Some(_old_client) = self.current_client {
@@ -233,7 +295,7 @@ impl Rotation {
                 .await;
         }
 
-        self.set_current_client(new_client).await;
+        self.set_and_grab_current_client(new_client).await;
 
         if let Some(new_client) = new_client {
             // Try to send switch{true} to the newly assigned current_client.
@@ -244,6 +306,18 @@ impl Rotation {
                 }))
                 .await
             {
+                if let Some(clipboard_info) = &self.clipboard_routing.current_clipboard {
+                    // Update new client with the clipboard types to be advertised
+                    let types_str = clipboard_info.types.join(" ");
+                    let types_msg = messages::ServerMessage::ClipboardTypes(messages::ClipboardTypes {
+                        types: &types_str,
+                        max_size_bytes: clipboard_info.max_size_bytes,
+                    });
+                    // If the send fails then current_client is cleaned up.
+                    if let Err(_e) = self.send_event(types_msg).await {
+                        return;
+                    }
+                }
                 info!(
                     "Switched to client: {} (clients: {:?})",
                     new_client,
@@ -254,6 +328,10 @@ impl Rotation {
                 );
             }
         } else {
+            if let Some(clipboard_info) = &self.clipboard_routing.current_clipboard {
+                // Provide local machine with the clipboard types to be advertised
+                let _ = self.clipboard_routing.writer.store_types(clipboard_info.types.clone()).await;
+            }
             info!(
                 "Switched to local machine (clients: {:?})",
                 self.clients
@@ -265,9 +343,13 @@ impl Rotation {
     }
 
     pub async fn send_event(&mut self, msg: messages::ServerMessage<'_>) -> Result<()> {
-        let current_client = match &self.current_client {
+        let current_client = match self.current_client.clone() {
             Some(client) => client,
-            None => return Ok(()),
+            None => {
+                // This could be a race with automatically switching to the local machine
+                warn!("Dropping event since we are currently on local machine: {}", msg); // TODO(later) downgrade to debug?
+                return Ok(());
+            },
         };
 
         match self
@@ -280,27 +362,97 @@ impl Rotation {
                     .get_mut(idx)
                     .expect("missing current_client")
                     .events_send;
-                if let Err(e) = send_event_to_client(events_send, msg, &mut self.buf).await {
-                    info!(
-                        "Client {} has disconnected, switching to local machine: {:?}",
-                        current_client, e
-                    );
-                    // Client is dead, remove it and switch to local machine
-                    self.clients.remove(idx);
-                    self.set_current_client(None).await;
+                if let Err(e) = send_message_to_client(events_send, &msg, &mut self.buf).await {
+                    self.handle_client_removal(&current_client, idx).await;
                     return Err(e);
                 }
             }
             Err(_idx) => {
-                // Shouldn't happen
-                warn!("Current client is not found in clients map");
-                self.set_current_client(None).await;
+                // Shouldn't happen, but recover by setting to local machine and ungrabbing
+                warn!("Active event client is not found in clients map");
+                self.set_and_grab_current_client(None).await;
             }
         }
         Ok(())
     }
 
-    async fn set_current_client(&mut self, client: Option<SocketAddr>) {
+    async fn send_bulk(&mut self, endpoint: &SocketAddr, msg: messages::BulkMessage<'_>, payload: Option<Vec<u8>>) -> Result<()> {
+
+        match self
+            .clients
+            .binary_search_by(|c| c.endpoint.cmp(&endpoint))
+        {
+            Ok(idx) => {
+                let bulk_send = &mut self
+                    .clients
+                    .get_mut(idx)
+                    .expect("missing current_client")
+                    .bulk_send;
+                // Try sending the message, then the payload. Stop on the first failure, to handle below.
+                if let Err(e) = send_message_to_client(bulk_send, &msg, &mut self.buf).await {
+                    self.handle_client_removal(endpoint, idx).await;
+                    return Err(e);
+                }
+                if let Some(payload) = payload {
+                    trace!("Sending {} byte payload", payload.len());
+                    if let Err(e) = bulk_send.write_all(&payload).await {
+                        self.handle_client_removal(endpoint, idx).await;
+                        return Err(e.into());
+                    }
+                }
+            }
+            Err(_idx) => {
+                // Shouldn't happen, but recover by setting to local machine and ungrabbing
+                warn!("Requested bulk client {} not found in clients map", endpoint);
+                self.set_and_grab_current_client(None).await;
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle_client_removal(&mut self, endpoint: &SocketAddr, idx: usize) {
+        self.clients.remove(idx);
+        let client_list = self.clients
+            .iter()
+            .map(|c| c.endpoint.to_string())
+            .collect::<Vec<String>>()
+            .join(", ");
+
+        if let Some(clipboard_info) = &self.clipboard_routing.current_clipboard {
+            if let Some(clipboard_source) = &clipboard_info.source {
+                if clipboard_source == endpoint {
+                    // Clear clipboard status owned by removed client
+                    self.clipboard_routing.current_clipboard = None;
+                }
+            }
+        }
+
+        if let Some(current_client) = self.current_client {
+            if current_client == *endpoint {
+                // This is the active client. Remove it AND switch to local machine.
+                info!(
+                    "Removing client {} from rotation and switching to local machine: {:?}",
+                    endpoint, client_list
+                );
+
+                // Current client is being removed. If it comes back soon, we can mark it current again.
+                self.removed_current_client = Some(DefunctClientInfo {
+                    endpoint: current_client,
+                    removed_at: Instant::now(),
+                });
+
+                self.set_and_grab_current_client(None).await;
+                return;
+            }
+        }
+
+        info!(
+            "Removing client {} from rotation: {:?}",
+            endpoint, client_list
+        );
+    }
+
+    async fn set_and_grab_current_client(&mut self, client: Option<SocketAddr>) {
         self.current_client = client;
         let grab = if client.is_some() {
             devicewatch::GrabEvent::Grab
@@ -317,21 +469,23 @@ impl Rotation {
     }
 }
 
-async fn send_event_to_client(
-    events_send: &mut quinn::SendStream,
-    msg: messages::ServerMessage<'_>,
+async fn send_message_to_client<T>(
+    send: &mut quinn::SendStream,
+    msg: &T,
     buf: &mut Vec<u8>,
-) -> Result<()> {
+) -> Result<()>
+where T: Serialize + ?Sized
+{
     // Serialize message data: postcard with cobs encoding for event framing
     let serializedmsg = postcard::to_slice_cobs(&msg, buf)
-        .map_err(|e| anyhow!("Failed to serialize event message: {:?}", e))?;
+        .map_err(|e| anyhow!("Failed to serialize message: {:?}", e))?;
     trace!(
-        "Sending {} byte event: {:X?}",
+        "Sending {} byte serialized message: {:X?}",
         serializedmsg.len(),
         &serializedmsg
     );
-    events_send
+    send
         .write_all(&serializedmsg)
         .await
-        .context("Failed to send event message")
+        .context("Failed to send serialized message")
 }

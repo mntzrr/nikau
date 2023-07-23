@@ -154,6 +154,7 @@ async fn read_device_events(
                             stream.device().name(),
                             e
                         );
+                        // TODO(later) missing loop exit?
                     }
                 }
             },

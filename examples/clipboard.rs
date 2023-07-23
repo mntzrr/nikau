@@ -21,6 +21,8 @@ fn main() -> Result<()> {
 }
 
 async fn do_thing() -> Result<()> {
+    let (clipboard_types_tx, mut clipboard_types_rx) = async_channel::bounded(32);
+    x11clipboard::reader::ClipboardTypeWatcher::start(clipboard_types_tx).await?;
     let mut reader = x11clipboard::reader::ClipboardReader::new().await?;
     let type_ = "UTF8_STRING";
     let types = vec![
@@ -35,17 +37,17 @@ async fn do_thing() -> Result<()> {
     let writer = Arc::new(Mutex::new(
         x11clipboard::writer::ClipboardWriter::new(fetch_tx).await?,
     ));
+
     let writer2 = writer.clone();
     task::spawn(async move {
         loop {
             if let Some(fetch) = fetch_rx.next().await {
                 info!("got fetch from writer");
                 // pretend that we're a server fetching a result here...
-                // TODO try a sleep?
                 let mut data = Vec::new();
                 data.extend_from_slice(b"hello xorg");
                 let d = x11clipboard::ClipboardData {
-                    type_: fetch.desired_type,
+                    type_: fetch.type_,
                     data,
                     remaining_bytes: 0,
                 };
@@ -56,7 +58,12 @@ async fn do_thing() -> Result<()> {
         }
     });
 
-    x11_fetch_types(&mut reader).await?;
+
+    info!("waiting for new clipboard types...");
+    if let Some(clipboard_types) = clipboard_types_rx.next().await {
+        info!("got clipboard types: {:?}", clipboard_types);
+    }
+
     x11_fetch_data(&mut reader, type_).await?;
 
     {
@@ -64,7 +71,11 @@ async fn do_thing() -> Result<()> {
         x11_store_types(&mut writer, &types).await?;
     }
 
-    x11_fetch_types(&mut reader).await?;
+    info!("checking for appearance of new clipboard types...");
+    if let Some(clipboard_types) = clipboard_types_rx.next().await {
+        info!("got clipboard types: {:?}", clipboard_types);
+    }
+
     x11_fetch_data(&mut reader, type_).await?;
     x11_fetch_data(&mut reader, type_).await?;
 
@@ -81,21 +92,11 @@ async fn x11_store_types(
     Ok(())
 }
 
-async fn x11_fetch_types(clipboard: &mut x11clipboard::reader::ClipboardReader) -> Result<()> {
-    info!("waiting for new clipboard types...");
-    let types = clipboard.types_wait().await?;
-    if types.contains(&"image/png".to_string()) {
-        info!("sweet");
-    }
-    info!("fetched clipboard types: {:?}", types);
-    Ok(())
-}
-
 async fn x11_fetch_data(
     clipboard: &mut x11clipboard::reader::ClipboardReader,
     type_: &str,
 ) -> Result<()> {
-    let val = clipboard.read(type_).await?;
+    let val = clipboard.read(type_, 0).await?;
     if val.len() > 256 {
         info!("x11 fetch clipboard: {} bytes", val.len());
     } else {

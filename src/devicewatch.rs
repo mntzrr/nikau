@@ -83,6 +83,7 @@ pub async fn watch_loop<F: DeviceHandler>(
     // Start handler to consume new/removed device events
     loop {
         select! {
+            // TODO(later) replace this DIY broadcast with tokio::sync::broadcast
             grab = grab_rx.next() => {
                 if let Some(grab) = grab {
                     trace!("Updating {} devices with grab state: {:?}", devices.len(), grab);
