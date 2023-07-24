@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use anyhow::{bail, Context, Result};
 use async_std::task;
 use futures::{select, FutureExt, StreamExt};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 use x11rb_async::connection::{Connection, RequestConnection};
 use x11rb_async::protocol::xproto::{
     Atom, AtomEnum, ChangeWindowAttributesAux, ConnectionExt, EventMask, PropMode, Property,
@@ -145,7 +145,7 @@ impl ClipboardServerState {
         fetch_tx: &async_channel::Sender<ClipboardFetch>,
         data_rx: &mut async_channel::Receiver<ClipboardData>,
     ) -> Result<()> {
-        debug!("X11 writer/server event: {:?}", event);
+        trace!("X11 writer/server event: {:?}", event);
         match event {
             Event::SelectionRequest(event) => {
                 let clipboard_types = match &self.clipboard_types {
@@ -159,9 +159,11 @@ impl ClipboardServerState {
                 if event.target == self.atoms.targets {
                     // request to get the available clipboard targets
                     debug!("Returning available clipboard types: {:?}", clipboard_types);
-                    let target_count = 1 + clipboard_types.len(); // the data types, plus TARGETS
+                    // TARGETS, NIKAU_CANARY, and the data types themselves:
+                    let target_count = 2 + clipboard_types.len();
                     let mut data_u8 = Vec::with_capacity(4 * target_count);
                     data_u8.extend(self.atoms.targets.to_ne_bytes());
+                    data_u8.extend(self.atoms.nikau_canary.to_ne_bytes());
                     for type_ in clipboard_types {
                         data_u8.extend(type_.0.to_ne_bytes());
                     }
@@ -183,7 +185,7 @@ impl ClipboardServerState {
                     let target = match clipboard_types.iter().find(|t| t.0 == event.target) {
                         Some(t) => t,
                         None => bail!(
-                            "Client requested clipboard type {} when we support {:?}",
+                            "X11 requested clipboard type {} when we support {:?}",
                             event.target,
                             clipboard_types
                         ),

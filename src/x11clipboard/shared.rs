@@ -8,10 +8,14 @@ use x11rb_async::protocol::xproto::{
 };
 use x11rb_async::rust_connection::RustConnection;
 
+/// A clipboard type that we advertise to tell if we're serving a clipboard already
+pub(crate) const NIKAU_CANARY_TARGET: &str = "__NIKAU_CANARY__";
+
 pub(crate) struct Atoms {
     // atoms that are needed internally:
     pub(crate) clipboard: Atom,
     pub(crate) targets: Atom,
+    pub(crate) nikau_canary: Atom,
     pub(crate) incr: Atom,
     pub(crate) recv_clipboard: Atom,
 
@@ -25,6 +29,7 @@ impl Atoms {
             // start with stub values:
             clipboard: Atom::MIN,
             targets: Atom::MIN,
+            nikau_canary: Atom::MIN,
             incr: Atom::MIN,
             recv_clipboard: Atom::MIN,
             atom_to_name: HashMap::new(),
@@ -33,6 +38,7 @@ impl Atoms {
         // populate values and fill in cache maps:
         atoms.clipboard = atoms.to_atom(conn, "CLIPBOARD").await?;
         atoms.targets = atoms.to_atom(conn, "TARGETS").await?;
+        atoms.nikau_canary = atoms.to_atom(conn, NIKAU_CANARY_TARGET).await?;
         atoms.incr = atoms.to_atom(conn, "INCR").await?;
         atoms.recv_clipboard = atoms.to_atom(conn, "NIKAU_CLIPBOARD_OUT").await?;
         Ok(atoms)

@@ -1,6 +1,6 @@
 use anyhow::Result;
 use evdev::{uinput, AbsInfo, AbsoluteAxisType, AttributeSet, EvdevEnum, InputEvent, Key};
-use tracing::{debug, info, warn};
+use tracing::{info, trace, warn};
 
 use crate::deviceutil;
 use crate::messages;
@@ -54,7 +54,7 @@ impl VirtualDevices {
                 // We only do this queueing because VirtualDevice::emit() internally
                 // writes its own sync event that we can't skip.
                 if !events.is_empty() {
-                    debug!(
+                    trace!(
                         "Sending {} events to {} device: {:?}",
                         events.len(),
                         net_event.target,

@@ -13,25 +13,6 @@ pub struct VersionBootstrapMessage {
     pub version: u64,
 }
 
-/*
-TODO clipboard flow, generally 'pull-based' except for when advertising ClipboardTypes on client switch:
-
-- client being activated: maybe recv ClipboardTypes from server, in which case advertise the types to x11
-- client being deactivated: send most recent local ClipboardTypes to server who can forward to the next client, or stop advertising the types to x11 if there are no local ClipboardTypes
-- active client when copy occurs: keep ClipboardTypes locally, to send to server upon deactivation
-- active client when paste occurs: send ClipboardContentRequest to server, read ClipboardContent from server
-- client receiving ClipboardContentRequest: request the type from the local application, send ClipboardContent with the result
-
-- server receiving ClipboardTypes: send to next client(s) upon their activation
-- server activating new client: send most recent ClipboardTypes to new client if available (or skip if not)
-- server receiving ClipboardContentRequest: send ClipboardContentRequest to clipboard client that last sent ClipboardTypes
-- server receiving ClipboardContent from clipboard client: send ClipboardContent to requesting client
-- server when clipboard client disconnects: send empty ClipboardTypes to active client
-
-NOTE: client shouldnt do anything to locally buffered data if local copy/paste occurs when deactivated
-NOTE: server may be a 'client' in local mode here
-*/
-
 /// A serialized message sent from the server to a client.
 /// Changes to this signature likely require changing PROTOCOL_VERSION.
 #[derive(Debug, Deserialize, Serialize)]

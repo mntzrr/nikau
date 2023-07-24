@@ -212,7 +212,13 @@ fn client(
     let mut virtual_devices = deviceoutput::VirtualDevices::new()
         .context("Failed to create virtual devices, are you root?")?;
     let bind_addr: SocketAddr = "0.0.0.0:0".parse()?;
+
     task::block_on(async move {
+        let mut clipboard = match client::ClientClipboard::new().await {
+            Ok(c) => c,
+            Err(e) => panic!("Failed to initialize client clipboard: {:?}", e),
+        };
+
         loop {
             let verifier2 = verifier.clone();
             info!("Connecting to server: {}", connect_addr);
@@ -222,6 +228,7 @@ fn client(
                 &mut virtual_devices,
                 verifier2,
                 max_clipboard_size_bytes,
+                &mut clipboard,
             )
             .await
             {

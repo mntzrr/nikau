@@ -115,16 +115,19 @@ async fn handle_connection(
 
     // Receive version from client and close the connection if it's not supported.
     // Future versions could follow the version message with more data. We ignore/discard it here.
-    {
-        let mut version_buf = vec![];
-        transport::recv_version(&mut events_recv, &mut version_buf).await?;
-    }
+    let mut event_bytes = Vec::with_capacity(1024);
+    transport::recv_version(&mut events_recv, &mut event_bytes).await?;
 
     // Start second stream for bulk messages
     let (bulk_send, mut bulk_recv) = conn
         .accept_bi()
         .await
         .context("Failed to initialize bulk stream")?;
+
+    // Receive the version a second time, on the bulk stream.
+    // Sending some data is required to initialize the bulk stream, so let's just repeat ourselves.
+    // Maybe we'll want to have different per-stream versions someday? Probably not.
+    transport::recv_version(&mut bulk_recv, &mut event_bytes).await?;
 
     // Add client to the rotation after a successful init
     rotation
@@ -133,7 +136,6 @@ async fn handle_connection(
         .add_client(conn.remote_address(), events_send, bulk_send)
         .await;
 
-    let mut event_bytes = Vec::with_capacity(1024);
     let mut bulk_bytes = Vec::with_capacity(1024); // TODO(later) 65536 here and below once chunking is known-good
     let mut clipboard: Option<x11clipboard::ClipboardData> = None;
     loop {
@@ -202,9 +204,10 @@ async fn handle_event_messages(
     let mut offset = 0;
     let bytes_len = bytes.len();
     while offset < bytes_len {
+        let bytes2 = bytes.clone();
         let (msg, resp_remainder) =
             postcard::take_from_bytes_cobs::<messages::ClientMessage>(&mut bytes[offset..])
-                .map_err(|e| anyhow!("Failed to deserialize client message: {:?}", e))?;
+            .map_err(|e| anyhow!("Failed to deserialize client message: {:?} bytes(off={})={:X?}", e, offset, bytes2))?;
         let consumed = bytes_len - resp_remainder.len() - offset;
         trace!(
             "Consumed event at offset={}: {} ({} bytes)",
@@ -214,7 +217,7 @@ async fn handle_event_messages(
         );
         match msg {
             messages::ClientMessage::ClipboardTypes(t) => {
-                let types: Vec<String> = t.types.split(",").map(|t| t.to_string()).collect();
+                let types: Vec<String> = t.types.split(" ").map(|t| t.to_string()).collect();
                 rotation
                     .lock()
                     .await

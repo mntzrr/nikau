@@ -4,7 +4,7 @@ use anyhow::{anyhow, bail, Result};
 use async_std::task;
 use evdev::{EventStream, EventType, InputEvent, Key};
 use futures::{select, FutureExt, StreamExt};
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 
 use crate::devicewatch::{DeviceHandle, DeviceHandler, GrabEvent};
 use crate::{deviceutil, messages};
@@ -154,7 +154,7 @@ async fn read_device_events(
                             stream.device().name(),
                             e
                         );
-                        // TODO(later) missing loop exit?
+                        return;
                     }
                 }
             },
@@ -209,7 +209,7 @@ async fn read_device_event(
             Event::SwitchPrev
         }
     } else {
-        debug!(
+        trace!(
             "{} event {:?}: {}",
             device_info.target,
             device.name().unwrap_or("(Unnamed device)"),

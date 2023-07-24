@@ -9,12 +9,36 @@ use tracing::{info, trace};
 
 use crate::{approval, deviceoutput, messages, transport, x11clipboard};
 
+pub struct ClientClipboard {
+    reader: x11clipboard::reader::ClipboardReader,
+    writer: x11clipboard::writer::ClipboardWriter,
+    fetch_rx: async_channel::Receiver<x11clipboard::writer::ClipboardFetch>,
+    types_rx: async_channel::Receiver<Vec<String>>,
+}
+
+impl ClientClipboard {
+    pub async fn new() -> Result<Self> {
+        let (fetch_tx, fetch_rx) = async_channel::bounded(32);
+        let reader = x11clipboard::reader::ClipboardReader::new().await?;
+        let (types_tx, types_rx) = async_channel::bounded(32);
+        x11clipboard::reader::ClipboardTypeWatcher::start(types_tx).await?;
+        let writer = x11clipboard::writer::ClipboardWriter::new(fetch_tx).await?;
+        Ok(Self {
+            reader,
+            writer,
+            fetch_rx,
+            types_rx,
+        })
+    }
+}
+
 pub async fn run_client(
     bind_addr: &SocketAddr,
     server_addr: &SocketAddr,
     virtual_devices: &mut deviceoutput::VirtualDevices,
     cert_verifier: Arc<approval::NikauCertVerification>,
     max_clipboard_size_bytes: u64,
+    clipboard: &mut ClientClipboard,
 ) -> Result<()> {
     let client_endpoint = transport::build_client(bind_addr, cert_verifier)?;
     // Connect to server, our custom cert verifiers result in server_name being ignored
@@ -28,35 +52,36 @@ pub async fn run_client(
         .context("Failed to initialize events stream")?;
 
     // Send version to server, who will close the connection if they can't support it.
-    let mut event_bytes = Vec::with_capacity(1024);
-    transport::send_version(&mut events_send, &mut event_bytes).await?;
+    transport::send_version(&mut events_send).await?;
 
     let (mut bulk_send, mut bulk_recv) = conn
         .open_bi()
         .await
         .context("Failed to initialize bulk stream")?;
 
-    let (fetch_tx, mut fetch_rx) = async_channel::bounded(32);
-    let mut clipboard_reader = x11clipboard::reader::ClipboardReader::new().await?;
-    let (clipboard_types_tx, mut clipboard_types_rx) = async_channel::bounded(32);
-    x11clipboard::reader::ClipboardTypeWatcher::start(clipboard_types_tx).await?;
-    let mut clipboard_writer = x11clipboard::writer::ClipboardWriter::new(fetch_tx).await?;
+    // Send version to server again via the bulk stream.
+    // This is required in order to initialize the bulk stream,
+    // otherwise the server times out waiting for the stream to open.
+    transport::send_version(&mut bulk_send).await?;
 
+    // Reusable buffer for receiving keyboard events.
+    let mut event_bytes = Vec::with_capacity(1024);
+    // Reusable buffer for receiving bulk data (clipboards).
     let mut bulk_recv_bytes = Vec::with_capacity(1024); // TODO(later) 65536 here and below once chunking is known-good
-    let mut clipboard: Option<x11clipboard::ClipboardData> = None;
+    let mut clipboard_data: Option<x11clipboard::ClipboardData> = None;
     let mut clipboard_types: Option<Vec<String>> = None;
     info!("Waiting to be activated by server...");
     loop {
         let mut event_fut = pin!(events_recv.read_chunk(1024, true).fuse());
         let mut bulk_fut = pin!(bulk_recv.read_chunk(1024, true).fuse());
         select! {
-            fetch_request = fetch_rx.next() => {
+            fetch_request = clipboard.fetch_rx.next() => {
                 if let Some(fetch_request) = fetch_request {
                     let msg = messages::BulkMessage::ClipboardContentRequest(messages::ClipboardContentRequest{
                         type_: &fetch_request.type_,
                         max_size_bytes: max_clipboard_size_bytes as u64,
                     });
-                    let serializedmsg = postcard::to_slice_cobs(&msg, &mut event_bytes)
+                    let serializedmsg = postcard::to_stdvec_cobs(&msg)
                         .map_err(|e| anyhow!("Failed to serialize clipboard request message: {:?}", e))?;
                     trace!(
                         "Sending {} byte event: {:X?}",
@@ -68,7 +93,7 @@ pub async fn run_client(
                         .context("Failed to send clipboard request message")?;
                 }
             },
-            types = clipboard_types_rx.next() => {
+            types = clipboard.types_rx.next() => {
                 // Save recently received types
                 info!("Received updated clipboard types: {:?}", types);
                 clipboard_types = types;
@@ -81,7 +106,7 @@ pub async fn run_client(
                 trace!("Received {} bytes from events stream: {:X?}", resp.bytes.len(), &*resp.bytes);
                 // Copy the immutable response data into a mutable buffer
                 event_bytes.extend_from_slice(&*resp.bytes);
-                handle_event_messages(&mut events_send, &mut event_bytes, virtual_devices, &mut clipboard_types, &mut clipboard_writer, max_clipboard_size_bytes).await?;
+                handle_event_messages(&mut events_send, &mut event_bytes, virtual_devices, &mut clipboard_types, &mut clipboard.writer, max_clipboard_size_bytes).await?;
                 event_bytes.clear();
             },
             bulk_result = bulk_fut => {
@@ -89,7 +114,7 @@ pub async fn run_client(
                     .context("Lost server bulk connection, does server need to approve our fingerprint?")?
                     .context("Server closed bulk connection")?;
                 trace!("Received {} bytes from bulk stream: {:X?}", resp.bytes.len(), &*resp.bytes);
-                if let Some(c) = &mut clipboard {
+                if let Some(c) = &mut clipboard_data {
                     if c.remaining_bytes >= resp.bytes.len() {
                         // Chunk is all clipboard data.
                         c.data.extend_from_slice(&*resp.bytes);
@@ -103,19 +128,19 @@ pub async fn run_client(
 
                     if c.remaining_bytes == 0 {
                         // Clipboard data is all accumulated, flush and clear
-                        clipboard_writer.store_data(clipboard.take().expect("missing clipboard")).await?;
+                        clipboard.writer.store_data(clipboard_data.take().expect("missing clipboard")).await?;
                     }
 
                     if bulk_recv_bytes.len() > 0 {
                         // Handle any data following the clipboard entry.
                         // Hopefully it's not fragmented too since we don't really support that
-                        clipboard = handle_bulk_messages(&mut bulk_send, &mut bulk_recv_bytes, &mut clipboard_reader, &clipboard_writer, max_clipboard_size_bytes).await?;
+                        clipboard_data = handle_bulk_messages(&mut bulk_send, &mut bulk_recv_bytes, &mut clipboard.reader, &clipboard.writer, max_clipboard_size_bytes).await?;
                         bulk_recv_bytes.clear();
                     }
                 } else {
                     // Copy the immutable response data into a mutable buffer
                     bulk_recv_bytes.extend_from_slice(&*resp.bytes);
-                    clipboard = handle_bulk_messages(&mut bulk_send, &mut bulk_recv_bytes, &mut clipboard_reader, &clipboard_writer, max_clipboard_size_bytes).await?;
+                    clipboard_data = handle_bulk_messages(&mut bulk_send, &mut bulk_recv_bytes, &mut clipboard.reader, &clipboard.writer, max_clipboard_size_bytes).await?;
                     bulk_recv_bytes.clear();
                 }
             },
@@ -148,6 +173,7 @@ async fn handle_event_messages(
             messages::ServerMessage::Switch(e) => {
                 virtual_devices.switch(e.enabled)?;
                 // We're being closed, send clipboard types if we have any
+                // TODO only send the types if they ORIGINATED FROM US
                 if let Some(types) = latest_clipboard_types {
                     if !e.enabled && !types.is_empty() {
                         let types = types.join(" ");
@@ -156,7 +182,7 @@ async fn handle_event_messages(
                                 types: &types,
                                 max_size_bytes: max_clipboard_size_bytes,
                             });
-                        let serializedmsg = postcard::to_slice_cobs(&msg, bytes).map_err(|e| {
+                        let serializedmsg = postcard::to_stdvec_cobs(&msg).map_err(|e| {
                             anyhow!("Failed to serialize clipboard types message: {:?}", e)
                         })?;
                         event_send
@@ -214,8 +240,7 @@ async fn handle_bulk_messages(
                         content_len_bytes: clipboard_data.len() as u64,
                     },
                 );
-                let mut bytes2 = Vec::with_capacity(1024);
-                let serializedmsg = postcard::to_slice_cobs(&msg, &mut bytes2)
+                let serializedmsg = postcard::to_stdvec_cobs(&msg)
                     .map_err(|e| anyhow!("Failed to serialize clipboard types message: {:?}", e))?;
                 bulk_send
                     .write_all(&serializedmsg)

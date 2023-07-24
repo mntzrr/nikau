@@ -1,6 +1,6 @@
 use anyhow::{anyhow, bail, Result};
 use async_std::task;
-use tracing::{debug, warn};
+use tracing::{info, trace, warn};
 use x11rb_async::connection::Connection;
 use x11rb_async::protocol::xproto::{Atom, AtomEnum, ConnectionExt, Property, Time};
 use x11rb_async::protocol::{xfixes, Event};
@@ -25,12 +25,22 @@ impl ClipboardTypeWatcher {
             loop {
                 match watcher.types_wait().await {
                     Ok(types) => {
+                        // We should only announce clipboard events from other applications.
+                        // If we announce our own type updates, then something like this will happen:
+                        // - we get advertised types pushed from server/client
+                        // - we store the advertised types to X11 for future pastes into other applications
+                        // - we see the update and think that another application took over the clipboard
+                        if types.contains(&shared::NIKAU_CANARY_TARGET.to_string()) {
+                            info!("Ignoring clipboard update from nikau itself: {:?}", types);
+                            continue;
+                        }
+                        info!("Detected updated clipboard types: {:?}", types);
                         if let Err(e) = types_tx.send(types).await {
-                            warn!("Failed to send updated types: {}", e);
+                            warn!("Failed to send updated clipboard types: {}", e);
                         }
                     }
                     Err(e) => {
-                        warn!("Failed to wait for new types: {}", e)
+                        warn!("Failed to wait for new clipboard types: {}", e)
                     }
                 }
             }
@@ -112,7 +122,7 @@ impl ClipboardReader {
 
     /// Reads the clipboard data for the specified type.
     pub async fn read(&mut self, type_: &str, max_size_bytes: u64) -> Result<Vec<u8>> {
-        // TODO(later) check both request_max_size_bytes and client/server's configured max_size_bytes
+        info!("Reading local clipboard content: type={} max_size_bytes={}", type_, max_size_bytes);
         let type_atom = self.atoms.to_atom(&self.context.conn, type_).await?;
 
         self.context
@@ -129,6 +139,7 @@ impl ClipboardReader {
             .await?;
 
         let mut buf = Vec::new();
+        // TODO freezes here. should have a timeout:
         process_event(
             &self.context,
             &self.atoms,
@@ -161,7 +172,7 @@ async fn process_event(
     let mut is_incr = false;
     loop {
         let event = context.conn.wait_for_event().await?;
-        debug!("X11 reader event: {:?}", event);
+        trace!("X11 reader event: {:?}", event);
 
         match event {
             Event::XfixesSelectionNotify(event) => {

@@ -47,19 +47,19 @@ pub fn build_server(
 fn transport_config() -> Arc<TransportConfig> {
     let mut transport_config = TransportConfig::default();
     transport_config
+        //.max_concurrent_bidi_streams(2_u8.into()) // events + bulk
         .max_concurrent_uni_streams(0_u8.into()) // we only use bidirectional streams
         .keep_alive_interval(Some(Duration::from_millis(KEEPALIVE_MILLIS)))
         .max_idle_timeout(Some(IdleTimeout::from(VarInt::from_u32(TIMEOUT_MILLIS))));
     Arc::new(transport_config)
 }
 
-pub async fn send_version(send: &mut SendStream, buf: &mut Vec<u8>) -> Result<()> {
+pub async fn send_version(send: &mut SendStream) -> Result<()> {
     let msg = messages::VersionBootstrapMessage {
         version: messages::PROTOCOL_VERSION,
     };
-    buf.resize(buf.capacity(), 0);
-    let serializedmsg = postcard::to_slice_cobs(&msg, buf)
-        .map_err(|e| anyhow!("Failed to serialize message: {:?}", e))?;
+    let serializedmsg = postcard::to_stdvec_cobs(&msg)
+        .map_err(|e| anyhow!("Failed to serialize version message: {:?}", e))?;
     debug!(
         "Sending {} byte version: {:X?}",
         serializedmsg.len(),
@@ -68,11 +68,10 @@ pub async fn send_version(send: &mut SendStream, buf: &mut Vec<u8>) -> Result<()
     send.write_all(&serializedmsg)
         .await
         .context("Failed to send protocol version")?;
-    buf.clear();
     Ok(())
 }
 
-pub async fn recv_version(recv: &mut RecvStream, buf: &mut Vec<u8>) -> Result<usize> {
+pub async fn recv_version(recv: &mut RecvStream, buf: &mut Vec<u8>) -> Result<()> {
     debug!("Waiting to receive version");
     let resp = recv
         .read_chunk(1024, true)
@@ -86,19 +85,26 @@ pub async fn recv_version(recv: &mut RecvStream, buf: &mut Vec<u8>) -> Result<us
     );
     // Copy the immutable response data into a mutable buffer
     buf.extend_from_slice(&*resp.bytes);
-    let (versionmsg, resp_remainder) =
-        postcard::take_from_bytes_cobs::<messages::VersionBootstrapMessage>(buf)
+    let version: u64;
+    {
+        debug!("bytes before: {:X?}", buf);
+        let (versionmsg, resp_remainder) =
+            postcard::take_from_bytes_cobs::<messages::VersionBootstrapMessage>(buf)
             .map_err(|e| anyhow!("Failed to deserialize message: {:?}", e))?;
-    if versionmsg.version != messages::PROTOCOL_VERSION {
+        version = versionmsg.version;
+        // Remove this message from the front of buf
+        let consumed = resp.bytes.len() - resp_remainder.len();
+        let buf_len = buf.len();
+        buf.copy_within(consumed..buf_len, 0);
+        buf.truncate(buf_len-consumed);
+        debug!("bytes after: {:X?}", buf);
+    }
+    if version != messages::PROTOCOL_VERSION {
         bail!(
             "Their version {} doesn't match our expected version {}",
-            versionmsg.version,
+            version,
             messages::PROTOCOL_VERSION
         );
     }
-
-    // Return location of leftover bytes following the version.
-    // They could be ServerMessage events to be processed by the client following the handshake.
-    let consumed = resp.bytes.len() - resp_remainder.len();
-    Ok(consumed)
+    Ok(())
 }

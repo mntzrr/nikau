@@ -200,23 +200,39 @@ impl Rotation {
         types: Vec<String>,
         max_size_bytes: u64,
     ) -> Result<()> {
-        debug!("Updating target clipboard: types={:?} from source={:?} with max_size_bytes={}", types, source, max_size_bytes);
+        debug!("Updating target clipboard: source={:?} dest={:?} with max_size_bytes={} has types={:?}", source, self.current_client, max_size_bytes, types);
         // Save the clipboard types/source for future retrievals and client switches
         self.clipboard_routing.current_clipboard = Some(ClipboardInfo {
             source,
             types: types.clone(),
             max_size_bytes,
         });
-        if self.current_client.is_some() {
-            // Store the types for advertising to X11 in the remote client
-            let types_str = types.join(" ");
-            let types_msg = messages::ServerMessage::ClipboardTypes(messages::ClipboardTypes {
-                types: &types_str,
-                max_size_bytes,
-            });
-            self.send_event(types_msg).await?;
-        } else {
-            // Currently on local machine, send types to local X11
+        // Avoid advertising in these cases:
+        // - source=server, dest=server: An app on the server owns the clipboard, don't override it
+        // - source=clientA, dest=clientA: An app on the client owns the clipboard, don't override it
+        if let Some(remote_client) = self.current_client {
+            if let Some(remote_source) = &source {
+                if *remote_source != remote_client {
+                    // Tell current client about a different client's clipboard
+                    // Avoid telling same client to about itself: don't want client overriding local app
+                    let types_str = types.join(" ");
+                    let types_msg = messages::ServerMessage::ClipboardTypes(messages::ClipboardTypes {
+                        types: &types_str,
+                        max_size_bytes,
+                    });
+                    self.send_event(types_msg).await?;
+                }
+            } else {
+                // Tell remote client about server's clipboard
+                let types_str = types.join(" ");
+                let types_msg = messages::ServerMessage::ClipboardTypes(messages::ClipboardTypes {
+                    types: &types_str,
+                    max_size_bytes,
+                });
+                self.send_event(types_msg).await?;
+            }
+        } else if source.is_some() {
+            // Tell server about a client's clipboard
             self.clipboard_routing.writer.store_types(types).await?;
         }
         Ok(())
@@ -228,7 +244,7 @@ impl Rotation {
         type_: &str,
         max_size_bytes: u64,
     ) -> Result<()> {
-        debug!("Handling clipboard content request from source={:?} for type={} with max_size_bytes={}: have {:?}", request_source, type_, max_size_bytes, self.clipboard_routing.current_clipboard);
+        debug!("Handling clipboard content request from source={:?} with max_size_bytes={} for type={}: have {:?}", request_source, max_size_bytes, type_, self.clipboard_routing.current_clipboard);
         let current_clipboard = match &self.clipboard_routing.current_clipboard {
             Some(c) => c,
             None => {
@@ -256,7 +272,10 @@ impl Rotation {
                 });
                 self.send_bulk(request_source, msg, Some(content)).await
             } else {
-                bail!("Request for server to get clipboard from itself?");
+                // We're getting a request for the clipboard from X11.
+                // We should only be advertising clipboards for remote clients, but there isn't one.
+                // TODO this might happen if we advertise a client that then disconnects, but we should un-advertise it when that happens
+                bail!("Server got local clipboard request against itself? current_clipboard={:?}", current_clipboard);
             }
         }
     }
@@ -307,6 +326,7 @@ impl Rotation {
                 .await
             {
                 if let Some(clipboard_info) = &self.clipboard_routing.current_clipboard {
+                    debug!("Telling new client about clipboard: {:?}", clipboard_info);
                     // Update new client with the clipboard types to be advertised
                     let types_str = clipboard_info.types.join(" ");
                     let types_msg = messages::ServerMessage::ClipboardTypes(messages::ClipboardTypes {
@@ -328,10 +348,6 @@ impl Rotation {
                 );
             }
         } else {
-            if let Some(clipboard_info) = &self.clipboard_routing.current_clipboard {
-                // Provide local machine with the clipboard types to be advertised
-                let _ = self.clipboard_routing.writer.store_types(clipboard_info.types.clone()).await;
-            }
             info!(
                 "Switched to local machine (clients: {:?})",
                 self.clients
@@ -343,11 +359,11 @@ impl Rotation {
     }
 
     pub async fn send_event(&mut self, msg: messages::ServerMessage<'_>) -> Result<()> {
-        let current_client = match self.current_client.clone() {
+        let current_client = match &self.current_client {
             Some(client) => client,
             None => {
-                // This could be a race with automatically switching to the local machine
-                warn!("Dropping event since we are currently on local machine: {}", msg); // TODO(later) downgrade to debug?
+                // Ignore input when using the local machine.
+                // We continue reading the input to detect combo presses but that's it.
                 return Ok(());
             },
         };
@@ -363,7 +379,8 @@ impl Rotation {
                     .expect("missing current_client")
                     .events_send;
                 if let Err(e) = send_message_to_client(events_send, &msg, &mut self.buf).await {
-                    self.handle_client_removal(&current_client, idx).await;
+                    let current_client = &self.current_client.expect("Should have exited if current_client was none");
+                    self.handle_client_removal(current_client, idx).await;
                     return Err(e);
                 }
             }
@@ -422,6 +439,7 @@ impl Rotation {
             if let Some(clipboard_source) = &clipboard_info.source {
                 if clipboard_source == endpoint {
                     // Clear clipboard status owned by removed client
+                    // TODO should we clear the clipboard in X11 too?
                     self.clipboard_routing.current_clipboard = None;
                 }
             }
@@ -431,7 +449,7 @@ impl Rotation {
             if current_client == *endpoint {
                 // This is the active client. Remove it AND switch to local machine.
                 info!(
-                    "Removing client {} from rotation and switching to local machine: {:?}",
+                    "Removing client {} from rotation and switching to local machine (clients: {:?})",
                     endpoint, client_list
                 );
 
@@ -477,8 +495,9 @@ async fn send_message_to_client<T>(
 where T: Serialize + ?Sized
 {
     // Serialize message data: postcard with cobs encoding for event framing
+    let buf_len = buf.len();
     let serializedmsg = postcard::to_slice_cobs(&msg, buf)
-        .map_err(|e| anyhow!("Failed to serialize message: {:?}", e))?;
+        .map_err(|e| anyhow!("Failed to serialize message into buf.len={}: {:?}", buf_len, e))?;
     trace!(
         "Sending {} byte serialized message: {:X?}",
         serializedmsg.len(),
