@@ -376,21 +376,23 @@ impl Rotation {
                     }
                 }
                 info!(
-                    "Switched to client: {} (clients: {:?})",
+                    "Switched to client: {} (clients: {})",
                     new_client,
                     self.clients
                         .iter()
-                        .map(|c| c.endpoint)
-                        .collect::<Vec<SocketAddr>>()
+                        .map(|c| c.endpoint.to_string())
+                        .collect::<Vec<String>>()
+                        .join(", ")
                 );
             }
         } else {
             info!(
-                "Switched to local machine (clients: {:?})",
+                "Switched to local machine (clients: {})",
                 self.clients
                     .iter()
-                    .map(|c| c.endpoint)
-                    .collect::<Vec<SocketAddr>>()
+                    .map(|c| c.endpoint.to_string())
+                    .collect::<Vec<String>>()
+                    .join(", ")
             );
         }
 

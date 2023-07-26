@@ -38,6 +38,7 @@ impl LocalClipboard {
 
     pub async fn clear_remote_clipboard(&mut self) -> Result<()> {
         if self.serving_remote_clipboard {
+            self.local_types = None;
             self.serving_remote_clipboard = false;
             self.writer.store_types(vec![]).await?;
         }
