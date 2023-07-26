@@ -212,8 +212,8 @@ async fn handle_event_messages(
                     "This client is {}",
                     if e.enabled { "active" } else { "inactive" }
                 );
+                virtual_devices.switch()?;
                 *active = e.enabled;
-                virtual_devices.switch(e.enabled)?;
                 if let Some(types) = &local_clipboard.local_types {
                     if !e.enabled && !types.is_empty() {
                         // We're being disabled and we have a clipboard from a local app.

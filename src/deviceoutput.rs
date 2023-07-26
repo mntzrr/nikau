@@ -82,7 +82,7 @@ impl VirtualDevices {
         Ok(())
     }
 
-    pub fn switch(&mut self, enabled: bool) -> Result<()> {
+    pub fn switch(&mut self) -> Result<()> {
         // TODO(feature): clear device state for client switches, to avoid e.g. leaving a device with a repeating key. but this requires subscribing and keeping track of device state.
         // TODO(feature): flash LEDs on the OTHER, NON-virtual edvices when this client becomes enabled
         if !self.keyboard_events.is_empty() {
