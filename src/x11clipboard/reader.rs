@@ -308,7 +308,7 @@ async fn process_event(
                     // so that the receiving client (and its WM) can stop waiting.
                     // So let's just send back a zero-byte clipboard, which isn't great but probably won't hurt.
                     warn!(
-                        "Aborting clipboard data read and sending empty data: length so far {} exceeds max={}",
+                        "Sending empty clipboard data: size read so far ({}) exceeds max={}",
                         buf.len() + reply.value.len(),
                         max_size_bytes
                     );
