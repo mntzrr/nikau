@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
-use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio::sync::{broadcast, mpsc, watch as watchchan, Mutex};
 use tokio::task;
 use tracing::{error, trace, warn};
 
@@ -64,13 +64,18 @@ pub async fn run_server(
     });
 
     // TODO(later) allow missing clipboard support
-    let (local_clipboard_types_tx, mut local_clipboard_types_rx) = mpsc::channel(32);
+    let (local_clipboard_types_tx, mut local_clipboard_types_rx) = watchchan::channel(vec![]);
     x11clipboard::reader::ClipboardTypeWatcher::start(local_clipboard_types_tx).await?;
     let rotation_cpy = rotation.clone();
     // Task: listen to server machine updates to the clipboard types
     task::spawn(async move {
-        while let Some(clipboard_types) = local_clipboard_types_rx.recv().await {
+        loop {
+            if let Err(e) = local_clipboard_types_rx.changed().await {
+                warn!("local_clipboard_types_rx has closed: {}", e);
+                break;
+            }
             // Another application on the server machine has a clipboard entry.
+            let clipboard_types = local_clipboard_types_rx.borrow().clone();
             if let Err(e) = rotation_cpy
                 .lock()
                 .await
@@ -142,7 +147,7 @@ async fn handle_connection(
         .add_client(conn.remote_address(), events_send, bulk_send)
         .await;
 
-    let mut bulk_bytes = Vec::with_capacity(1024); // TODO(later) 65536 here and below once chunking is known-good
+    let mut bulk_bytes = Vec::with_capacity(65536);
     let mut incoming_clipboard_data: Option<(x11clipboard::ClipboardData, Option<SocketAddr>)> =
         None;
     loop {
@@ -157,7 +162,7 @@ async fn handle_connection(
                 handle_event_messages(conn.remote_address(), &rotation, &mut event_bytes, max_clipboard_size_bytes).await?;
                 event_bytes.clear();
             },
-            bulk_result = bulk_recv.read_chunk(1024, true) => {
+            bulk_result = bulk_recv.read_chunk(65536, true) => {
                 let resp = bulk_result
                     .context("Lost client bulk connection")?
                     .context("Client closed bulk connection")?;

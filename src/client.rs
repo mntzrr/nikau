@@ -1,12 +1,11 @@
 use std::net::SocketAddr;
-use std::pin::pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use quinn::SendStream;
-use tokio::sync::mpsc;
-use tracing::{info, trace};
+use tokio::sync::{mpsc, watch};
+use tracing::{info, trace, warn};
 
 use crate::device::output;
 use crate::msgs::{bulk, event};
@@ -17,7 +16,7 @@ pub struct LocalClipboard {
     reader: x11clipboard::reader::ClipboardReader,
     pub writer: x11clipboard::writer::ClipboardWriter,
     fetch_rx: mpsc::Receiver<x11clipboard::writer::ClipboardFetch>,
-    types_rx: mpsc::Receiver<Vec<String>>,
+    local_types_rx: watch::Receiver<Vec<String>>,
     local_types: Option<Vec<String>>,
     pub serving_remote_clipboard: bool,
 }
@@ -26,14 +25,14 @@ impl LocalClipboard {
     pub async fn new() -> Result<Self> {
         let (fetch_tx, fetch_rx) = mpsc::channel(32);
         let reader = x11clipboard::reader::ClipboardReader::new().await?;
-        let (types_tx, types_rx) = mpsc::channel(32);
-        x11clipboard::reader::ClipboardTypeWatcher::start(types_tx).await?;
+        let (local_types_tx, local_types_rx) = watch::channel(vec![]);
+        x11clipboard::reader::ClipboardTypeWatcher::start(local_types_tx).await?;
         let writer = x11clipboard::writer::ClipboardWriter::new(fetch_tx).await?;
         Ok(Self {
             reader,
             writer,
             fetch_rx,
-            types_rx,
+            local_types_rx,
             local_types: None,
             serving_remote_clipboard: false,
         })
@@ -43,7 +42,7 @@ impl LocalClipboard {
         if self.serving_remote_clipboard {
             self.local_types = None;
             self.serving_remote_clipboard = false;
-            self.writer.store_types(vec![]).await?;
+            self.writer.store_types(vec![])?;
         }
         Ok(())
     }
@@ -87,7 +86,7 @@ pub async fn run_client(
     // Reusable buffer for receiving keyboard events.
     let mut event_bytes = Vec::with_capacity(1024);
     // Reusable buffer for receiving bulk data (clipboards).
-    let mut bulk_recv_bytes = Vec::with_capacity(1024); // TODO(later) 65536 here and below once chunking is known-good
+    let mut bulk_recv_bytes = Vec::with_capacity(65536);
 
     // Accumulator of raw clipboard data streamed from the server.
     // Cleared when the clipboard data has all been received.
@@ -95,8 +94,6 @@ pub async fn run_client(
     let mut active = false;
     info!("Waiting to be activated by server...");
     loop {
-        let event_fut = pin!(events_recv.read_chunk(1024, true));
-        let bulk_fut = pin!(bulk_recv.read_chunk(1024, true));
         tokio::select! {
             local_fetch_request = local_clipboard.fetch_rx.recv() => {
                 // Send fetch request to server
@@ -117,16 +114,20 @@ pub async fn run_client(
                         .context("Failed to send clipboard request message")?;
                 }
             },
-            types = local_clipboard.types_rx.recv() => {
+            types_notify = local_clipboard.local_types_rx.changed() => {
+                if let Err(e) = types_notify {
+                    warn!("local_types_rx has closed: {}", e);
+                    return Err(anyhow!(e));
+                }
                 if active {
                     // New clipboard entry on local machine, and we're active.
                     // We'll advertise it to the server when there's a switch.
                     // Avoid polluting the rotation with "external" clipboards: only collect info if we're active.
-                    local_clipboard.local_types = types;
+                    local_clipboard.local_types.replace(local_clipboard.local_types_rx.borrow().clone());
                     local_clipboard.serving_remote_clipboard = false;
                 }
             },
-            event_result = event_fut => {
+            event_result = events_recv.read_chunk(1024, true) => {
                 // Incoming data may contain one or more messages, but I've never seen fragments of messages.
                 let resp = event_result
                     .with_context(|| if is_new_connection() {
@@ -141,7 +142,7 @@ pub async fn run_client(
                 handle_event_messages(&mut events_send, &mut event_bytes, virtual_devices, local_clipboard, max_clipboard_size_bytes, &mut active).await?;
                 event_bytes.clear();
             },
-            bulk_result = bulk_fut => {
+            bulk_result = bulk_recv.read_chunk(65536, true) => {
                 let resp = bulk_result
                     .with_context(|| if is_new_connection() {
                         "Lost bulk connection, does server need to approve our fingerprint?"
@@ -250,7 +251,7 @@ async fn handle_event_messages(
                 local_clipboard.local_types = None;
                 local_clipboard.serving_remote_clipboard = true;
                 let types: Vec<String> = types.types.split(" ").map(|s| s.to_string()).collect();
-                local_clipboard.writer.store_types(types).await?;
+                local_clipboard.writer.store_types(types)?;
             }
         }
         offset += consumed;

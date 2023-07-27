@@ -56,7 +56,6 @@ struct ServerArgs {
     #[arg(long)]
     exit_secs: Option<u32>,
 
-    // TODO(later) test behavior when server max is very small
     /// Maximum size in bytes for transferring clipboard data
     #[arg(long, default_value_t = 1048576)]
     max_clipboard_size_bytes: u64,
@@ -75,7 +74,6 @@ struct ClientArgs {
     #[arg(long)]
     fingerprints: Option<Vec<String>>,
 
-    // TODO(later) test behavior when client max is very small
     /// Maximum size in bytes for transferring clipboard data
     #[arg(long, default_value_t = 1048576)]
     max_clipboard_size_bytes: u64,

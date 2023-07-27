@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
-use tokio::{sync::mpsc, task, time};
+use tokio::{sync::watch, task, time};
 use tracing::{debug, trace, warn};
 use x11rb_async::connection::Connection;
 use x11rb_async::protocol::xproto::{Atom, AtomEnum, ConnectionExt, Property, Time};
@@ -21,8 +21,7 @@ pub struct ClipboardTypeWatcher {
 }
 
 impl ClipboardTypeWatcher {
-    // TODO(later) replace this DIY watching with tokio::sync::watch (fetch latest recved value)
-    pub async fn start(types_tx: mpsc::Sender<Vec<String>>) -> Result<()> {
+    pub async fn start(types_tx: watch::Sender<Vec<String>>) -> Result<()> {
         let context = shared::XContext::new().await?;
         let atoms = shared::Atoms::new(&context.conn).await?;
         task::spawn(async move {
@@ -48,7 +47,7 @@ impl ClipboardTypeWatcher {
                             "Received updated clipboard from local system with types: {:?}",
                             types
                         );
-                        if let Err(e) = types_tx.send(types).await {
+                        if let Err(e) = types_tx.send(types) {
                             warn!("Failed to send updated clipboard types: {}", e);
                         }
                     }
@@ -274,14 +273,6 @@ async fn process_event(
                 }
 
                 buf.extend_from_slice(&reply.value);
-
-                if max_size_bytes > 0 && buf.len() > max_size_bytes as usize {
-                    bail!(
-                        "Aborting clipboard read: length={} exceeds max={}",
-                        buf.len(),
-                        max_size_bytes
-                    );
-                }
                 break;
             }
             Event::PropertyNotify(event) if is_incr => {
@@ -307,13 +298,25 @@ async fn process_event(
                     continue;
                 };
 
-                let value = reply.value;
-
-                if !value.is_empty() {
-                    buf.extend_from_slice(&value);
-                } else {
+                if reply.value.is_empty() {
+                    // End of data
                     break;
                 }
+
+                if max_size_bytes > 0 && (buf.len() + reply.value.len()) > max_size_bytes as usize {
+                    // When this happens, we still need to send _something_ back,
+                    // so that the receiving client (and its WM) can stop waiting.
+                    // So let's just send back a zero-byte clipboard, which isn't great but probably won't hurt.
+                    warn!(
+                        "Aborting clipboard data read and sending empty data: length so far {} exceeds max={}",
+                        buf.len() + reply.value.len(),
+                        max_size_bytes
+                    );
+                    buf.clear();
+                    break;
+                }
+
+                buf.extend_from_slice(&reply.value);
             }
             _ => (),
         }

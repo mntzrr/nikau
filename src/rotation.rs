@@ -443,7 +443,7 @@ impl Rotation {
                     clipboard_source,
                     c.types.join(" ")
                 );
-                self.clipboard_writer.store_types(c.types.clone()).await?;
+                self.clipboard_writer.store_types(c.types.clone())?;
             }
         } else {
             // The clipboard is from the server.
@@ -659,7 +659,7 @@ impl Rotation {
         self.clipboard_target = None;
 
         // Clear the server's host clipboard status
-        if let Err(e) = self.clipboard_writer.store_types(vec![]).await {
+        if let Err(e) = self.clipboard_writer.store_types(vec![]) {
             // Keep going with the clients...
             warn!("Failed to clear server clipboard: {}", e);
         }

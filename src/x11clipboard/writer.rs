@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
-use anyhow::{bail, Context, Result};
-use tokio::{sync::mpsc, task};
+use anyhow::{anyhow, bail, Context, Result};
+use tokio::sync::{mpsc, watch};
+use tokio::task;
 use tracing::{debug, info, trace, warn};
 use x11rb_async::connection::{Connection, RequestConnection};
 use x11rb_async::protocol::xproto::{
@@ -21,57 +22,61 @@ pub struct ClipboardFetch {
 
 pub struct ClipboardWriter {
     /// Send available clipboard types, advertised by server
-    types_tx: mpsc::Sender<Vec<String>>,
+    store_types_tx: watch::Sender<Vec<String>>,
     /// Send clipboard content for one of the previously advertised types
-    data_tx: mpsc::Sender<ClipboardData>,
+    store_data_tx: mpsc::Sender<ClipboardData>,
 }
 
 impl ClipboardWriter {
-    pub async fn new(fetch_tx: mpsc::Sender<ClipboardFetch>) -> Result<Self> {
+    pub async fn new(fetch_data_tx: mpsc::Sender<ClipboardFetch>) -> Result<Self> {
         let context = shared::XContext::new().await?;
-        // TODO(later) replace this DIY watching with tokio::sync::watch (fetch latest recved value)
-        let (types_tx, types_rx) = mpsc::channel(32);
-        // TODO(later) replace this DIY watching with tokio::sync::watch (fetch latest recved value)
-        let (data_tx, data_rx) = mpsc::channel(32);
+        let (store_types_tx, store_types_rx) = watch::channel(vec![]);
+        let (store_data_tx, store_data_rx) = mpsc::channel(32);
         task::spawn(async move {
-            if let Err(e) = serve(context, types_rx, fetch_tx, data_rx).await {
+            if let Err(e) = serve(context, store_types_rx, fetch_data_tx, store_data_rx).await {
                 warn!("clipboard server died: {}", e);
             }
         });
-        Ok(ClipboardWriter { types_tx, data_tx })
+        Ok(ClipboardWriter { store_types_tx, store_data_tx })
     }
 
     /// Advertises with X11 that we have a new clipboard entry available
-    pub async fn store_types<K: Into<Vec<String>>>(&self, types: K) -> Result<()> {
-        self.types_tx.send(types.into()).await?;
+    pub fn store_types<K: Into<Vec<String>>>(&self, types: K) -> Result<()> {
+        self.store_types_tx.send(types.into())?;
         Ok(())
     }
 
     /// Makes the provided clipboard data available to X11 for a paste operation
     pub async fn store_data(&self, data: ClipboardData) -> Result<()> {
         // TODO(later) check if we're expecting a fetch and discard the data if not?
-        self.data_tx.send(data).await?;
+        self.store_data_tx.send(data).await?;
         Ok(())
     }
 }
 
 async fn serve(
     context: shared::XContext,
-    // Receive available clipboard types, advertised by server
+    // Receive available clipboard types, advertised by Nikau server
     // Events are from calls to store_types()
-    mut types_rx: mpsc::Receiver<Vec<String>>,
-    // Request clipboard content for one of the types received to types_rx
-    fetch_tx: mpsc::Sender<ClipboardFetch>,
-    // Receive clipboard content in response to a fetch_tx query
+    mut store_types_rx: watch::Receiver<Vec<String>>,
+    // Request clipboard content for one of the types received to store_types_rx
+    fetch_data_tx: mpsc::Sender<ClipboardFetch>,
+    // Receive clipboard content in response to a fetch_data_tx query
     // Events are from calls to store_data()
-    mut data_rx: mpsc::Receiver<ClipboardData>,
+    mut store_data_rx: mpsc::Receiver<ClipboardData>,
 ) -> Result<()> {
     let mut state = ClipboardServerState::new(&context.conn).await?;
     loop {
         tokio::select! {
-            clipboard_types = types_rx.recv() => {
+            types_notify = store_types_rx.changed() => {
+                if let Err(e) = types_notify {
+                    warn!("store_types_rx has closed: {}", e);
+                    return Err(anyhow!(e));
+                }
+
                 // New (or cleared) clipboard: Update types, and clear any prior clipboard data
-                if let Some(clipboard_types) = clipboard_types {
+                {
+                    let clipboard_types = store_types_rx.borrow().clone();
                     debug!("Received new clipboard types for serving locally: {}", clipboard_types.join(" "));
                     if clipboard_types.is_empty() {
                         // Treat empty types as a clipboard clear
@@ -83,8 +88,6 @@ async fn serve(
                         }
                         state.clipboard_types = Some(type_atoms);
                     }
-                } else {
-                    state.clipboard_types = None;
                 }
                 state.clipboard_data = None;
 
@@ -97,7 +100,7 @@ async fn serve(
             },
             event = context.conn.wait_for_event() => {
                 if let Ok(event) = event {
-                    if let Err(e) = state.handle_event(event, &context, &fetch_tx, &mut data_rx).await {
+                    if let Err(e) = state.handle_event(event, &context, &fetch_data_tx, &mut store_data_rx).await {
                         warn!("X11 event handling failed: {:?}", e);
                         // keep going...
                     }
@@ -142,8 +145,8 @@ impl ClipboardServerState {
         &mut self,
         event: Event,
         context: &shared::XContext,
-        fetch_tx: &mpsc::Sender<ClipboardFetch>,
-        data_rx: &mut mpsc::Receiver<ClipboardData>,
+        fetch_data_tx: &mpsc::Sender<ClipboardFetch>,
+        store_data_rx: &mut mpsc::Receiver<ClipboardData>,
     ) -> Result<()> {
         trace!("X11 writer/server event: {:?}", event);
         match event {
@@ -198,20 +201,20 @@ impl ClipboardServerState {
                                 "Fetching clipboard with type {}={} for requestor={}",
                                 target.0, target.1, event.requestor
                             );
-                            fetch_tx
+                            fetch_data_tx
                                 .send(ClipboardFetch {
                                     type_: target.1.clone(),
                                 })
                                 .await?;
                             // TODO(later) timeout on retrieving data, where we give up and return empty data?
-                            let clipboard_data = data_rx
+                            let clipboard_data = store_data_rx
                                 .recv()
                                 .await
-                                .context("failed to get clipboard data")?;
+                                .context("failed to wait for clipboard data")?;
                             if clipboard_data.type_ != target.1 {
                                 bail!("Requested clipboard type {} for requestor={}, but fetched clipboard had type {}", target.1, event.requestor, clipboard_data.type_);
                             }
-                            debug!(
+                            info!(
                                 "Providing clipboard data to requestor={} with type {}: {} bytes",
                                 event.requestor,
                                 clipboard_data.type_,
