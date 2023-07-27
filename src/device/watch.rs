@@ -4,7 +4,8 @@ use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 use evdev::{Device, EventStream, EventType, Key};
 use notify::Watcher;
-use tokio::{sync::mpsc, task};
+use tokio::sync::{broadcast, mpsc};
+use tokio::task;
 use tracing::{debug, info, trace, warn};
 
 use crate::device::output;
@@ -28,18 +29,17 @@ pub enum GrabEvent {
 }
 
 pub struct DeviceHandle {
-    pub handle: task::JoinHandle<()>,
-    pub grab_tx: mpsc::Sender<GrabEvent>,
+    pub handle: task::JoinHandle<()>
 }
 
 /// Trait for watching the addition and removal of devices from the machine
 pub trait DeviceHandler: Send + 'static {
-    fn handle_device_stream(&mut self, stream: EventStream) -> Result<DeviceHandle>;
+    fn handle_device_stream(&mut self, events: EventStream, grab_rx: broadcast::Receiver<GrabEvent>) -> Result<DeviceHandle>;
 }
 
 pub async fn watch_loop<F: DeviceHandler>(
     mut handler: F,
-    mut grab_rx: mpsc::Receiver<GrabEvent>,
+    mut grab_tx: broadcast::Sender<GrabEvent>,
 ) -> Result<()> {
     // Start watch for new and removed devices BEFORE scanning current devices.
     let (device_event_tx, mut device_event_rx): (
@@ -75,8 +75,8 @@ pub async fn watch_loop<F: DeviceHandler>(
             );
             continue;
         }
-        let stream = start_device_stream(device, &path)?;
-        devices.insert(path, handler.handle_device_stream(stream)?);
+        let events = start_device_stream(device, &path)?;
+        devices.insert(path, handler.handle_device_stream(events, grab_tx.subscribe())?);
     }
     info!("Listening to {} input devices", devices.len());
     if devices.len() <= 0 {
@@ -85,30 +85,19 @@ pub async fn watch_loop<F: DeviceHandler>(
 
     // Start handler to consume new/removed device events
     loop {
-        tokio::select! {
-            // TODO(later) replace this DIY broadcast with tokio::sync::broadcast
-            grab = grab_rx.recv() => {
-                if let Some(grab) = grab {
-                    trace!("Updating {} devices with grab state: {:?}", devices.len(), grab);
-                    for device in devices.values() {
-                        if let Err(e) = device.grab_tx.send(grab.clone()).await {
-                            panic!("Failed to notify device of grab event, exiting server to avoid bad grab state: {:?}", e);
-                        }
-                    }
-                }
-            },
-            device_event = device_event_rx.recv() => {
-                if let Some(event) = device_event {
-                    handle_device_event(&mut handler, &mut devices, event).await;
-                }
-            },
-        };
+        if let Some(event) = device_event_rx.recv().await {
+            handle_device_event(&mut handler, &mut devices, &mut grab_tx, event).await;
+        } else {
+            // Channel lost, exit
+            return Ok(());
+        }
     }
 }
 
 async fn handle_device_event<F: DeviceHandler>(
     handler: &mut F,
     devices: &mut HashMap<PathBuf, DeviceHandle>,
+    grab_tx: &mut broadcast::Sender<GrabEvent>,
     event: DeviceEvent,
 ) {
     trace!("Device file event: {:?}", event);
@@ -133,7 +122,7 @@ async fn handle_device_event<F: DeviceHandler>(
                         event.path.to_string_lossy()
                     );
                     match start_device_stream(device, &event.path) {
-                        Ok(stream) => match handler.handle_device_stream(stream) {
+                        Ok(stream) => match handler.handle_device_stream(stream, grab_tx.subscribe()) {
                             Ok(join_handle) => {
                                 devices.insert(event.path, join_handle);
                             }

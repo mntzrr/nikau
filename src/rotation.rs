@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use quinn::SendStream;
 use serde::Serialize;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, trace, warn};
 
 use crate::device::watch;
@@ -51,7 +51,7 @@ struct ClipboardTarget {
 }
 
 pub struct Rotation {
-    grab_tx: mpsc::Sender<watch::GrabEvent>,
+    grab_tx: broadcast::Sender<watch::GrabEvent>,
     clients: Vec<ClientInfo>,
     current_client: Option<SocketAddr>,
     removed_current_client: Option<DefunctClientInfo>,
@@ -63,7 +63,7 @@ pub struct Rotation {
 
 impl Rotation {
     pub async fn new(
-        grab_tx: mpsc::Sender<watch::GrabEvent>,
+        grab_tx: broadcast::Sender<watch::GrabEvent>,
         clipboard_fetch_tx: mpsc::Sender<x11clipboard::writer::ClipboardFetch>,
     ) -> Result<Self> {
         let mut buf = Vec::with_capacity(1024);
@@ -642,7 +642,7 @@ impl Rotation {
         } else {
             watch::GrabEvent::Ungrab
         };
-        if let Err(e) = self.grab_tx.send(grab).await {
+        if let Err(e) = self.grab_tx.send(grab) {
             // Avoid leaving devices in a bad grabbed state
             panic!(
                 "Failed to update device grab, exiting server to avoid bad grab state: {}",

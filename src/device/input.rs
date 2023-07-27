@@ -2,7 +2,8 @@ use std::str::FromStr;
 
 use anyhow::{anyhow, bail, Result};
 use evdev::{EventStream, EventType, InputEvent, Key};
-use tokio::{sync::mpsc, task};
+use tokio::sync::{broadcast, mpsc};
+use tokio::task;
 use tracing::{debug, trace, warn};
 
 use crate::device::util;
@@ -64,13 +65,11 @@ impl InputHandler {
 
 impl DeviceHandler for InputHandler {
     /// Spawns a task for listening to a device's events and for controlling its grab state.
-    fn handle_device_stream(&mut self, mut stream: EventStream) -> Result<DeviceHandle> {
-        let (grab_tx, grab_rx): (mpsc::Sender<GrabEvent>, mpsc::Receiver<GrabEvent>) =
-            mpsc::channel(32);
+    fn handle_device_stream(&mut self, mut events: EventStream, grab_rx: broadcast::Receiver<GrabEvent>) -> Result<DeviceHandle> {
         let config = self.config.clone();
         let handle =
-            task::spawn(async move { read_device_events(&mut stream, config, grab_rx).await });
-        Ok(DeviceHandle { handle, grab_tx })
+            task::spawn(async move { read_device_events(&mut events, config, grab_rx).await });
+        Ok(DeviceHandle { handle })
     }
 }
 
@@ -129,7 +128,7 @@ impl ComboState {
 async fn read_device_events(
     stream: &mut EventStream,
     mut c: HandlerConfig,
-    mut grab_rx: mpsc::Receiver<GrabEvent>,
+    mut grab_rx: broadcast::Receiver<GrabEvent>,
 ) {
     let mut combo_state_next = ComboState::new(c.combo_keys_next.clone());
     let mut combo_state_prev = ComboState::new(c.combo_keys_prev.clone());
@@ -140,7 +139,7 @@ async fn read_device_events(
                 match event {
                     Ok(event) => {
                         read_device_event(event, &mut c.event_tx, &stream.device(), &device_info, &mut combo_state_next, &mut combo_state_prev).await;
-                    },
+                    }
                     Err(e) => {
                         // Common when the device has been unplugged.
                         // We'll frequently get this error just as inotify is telling us the file is deleted.
@@ -155,20 +154,27 @@ async fn read_device_events(
                 }
             },
             grab = grab_rx.recv() => {
-                if let Some(grab) = grab {
-                    match grab {
-                        GrabEvent::Grab => {
-                            debug!("Grabbing device: {:?}", stream.device().name().unwrap_or("(Unnamed device)"));
-                            if let Err(e) = stream.device_mut().grab() {
-                                panic!("Failed to grab device {:?}: {:?}", stream.device().name(), e);
-                            }
-                        },
-                        GrabEvent::Ungrab => {
-                            debug!("Ungrabbing device: {:?}", stream.device().name().unwrap_or("(Unnamed device)"));
-                            if let Err(e) = stream.device_mut().ungrab() {
-                                panic!("Failed to ungrab device {:?}: {:?}", stream.device().name(), e);
-                            }
+                match grab {
+                    Ok(GrabEvent::Grab) => {
+                        debug!("Grabbing device: {:?}", stream.device().name().unwrap_or("(Unnamed device)"));
+                        if let Err(e) = stream.device_mut().grab() {
+                            panic!("Failed to grab device {:?}: {:?}", stream.device().name(), e);
                         }
+                    }
+                    Ok(GrabEvent::Ungrab) => {
+                        debug!("Ungrabbing device: {:?}", stream.device().name().unwrap_or("(Unnamed device)"));
+                        if let Err(e) = stream.device_mut().ungrab() {
+                            panic!("Failed to ungrab device {:?}: {:?}", stream.device().name(), e);
+                        }
+                    }
+                    Err(e) => {
+                        // Shouldn't happen, but don't want to loop forever if it does
+                        warn!(
+                            "Error on grab broadcast for {:?}, removing device: {}",
+                            stream.device().name(),
+                            e
+                        );
+                        return
                     }
                 }
             }

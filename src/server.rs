@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio::task;
 use tracing::{error, trace, warn};
 
@@ -15,7 +15,7 @@ pub async fn run_server(
     listen_addr: &SocketAddr,
     cert_verifier: Arc<approval::NikauCertVerification>,
     mut input_rx: mpsc::Receiver<input::Event>,
-    grab_tx: mpsc::Sender<watch::GrabEvent>,
+    grab_tx: broadcast::Sender<watch::GrabEvent>,
     max_clipboard_size_bytes: u64,
 ) -> Result<()> {
     // TODO(later) rotation just accepts inputs without responses? if so then maybe put it in a separate task behind a channel, with an enum for the different request types. basically let's see if we can avoid mutex locking on input events.

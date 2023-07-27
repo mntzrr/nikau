@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use signal_hook::{consts::signal, iterator::Signals};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio::{task, time};
 use tracing::{error, info, warn};
 
@@ -165,15 +165,13 @@ async fn server(
     let signals = Signals::new(&[signal::SIGUSR1, signal::SIGUSR2])?;
     std::thread::spawn(|| handle_signals(signals, event_tx2));
 
-    let (grab_tx, grab_rx): (
-        mpsc::Sender<watch::GrabEvent>,
-        mpsc::Receiver<watch::GrabEvent>,
-    ) = mpsc::channel(32);
+    let (grab_tx, _grab_rx) = broadcast::channel(1);
+    let grab_tx2 = grab_tx.clone();
 
     let input_handler = input::InputHandler::new(&next_keys, prev_keys, event_tx)?;
 
     task::spawn(async move {
-        if let Err(e) = watch::watch_loop(input_handler, grab_rx).await {
+        if let Err(e) = watch::watch_loop(input_handler, grab_tx).await {
             error!("Input device watch failure: {:?}", e);
         }
     });
@@ -186,7 +184,7 @@ async fn server(
                 &listen_addr,
                 verifier,
                 event_rx,
-                grab_tx,
+                grab_tx2,
                 max_clipboard_size_bytes,
             ) => {
                 bail!("Server unexpectedly exited early: {:?}", server_exit);
@@ -200,7 +198,7 @@ async fn server(
             &listen_addr,
             verifier,
             event_rx,
-            grab_tx,
+            grab_tx2,
             max_clipboard_size_bytes,
         )
         .await?;
