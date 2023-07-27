@@ -29,12 +29,16 @@ pub enum GrabEvent {
 }
 
 pub struct DeviceHandle {
-    pub handle: task::JoinHandle<()>
+    pub handle: task::JoinHandle<()>,
 }
 
 /// Trait for watching the addition and removal of devices from the machine
 pub trait DeviceHandler: Send + 'static {
-    fn handle_device_stream(&mut self, events: EventStream, grab_rx: broadcast::Receiver<GrabEvent>) -> Result<DeviceHandle>;
+    fn handle_device_stream(
+        &mut self,
+        events: EventStream,
+        grab_rx: broadcast::Receiver<GrabEvent>,
+    ) -> Result<DeviceHandle>;
 }
 
 pub async fn watch_loop<F: DeviceHandler>(
@@ -76,7 +80,10 @@ pub async fn watch_loop<F: DeviceHandler>(
             continue;
         }
         let events = start_device_stream(device, &path)?;
-        devices.insert(path, handler.handle_device_stream(events, grab_tx.subscribe())?);
+        devices.insert(
+            path,
+            handler.handle_device_stream(events, grab_tx.subscribe())?,
+        );
     }
     info!("Listening to {} input devices", devices.len());
     if devices.len() <= 0 {
@@ -122,18 +129,20 @@ async fn handle_device_event<F: DeviceHandler>(
                         event.path.to_string_lossy()
                     );
                     match start_device_stream(device, &event.path) {
-                        Ok(stream) => match handler.handle_device_stream(stream, grab_tx.subscribe()) {
-                            Ok(join_handle) => {
-                                devices.insert(event.path, join_handle);
+                        Ok(stream) => {
+                            match handler.handle_device_stream(stream, grab_tx.subscribe()) {
+                                Ok(join_handle) => {
+                                    devices.insert(event.path, join_handle);
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "Failed to start event handler for device {}: {}",
+                                        event.path.to_string_lossy(),
+                                        e
+                                    );
+                                }
                             }
-                            Err(e) => {
-                                warn!(
-                                    "Failed to start event handler for device {}: {}",
-                                    event.path.to_string_lossy(),
-                                    e
-                                );
-                            }
-                        },
+                        }
                         Err(e) => {
                             // Avoid exiting loop and aborting program if a new device fails
                             warn!(

@@ -65,7 +65,11 @@ impl InputHandler {
 
 impl DeviceHandler for InputHandler {
     /// Spawns a task for listening to a device's events and for controlling its grab state.
-    fn handle_device_stream(&mut self, mut events: EventStream, grab_rx: broadcast::Receiver<GrabEvent>) -> Result<DeviceHandle> {
+    fn handle_device_stream(
+        &mut self,
+        mut events: EventStream,
+        grab_rx: broadcast::Receiver<GrabEvent>,
+    ) -> Result<DeviceHandle> {
         let config = self.config.clone();
         let handle =
             task::spawn(async move { read_device_events(&mut events, config, grab_rx).await });

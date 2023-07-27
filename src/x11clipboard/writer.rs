@@ -37,7 +37,10 @@ impl ClipboardWriter {
                 warn!("clipboard server died: {}", e);
             }
         });
-        Ok(ClipboardWriter { store_types_tx, store_data_tx })
+        Ok(ClipboardWriter {
+            store_types_tx,
+            store_data_tx,
+        })
     }
 
     /// Advertises with X11 that we have a new clipboard entry available
