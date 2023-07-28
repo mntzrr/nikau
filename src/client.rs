@@ -61,7 +61,14 @@ pub async fn run_client(
     let conn = client_endpoint
         .connect(server_addr.clone(), "__ignored__")?
         .await?;
-    info!("Connected to server: {}", conn.remote_address());
+    info!(
+        "Connected to server: {} (from local endpoint {})",
+        conn.remote_address(),
+        // IP is typically 0.0.0.0 but the local port should be there at least
+        client_endpoint
+            .local_addr()
+            .map_or("<unknown endpoint>".to_string(), |s| s.to_string())
+    );
     let connect_time = Instant::now();
     let is_new_connection =
         move || Instant::now().duration_since(connect_time) < Duration::from_secs(5);

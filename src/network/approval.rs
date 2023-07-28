@@ -1,5 +1,6 @@
 use std::io::{self, prelude::*};
 use std::sync::{Arc, RwLock};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{bail, Context, Result};
@@ -293,7 +294,7 @@ fn prompt_internal(msg: &str) -> Result<u8> {
         .expect("Failed to configure timeout");
     let mut content = vec![];
     loop {
-        std::thread::sleep(Duration::from_millis(50));
+        thread::sleep(Duration::from_millis(50));
         stdin
             .read_available(&mut content)
             .context("Failed to check for user input")?;

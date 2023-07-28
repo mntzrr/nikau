@@ -56,9 +56,9 @@ struct ServerArgs {
     #[arg(long)]
     exit_secs: Option<u32>,
 
-    /// Maximum size in bytes for transferring clipboard data
-    #[arg(long, default_value_t = 1048576)]
-    max_clipboard_size_bytes: u64,
+    /// Maximum size in KB for transferring clipboard data (default: 5MB)
+    #[arg(long, default_value_t = 5120)]
+    max_clipboard_size_kb: u64,
 }
 
 #[derive(Args)]
@@ -74,9 +74,9 @@ struct ClientArgs {
     #[arg(long)]
     fingerprints: Option<Vec<String>>,
 
-    /// Maximum size in bytes for transferring clipboard data
-    #[arg(long, default_value_t = 1048576)]
-    max_clipboard_size_bytes: u64,
+    /// Maximum size in KB for transferring clipboard data (default: 5MB)
+    #[arg(long, default_value_t = 5120)]
+    max_clipboard_size_kb: u64,
 }
 
 /// Listens for SIGUSR1 and SIGUSR2, treating them as "switch to next client" and "switch to prev client" respectively.
@@ -120,7 +120,7 @@ async fn main() -> Result<()> {
                 args.shortcut_prev.as_deref(),
                 args.exit_secs,
                 verifier,
-                args.max_clipboard_size_bytes,
+                args.max_clipboard_size_kb * 1024,
             )
             .await
         }
@@ -143,7 +143,7 @@ async fn main() -> Result<()> {
                 "client",
                 args.fingerprints.unwrap_or(vec![]),
             )?;
-            client(connect_addr, verifier, args.max_clipboard_size_bytes).await
+            client(connect_addr, verifier, args.max_clipboard_size_kb * 1024).await
         }
     }
 }

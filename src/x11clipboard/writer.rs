@@ -4,7 +4,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use tokio::sync::{mpsc, watch};
 use tokio::task;
 use tracing::{debug, info, trace, warn};
-use x11rb_async::connection::{Connection, RequestConnection};
+use x11rb_async::connection::Connection;
 use x11rb_async::protocol::xproto::{
     Atom, AtomEnum, ChangeWindowAttributesAux, ConnectionExt, EventMask, PropMode, Property,
     SelectionNotifyEvent, Time, Window, SELECTION_NOTIFY_EVENT,
@@ -13,6 +13,12 @@ use x11rb_async::protocol::Event;
 use x11rb_async::rust_connection::RustConnection;
 
 use crate::x11clipboard::{shared, ClipboardData};
+
+/// Max X11 property size. We ignore the 16M size reported by X11 via conn.maximum_request_bytes(),
+/// which is apparently a lie because e.g. a 4M property will cause panics.
+/// Meanwhile other applications are observed to use 262144 byte chunks when we fetch clipboards from them.
+/// Let's go slightly smaller than that to ensure plenty of headroom and avoid panics.
+const CLIPBOARD_MAX_CHUNK_BYTES: usize = 256000;
 
 /// A fetch request, and a path for sending the response.
 pub struct ClipboardFetch {
@@ -137,7 +143,7 @@ impl ClipboardServerState {
             selection_to_property: HashMap::<Atom, Atom>::new(),
             property_to_state: HashMap::<Atom, IncrState>::new(),
             atoms: shared::Atoms::new(conn).await?,
-            max_length: conn.maximum_request_bytes().await,
+            max_length: CLIPBOARD_MAX_CHUNK_BYTES,
             clipboard_types: None,
             clipboard_data: None,
         };
@@ -241,7 +247,8 @@ impl ClipboardServerState {
                             None => return Ok(()),
                         };
                         if clipboard_data.data.len() < self.max_length - 24 {
-                            // request to get clipboard content, and data fits within max_length
+                            // Request to get clipboard content, and data fits within max_length
+                            // If the size is too big, then the underlying X11 thread will panic here.
                             context
                                 .conn
                                 .change_property(
@@ -255,7 +262,7 @@ impl ClipboardServerState {
                                 )
                                 .await?;
                         } else {
-                            // request to get clipboard content, but data doesn't fit within max_length
+                            // Request to get clipboard content, but data doesn't fit within max_length
                             context
                                 .conn
                                 .change_window_attributes(
@@ -315,7 +322,7 @@ impl ClipboardServerState {
                     return Ok(());
                 };
 
-                // requestor has deleted the last chunk of clipboard content, write the next chunk
+                // Requestor has deleted the last chunk of clipboard content, write the next chunk
                 let state = match self.property_to_state.get_mut(&event.atom) {
                     Some(val) => val,
                     None => return Ok(()),
@@ -326,9 +333,9 @@ impl ClipboardServerState {
                 };
 
                 let mut len = clipboard_data.data.len() - state.pos;
-                // Max out at 1MB per chunk
-                if len > 1048576 {
-                    len = 1048576;
+                // Enforce a max size per chunk
+                if len > self.max_length {
+                    len = self.max_length;
                 }
                 let data = &clipboard_data.data[state.pos..][..len];
                 context
