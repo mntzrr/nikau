@@ -177,7 +177,9 @@ impl<'a> std::fmt::Display for ClipboardRequestSource {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             ClipboardRequestSource::Local(_) => f.write_str("Local"),
-            ClipboardRequestSource::Remote(addr) => f.write_str(format!("Remote({})", addr).as_str()),
+            ClipboardRequestSource::Remote(addr) => {
+                f.write_str(format!("Remote({})", addr).as_str())
+            }
         }
     }
 }
@@ -249,7 +251,11 @@ impl Rotation {
             }
             RotationEvent::ClipboardSendContent(args) => {
                 if let Err(e) = self
-                    .clipboard_send_content_from_client(args.data_source, args.request_client, args.data)
+                    .clipboard_send_content_from_client(
+                        args.data_source,
+                        args.request_client,
+                        args.data,
+                    )
                     .await
                 {
                     warn!("Failed to send clipboard content to client: {:?}", e);
@@ -479,7 +485,9 @@ impl Rotation {
                 if let Some(local_clipboard) = &mut self.local_clipboard {
                     local_clipboard.waiting_clipboard_tx = Some(waiting_clipboard_tx);
                 } else {
-                    bail!("Got request for clipboard from server, but server clipboard is disabled");
+                    bail!(
+                        "Got request for clipboard from server, but server clipboard is disabled"
+                    );
                 }
             }
 
@@ -559,11 +567,15 @@ impl Rotation {
                 }
                 Ok(())
             } else {
-                warn!("Ignoring unexpected clipboard data from client: no clipboard fetch is pending");
+                warn!(
+                    "Ignoring unexpected clipboard data from client: no clipboard fetch is pending"
+                );
                 Ok(())
             }
         } else {
-            warn!("Ignoring unexpected clipboard data from client: clipboard is disabled at server");
+            warn!(
+                "Ignoring unexpected clipboard data from client: clipboard is disabled at server"
+            );
             Ok(())
         }
     }
@@ -859,7 +871,12 @@ impl Rotation {
                 // This is the active client. Remove it AND switch to local machine.
                 info!(
                     "Removing client {} from rotation and switching to local machine (clients: {})",
-                    endpoint, client_list
+                    endpoint,
+                    if client_list.is_empty() {
+                        "none".to_string()
+                    } else {
+                        client_list
+                    }
                 );
 
                 // Current client is being removed. If it comes back soon, we can mark it current again.
@@ -874,8 +891,13 @@ impl Rotation {
         }
 
         info!(
-            "Removing client {} from rotation: {}",
-            endpoint, client_list
+            "Removing client {} from client rotation: {}",
+            endpoint,
+            if client_list.is_empty() {
+                "empty".to_string()
+            } else {
+                client_list
+            }
         );
         should_clear_clipboard
     }

@@ -50,9 +50,7 @@ impl ClipboardWriter {
                 warn!("clipboard server died: {}", e);
             }
         });
-        Ok(ClipboardWriter {
-            store_types_tx,
-        })
+        Ok(ClipboardWriter { store_types_tx })
     }
 
     /// Advertises with X11 that we have a new clipboard entry available
@@ -202,7 +200,8 @@ impl ClipboardServerState {
                             .map(|d| d.requested_type != target.1)
                             .unwrap_or(true);
                         if needs_fetch {
-                            self.clipboard_data = Some(fetch_clipboard_data(fetch_data_tx, &target.1, &event).await?);
+                            self.clipboard_data =
+                                Some(fetch_clipboard_data(fetch_data_tx, &target.1, &event).await?);
                         } else {
                             info!(
                                 "Reusing existing clipboard content to requestor={} with type {}: {} bytes",
@@ -216,7 +215,14 @@ impl ClipboardServerState {
                         }
 
                         if let Some(data) = &self.clipboard_data {
-                            send_clipboard_data(data, &context, &event, self.max_length, self.atoms.incr).await?;
+                            send_clipboard_data(
+                                data,
+                                &context,
+                                &event,
+                                self.max_length,
+                                self.atoms.incr,
+                            )
+                            .await?;
                             self.selection_to_property
                                 .insert(event.selection, event.property);
                             self.property_to_state.insert(
@@ -323,9 +329,9 @@ async fn fetch_clipboard_data(
     // Wait for response with clipboard data, or give up
     match time::timeout(
         Duration::from_secs(shared::CLIPBOARD_TIMEOUT_SECS),
-        fetch_result_rx
+        fetch_result_rx,
     )
-        .await
+    .await
     {
         Ok(Ok(clipboard_data)) => {
             if let Some(data_type) = &clipboard_data.data_type {
@@ -344,7 +350,10 @@ async fn fetch_clipboard_data(
             };
         }
         Ok(Err(e)) => {
-            error!("Waiting for clipboard data failed, writing empty clipboard: {}", e);
+            error!(
+                "Waiting for clipboard data failed, writing empty clipboard: {}",
+                e
+            );
         }
         Err(_e) => {
             error!(
@@ -363,7 +372,13 @@ async fn fetch_clipboard_data(
     })
 }
 
-async fn send_clipboard_data(clipboard_data: &ClipboardData, context: &shared::XContext, event: &SelectionRequestEvent, max_length: usize, incr_atom: Atom) -> Result<()> {
+async fn send_clipboard_data(
+    clipboard_data: &ClipboardData,
+    context: &shared::XContext,
+    event: &SelectionRequestEvent,
+    max_length: usize,
+    incr_atom: Atom,
+) -> Result<()> {
     if clipboard_data.data.len() < max_length - 24 {
         // Request to get clipboard content, and data fits within max_length
         // If the size is too big, then the underlying X11 thread will panic here.
@@ -387,8 +402,7 @@ async fn send_clipboard_data(clipboard_data: &ClipboardData, context: &shared::X
         .conn
         .change_window_attributes(
             event.requestor,
-            &ChangeWindowAttributesAux::new()
-                .event_mask(EventMask::PROPERTY_CHANGE),
+            &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE),
         )
         .await?;
     context

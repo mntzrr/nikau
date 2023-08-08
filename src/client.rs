@@ -366,7 +366,10 @@ impl Connection {
                 // Raw clipboard data has all been accumulated, send it to the pending fetch.
                 // Pass ownership of the data to the writer and clear local state.
                 if let Some(waiting_clipboard_fetch) = self.waiting_clipboard_fetch.take() {
-                    let d = self.incoming_clipboard_data.take().expect("Just checked data was present");
+                    let d = self
+                        .incoming_clipboard_data
+                        .take()
+                        .expect("Just checked data was present");
                     if let Err(_d_again) = waiting_clipboard_fetch.fetch_result_tx.send(d) {
                         warn!("Discarding clipboard data from server: no pending clipboard request (timed out?)");
                     }

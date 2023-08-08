@@ -48,7 +48,8 @@ impl ClipboardTypeWatcher {
                             types
                         );
                         // TODO(clipboard): remove this filtering once tmpzip conversion is implemented
-                        let types = types.into_iter()
+                        let types = types
+                            .into_iter()
                             .filter(|t| t != "x-special/gnome-copied-files" && t != "text/uri-list")
                             .collect();
                         if let Err(e) = types_tx.send(types) {
@@ -158,7 +159,10 @@ impl ClipboardReader {
             requested_type,
             max_size_bytes
         );
-        let type_atom = self.atoms.get_atom(&self.context.conn, requested_type).await?;
+        let type_atom = self
+            .atoms
+            .get_atom(&self.context.conn, requested_type)
+            .await?;
 
         self.context
             .conn
