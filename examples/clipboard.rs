@@ -40,12 +40,13 @@ async fn main() -> Result<()> {
                 let mut data = Vec::new();
                 data.extend_from_slice(b"hello xorg");
                 let d = ClipboardData {
-                    type_: fetch.type_,
+                    requested_type: fetch.requested_type,
+                    data_type: None,
                     data,
                     remaining_bytes: 0,
                 };
-                if let Err(e) = writer.lock().await.store_data(d).await {
-                    error!("storing clipboard data failed: {}", e);
+                if let Err(_d_again) = fetch.fetch_result_tx.send(d) {
+                    error!("storing clipboard data failed");
                 }
             }
         }
@@ -96,7 +97,7 @@ async fn x11_store_types(clipboard: &mut ClipboardWriter, types: &Vec<&str>) -> 
 }
 
 async fn x11_fetch_data(clipboard: &mut ClipboardReader, type_: &str) -> Result<()> {
-    let val = clipboard.read(type_, 0, &None).await?;
+    let (val, _data_type) = clipboard.read(type_, 0, &None).await?;
     if val.len() > 256 {
         info!("got clipboard from x11: {} bytes", val.len());
     } else {

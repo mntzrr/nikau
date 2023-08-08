@@ -11,8 +11,6 @@ use x11rb_async::x11_utils::TryParse;
 
 use crate::x11clipboard::shared;
 
-const CLIPBOARD_TIMEOUT_SECS: u64 = 3;
-
 /// Task that listens for updates to the clipboard types (local cut or copy).
 /// Sends out an event when an update occurs, indicating a new clipboard is available.
 pub struct ClipboardTypeWatcher {
@@ -49,6 +47,10 @@ impl ClipboardTypeWatcher {
                             "Received updated clipboard from local system with types: {:?}",
                             types
                         );
+                        // TODO(clipboard): remove this filtering once tmpzip conversion is implemented
+                        let types = types.into_iter()
+                            .filter(|t| t != "x-special/gnome-copied-files" && t != "text/uri-list")
+                            .collect();
                         if let Err(e) = types_tx.send(types) {
                             warn!("Failed to send updated clipboard types: {}", e);
                         }
@@ -139,23 +141,24 @@ impl ClipboardReader {
     }
 
     /// Reads the clipboard data for the specified type.
+    /// The result may be converted/compressed to a different type for network transfer, see ret.1.
     pub async fn read(
         &mut self,
-        type_: &str,
+        requested_type: &str,
         max_size_bytes: u64,
         request_client: &Option<SocketAddr>,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<(Vec<u8>, Option<String>)> {
         debug!(
-            "Reading local clipboard content as requested by {}: type={} max_size_bytes={}",
+            "Reading local clipboard content as requested by {}: requested_type={} max_size_bytes={}",
             if let Some(c) = request_client {
                 format!("client {}", c)
             } else {
                 "server".to_string()
             },
-            type_,
+            requested_type,
             max_size_bytes
         );
-        let type_atom = self.atoms.get_atom(&self.context.conn, type_).await?;
+        let type_atom = self.atoms.get_atom(&self.context.conn, requested_type).await?;
 
         self.context
             .conn
@@ -174,7 +177,7 @@ impl ClipboardReader {
         // If there's a bug in clipboard state management, retrieval can get stuck forever.
         // So just in case let's avoid waiting forever here.
         match time::timeout(
-            Duration::from_secs(CLIPBOARD_TIMEOUT_SECS),
+            Duration::from_secs(shared::CLIPBOARD_TIMEOUT_SECS),
             process_event(
                 &self.context,
                 &self.atoms,
@@ -193,7 +196,7 @@ impl ClipboardReader {
             Err(_e) => {
                 warn!(
                     "X11 clipboard read timed out after {}s",
-                    CLIPBOARD_TIMEOUT_SECS
+                    shared::CLIPBOARD_TIMEOUT_SECS
                 );
                 buf.clear();
                 // Continue below, try to clear the status
@@ -207,7 +210,8 @@ impl ClipboardReader {
             .check()
             .await?;
 
-        Ok(buf)
+        // TODO(clipboard) buf has the clipboard data. convert from requested_type to a preferred data_type as relevant
+        Ok((buf, None))
     }
 }
 

@@ -272,8 +272,8 @@ async fn handle_bulk_messages(
                 rotation_tx
                     .send(rotation::RotationEvent::ClipboardRequestContent(
                         rotation::ClipboardRequestContentArgs {
-                            request_client: Some(source),
-                            type_: c.type_.to_string(),
+                            request_source: rotation::ClipboardRequestSource::Remote(source),
+                            requested_type: c.requested_type.to_string(),
                             // Advertise min(advertising client max, server max)
                             max_size_bytes: std::cmp::min(
                                 c.max_size_bytes,
@@ -303,7 +303,8 @@ async fn handle_bulk_messages(
                                 data_source: source,
                                 request_client: c.request_client,
                                 data: x11clipboard::ClipboardData {
-                                    type_: c.type_.to_string(),
+                                    requested_type: c.requested_type.to_string(),
+                                    data_type: c.data_type.map(|t| t.to_string()),
                                     data,
                                     remaining_bytes: 0,
                                 },
@@ -318,7 +319,8 @@ async fn handle_bulk_messages(
                     data.extend_from_slice(resp_remainder);
                     return Ok(Some((
                         x11clipboard::ClipboardData {
-                            type_: c.type_.to_string(),
+                            requested_type: c.requested_type.to_string(),
+                            data_type: c.data_type.map(|t| t.to_string()),
                             data,
                             remaining_bytes: c.content_len_bytes as usize - resp_remainder.len(),
                         },

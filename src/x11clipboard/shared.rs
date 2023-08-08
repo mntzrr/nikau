@@ -8,6 +8,8 @@ use x11rb_async::protocol::xproto::{
 };
 use x11rb_async::rust_connection::RustConnection;
 
+pub(crate) const CLIPBOARD_TIMEOUT_SECS: u64 = 5;
+
 /// A clipboard type that we advertise to tell if we're serving a clipboard already
 pub(crate) const NIKAU_REMOTE_TARGET: &str = "__NIKAU_REMOTE__";
 

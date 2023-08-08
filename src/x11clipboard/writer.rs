@@ -1,13 +1,14 @@
 use std::collections::HashMap;
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use tokio::sync::{mpsc, watch};
-use tokio::task;
-use tracing::{debug, info, trace, warn};
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio::{task, time};
+use tracing::{debug, error, info, trace, warn};
 use x11rb_async::connection::Connection;
 use x11rb_async::protocol::xproto::{
     Atom, AtomEnum, ChangeWindowAttributesAux, ConnectionExt, EventMask, PropMode, Property,
-    SelectionNotifyEvent, Time, Window, SELECTION_NOTIFY_EVENT,
+    SelectionNotifyEvent, SelectionRequestEvent, Time, Window, SELECTION_NOTIFY_EVENT,
 };
 use x11rb_async::protocol::Event;
 use x11rb_async::rust_connection::RustConnection;
@@ -20,34 +21,37 @@ use crate::x11clipboard::{shared, ClipboardData};
 /// Let's go slightly smaller than that to ensure plenty of headroom and avoid panics.
 const CLIPBOARD_MAX_CHUNK_BYTES: usize = 256000;
 
-/// A fetch request, and a path for sending the response.
+/// A clipboard fetch request
 pub struct ClipboardFetch {
-    /// The type that we want
-    pub type_: String,
+    /// The type that we want. The resulting ClipboardData may have a different type.
+    pub requested_type: String,
+
+    /// The channel for sending back the result.
+    pub fetch_result_tx: oneshot::Sender<ClipboardData>,
 }
 
 pub struct ClipboardWriter {
-    /// Send available clipboard types, advertised by server
+    /// Send available clipboard types, received from Nikau server
     store_types_tx: watch::Sender<Vec<String>>,
-    /// Send clipboard content for one of the previously advertised types
-    store_data_tx: mpsc::Sender<ClipboardData>,
 }
 
+/// Launches an X11 background task for advertising received clipboard types,
+/// and fetching clipboard contents in response to type requests (pastes).
 impl ClipboardWriter {
+    /// Launches the async background task and returns a call for sending clipboard type updates.
+    /// fetch_data_tx is the call for requesting clipboard contents for a given type from Nikau.
     pub async fn start(fetch_data_tx: mpsc::Sender<ClipboardFetch>) -> Result<Self> {
         let context = shared::XContext::new()
             .await
             .context("Failed to set up X11 API context")?;
         let (store_types_tx, store_types_rx) = watch::channel(vec![]);
-        let (store_data_tx, store_data_rx) = mpsc::channel(32);
         task::spawn(async move {
-            if let Err(e) = serve(context, store_types_rx, fetch_data_tx, store_data_rx).await {
+            if let Err(e) = serve(context, store_types_rx, fetch_data_tx).await {
                 warn!("clipboard server died: {}", e);
             }
         });
         Ok(ClipboardWriter {
             store_types_tx,
-            store_data_tx,
         })
     }
 
@@ -56,25 +60,16 @@ impl ClipboardWriter {
         self.store_types_tx.send(types.into())?;
         Ok(())
     }
-
-    /// Makes the provided clipboard data available to X11 for a paste operation
-    pub async fn store_data(&self, data: ClipboardData) -> Result<()> {
-        // TODO(later) check if we're expecting a fetch and discard the data if not?
-        self.store_data_tx.send(data).await?;
-        Ok(())
-    }
 }
 
 async fn serve(
     context: shared::XContext,
-    // Receive available clipboard types, advertised by Nikau server
-    // Events are from calls to store_types()
+    // Receive available clipboard types, advertised by Nikau server.
+    // Uses watch rather than an mpsc since we only care about the current/latest clipboard.
     mut store_types_rx: watch::Receiver<Vec<String>>,
-    // Request clipboard content for one of the types received to store_types_rx
+    // Ask Nikau to get clipboard content, for one of the types previously advertised
+    // via store_types()/store_types_rx. The ClipboardFetch has a oneshot for sending the data.
     fetch_data_tx: mpsc::Sender<ClipboardFetch>,
-    // Receive clipboard content in response to a fetch_data_tx query
-    // Events are from calls to store_data()
-    mut store_data_rx: mpsc::Receiver<ClipboardData>,
 ) -> Result<()> {
     let mut state = ClipboardServerState::new(&context.conn).await?;
     loop {
@@ -111,7 +106,7 @@ async fn serve(
             },
             event = context.conn.wait_for_event() => {
                 if let Ok(event) = event {
-                    if let Err(e) = state.handle_event(event, &context, &fetch_data_tx, &mut store_data_rx).await {
+                    if let Err(e) = state.handle_event(event, &context, &fetch_data_tx).await {
                         warn!("X11 event handling failed: {:?}", e);
                         // keep going...
                     }
@@ -157,7 +152,6 @@ impl ClipboardServerState {
         event: Event,
         context: &shared::XContext,
         fetch_data_tx: &mpsc::Sender<ClipboardFetch>,
-        store_data_rx: &mut mpsc::Receiver<ClipboardData>,
     ) -> Result<()> {
         trace!("X11 writer/server event: {:?}", event);
         match event {
@@ -205,33 +199,10 @@ impl ClipboardServerState {
                         let needs_fetch = self
                             .clipboard_data
                             .as_ref()
-                            .map(|d| d.type_ != target.1)
+                            .map(|d| d.requested_type != target.1)
                             .unwrap_or(true);
                         if needs_fetch {
-                            debug!(
-                                "Fetching clipboard with type {}={} for requestor={}",
-                                target.0, target.1, event.requestor
-                            );
-                            fetch_data_tx
-                                .send(ClipboardFetch {
-                                    type_: target.1.clone(),
-                                })
-                                .await?;
-                            // TODO(later) timeout on retrieving data, where we give up and return empty data?
-                            let clipboard_data = store_data_rx
-                                .recv()
-                                .await
-                                .context("failed to wait for clipboard data")?;
-                            if clipboard_data.type_ != target.1 {
-                                bail!("Requested clipboard type {} for requestor={}, but fetched clipboard had type {}", target.1, event.requestor, clipboard_data.type_);
-                            }
-                            info!(
-                                "Providing clipboard data to requestor={} with type {}: {} bytes",
-                                event.requestor,
-                                clipboard_data.type_,
-                                clipboard_data.data.len()
-                            );
-                            self.clipboard_data = Some(clipboard_data);
+                            self.clipboard_data = Some(fetch_clipboard_data(fetch_data_tx, &target.1, &event).await?);
                         } else {
                             info!(
                                 "Reusing existing clipboard content to requestor={} with type {}: {} bytes",
@@ -244,47 +215,8 @@ impl ClipboardServerState {
                             );
                         }
 
-                        let clipboard_data = match &self.clipboard_data {
-                            Some(data) => data,
-                            None => return Ok(()),
-                        };
-                        if clipboard_data.data.len() < self.max_length - 24 {
-                            // Request to get clipboard content, and data fits within max_length
-                            // If the size is too big, then the underlying X11 thread will panic here.
-                            context
-                                .conn
-                                .change_property(
-                                    PropMode::REPLACE,
-                                    event.requestor,
-                                    event.property,
-                                    event.target,
-                                    8,
-                                    clipboard_data.data.len() as u32,
-                                    &clipboard_data.data,
-                                )
-                                .await?;
-                        } else {
-                            // Request to get clipboard content, but data doesn't fit within max_length
-                            context
-                                .conn
-                                .change_window_attributes(
-                                    event.requestor,
-                                    &ChangeWindowAttributesAux::new()
-                                        .event_mask(EventMask::PROPERTY_CHANGE),
-                                )
-                                .await?;
-                            context
-                                .conn
-                                .change_property(
-                                    PropMode::REPLACE,
-                                    event.requestor,
-                                    event.property,
-                                    self.atoms.incr,
-                                    32,
-                                    0,
-                                    &[],
-                                )
-                                .await?;
+                        if let Some(data) = &self.clipboard_data {
+                            send_clipboard_data(data, &context, &event, self.max_length, self.atoms.incr).await?;
                             self.selection_to_property
                                 .insert(event.selection, event.property);
                             self.property_to_state.insert(
@@ -296,6 +228,8 @@ impl ClipboardServerState {
                                     pos: 0,
                                 },
                             );
+                        } else {
+                            return Ok(());
                         }
                     }
                 }
@@ -367,4 +301,107 @@ impl ClipboardServerState {
         }
         Ok(())
     }
+}
+
+async fn fetch_clipboard_data(
+    fetch_data_tx: &mpsc::Sender<ClipboardFetch>,
+    requested_type: &str,
+    event: &SelectionRequestEvent,
+) -> Result<ClipboardData> {
+    debug!(
+        "Fetching clipboard with type {} for requestor={}",
+        requested_type, event.requestor
+    );
+    let (fetch_result_tx, fetch_result_rx) = oneshot::channel();
+    fetch_data_tx
+        .send(ClipboardFetch {
+            requested_type: requested_type.to_string(),
+            fetch_result_tx,
+        })
+        .await?;
+
+    // Wait for response with clipboard data, or give up
+    match time::timeout(
+        Duration::from_secs(shared::CLIPBOARD_TIMEOUT_SECS),
+        fetch_result_rx
+    )
+        .await
+    {
+        Ok(Ok(clipboard_data)) => {
+            if let Some(data_type) = &clipboard_data.data_type {
+                // TODO(clipboard) convert from data_type to requested_type for writing
+                error!("Clipboard data conversion from data_type={} to requested_type={} isn't supported, writing empty clipboard", data_type, clipboard_data.requested_type);
+            } else if clipboard_data.requested_type != requested_type {
+                error!("Returned clipboard type {} doesn't match requested type {} for requestor={}, writing empty clipboard", clipboard_data.requested_type, requested_type, event.requestor);
+            } else {
+                info!(
+                    "Writing clipboard data to requestor={} with type {}: {} bytes",
+                    event.requestor,
+                    clipboard_data.requested_type,
+                    clipboard_data.data.len()
+                );
+                return Ok(clipboard_data);
+            };
+        }
+        Ok(Err(e)) => {
+            error!("Waiting for clipboard data failed, writing empty clipboard: {}", e);
+        }
+        Err(_e) => {
+            error!(
+                "Waiting for clipboard data timed out after {}s, writing empty clipboard",
+                shared::CLIPBOARD_TIMEOUT_SECS
+            );
+        }
+    }
+
+    // For timeout and conversion errors, return an empty clipboard entry to avoid things freezing up.
+    Ok(ClipboardData {
+        requested_type: requested_type.to_string(),
+        data_type: None,
+        data: vec![],
+        remaining_bytes: 0,
+    })
+}
+
+async fn send_clipboard_data(clipboard_data: &ClipboardData, context: &shared::XContext, event: &SelectionRequestEvent, max_length: usize, incr_atom: Atom) -> Result<()> {
+    if clipboard_data.data.len() < max_length - 24 {
+        // Request to get clipboard content, and data fits within max_length
+        // If the size is too big, then the underlying X11 thread will panic here.
+        context
+            .conn
+            .change_property(
+                PropMode::REPLACE,
+                event.requestor,
+                event.property,
+                event.target,
+                8,
+                clipboard_data.data.len() as u32,
+                &clipboard_data.data,
+            )
+            .await?;
+        return Ok(());
+    }
+
+    // Request to get clipboard content, but data doesn't fit within max_length
+    context
+        .conn
+        .change_window_attributes(
+            event.requestor,
+            &ChangeWindowAttributesAux::new()
+                .event_mask(EventMask::PROPERTY_CHANGE),
+        )
+        .await?;
+    context
+        .conn
+        .change_property(
+            PropMode::REPLACE,
+            event.requestor,
+            event.property,
+            incr_atom,
+            32,
+            0,
+            &[],
+        )
+        .await?;
+    Ok(())
 }

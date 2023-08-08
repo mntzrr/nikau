@@ -48,10 +48,12 @@ impl<'a> std::fmt::Display for ClientBulk<'a> {
 
 // ServerClipboardRequest
 
+/// Request to retrieve a previously advertised clipboard, sent from the server to a client
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ServerClipboardRequest<'a> {
-    /// The desired type to be retrieved from the client, from a prior ServerClipboardTypes
-    pub type_: &'a str,
+    /// The desired type to be retrieved from the client,
+    /// from a prior ClipboardTypes event advertised by the client
+    pub requested_type: &'a str,
 
     /// Request that any sent clipboards not exceed this size
     pub max_size_bytes: u64,
@@ -65,8 +67,8 @@ impl<'a> std::fmt::Display for ServerClipboardRequest<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         f.write_str(
             format!(
-                "ServerClipboardRequest(type={}, max_size_bytes={}, request_client={:?})",
-                self.type_, self.max_size_bytes, self.request_client,
+                "ServerClipboardRequest(requested_type={}, max_size_bytes={}, request_client={:?})",
+                self.requested_type, self.max_size_bytes, self.request_client,
             )
             .as_str(),
         )
@@ -78,8 +80,12 @@ impl<'a> std::fmt::Display for ServerClipboardRequest<'a> {
 /// Metadata about requested clipboard content which follows, sent from the server to a client
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ServerClipboardHeader<'a> {
-    /// A mime type requested by an X11 (or Wayland) client
-    pub type_: &'a str,
+    /// The mime type that had originally been requested in the ClientClipboardRequest
+    pub requested_type: &'a str,
+
+    /// The actual type being returned, or None if it matches requested_type.
+    /// This is used for sending compressed or packaged payloads as needed for some types.
+    pub data_type: Option<&'a str>,
 
     /// The length of the clipboard content that follows this header
     pub content_len_bytes: u64,
@@ -89,8 +95,8 @@ impl<'a> std::fmt::Display for ServerClipboardHeader<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         f.write_str(
             format!(
-                "ServerClipboardHeader(type={}, content_len_bytes={})",
-                self.type_, self.content_len_bytes,
+                "ServerClipboardHeader(requested_type={}, data_type={:?}, content_len_bytes={})",
+                self.requested_type, self.data_type, self.content_len_bytes,
             )
             .as_str(),
         )
@@ -99,10 +105,12 @@ impl<'a> std::fmt::Display for ServerClipboardHeader<'a> {
 
 // ClientClipboardRequest
 
+/// Request to retrieve a previously advertised clipboard, sent from a client to the server
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ClientClipboardRequest<'a> {
-    /// The desired type to be retrieved from the client, from a prior ClientClipboardTypes
-    pub type_: &'a str,
+    /// The desired type to be retrieved from the server,
+    /// from a prior ClipboardTypes event adverstised by the server
+    pub requested_type: &'a str,
 
     /// Request that any sent clipboards not exceed this size
     pub max_size_bytes: u64,
@@ -112,8 +120,8 @@ impl<'a> std::fmt::Display for ClientClipboardRequest<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         f.write_str(
             format!(
-                "ClientClipboardRequest(type={}, max_size_bytes={})",
-                self.type_, self.max_size_bytes,
+                "ClientClipboardRequest(requested_type={}, max_size_bytes={})",
+                self.requested_type, self.max_size_bytes,
             )
             .as_str(),
         )
@@ -125,8 +133,12 @@ impl<'a> std::fmt::Display for ClientClipboardRequest<'a> {
 /// Metadata about requested clipboard content which follows, sent from a client to the server
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ClientClipboardHeader<'a> {
-    /// A mime type requested by an X11 (or Wayland) client
-    pub type_: &'a str,
+    /// The mime type that had originally been requested in the ServerClipboardRequest
+    pub requested_type: &'a str,
+
+    /// The actual type being returned, or None if it matches requested_type.
+    /// This is used for sending compressed or packaged payloads as needed for some types.
+    pub data_type: Option<&'a str>,
 
     /// The length of the clipboard content that follows this header
     pub content_len_bytes: u64,
@@ -140,8 +152,8 @@ impl<'a> std::fmt::Display for ClientClipboardHeader<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         f.write_str(
             format!(
-                "ClientClipboardHeader(type={}, content_len_bytes={}, request_client={:?})",
-                self.type_, self.content_len_bytes, self.request_client,
+                "ClientClipboardHeader(requested_type={}, data_type={:?}, content_len_bytes={}, request_client={:?})",
+                self.requested_type, self.data_type, self.content_len_bytes, self.request_client,
             )
             .as_str(),
         )

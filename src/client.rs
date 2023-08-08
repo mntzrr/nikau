@@ -80,14 +80,17 @@ struct Connection {
 
     active: bool,
 
-    // Reusable buffer for receiving keyboard events.
+    /// Reusable buffer for receiving keyboard events.
     event_bytes: Vec<u8>,
-    // Reusable buffer for receiving bulk data (clipboards).
+    /// Reusable buffer for receiving bulk data (clipboards).
     bulk_recv_bytes: Vec<u8>,
 
-    // Accumulator of raw clipboard data streamed from the server.
-    // Cleared when the clipboard data has all been received.
+    /// Accumulator of raw clipboard data streamed from the server.
+    /// Cleared when the clipboard data has all been received.
     incoming_clipboard_data: Option<ClipboardData>,
+
+    /// Pending fetch request for this connection, if any.
+    waiting_clipboard_fetch: Option<ClipboardFetch>,
 }
 
 impl Connection {
@@ -141,6 +144,7 @@ impl Connection {
                 event_bytes: Vec::with_capacity(1024),
                 bulk_recv_bytes: Vec::with_capacity(65536),
                 incoming_clipboard_data: None,
+                waiting_clipboard_fetch: None,
             },
             connect_time,
         ))
@@ -157,11 +161,11 @@ impl Connection {
             // Local clipboard enabled: Include watching for local clipboard events
             tokio::select! {
                 local_fetch_request = local_clipboard.fetch_rx.recv() => {
-                    // Send fetch request to server
+                    // Send fetch request to server, keep request and its nested oneshot for handling the response
                     if let Some(local_fetch_request) = local_fetch_request {
                         let msg = bulk::ClientBulk::ClipboardRequest(bulk::ClientClipboardRequest{
-                            type_: &local_fetch_request.type_,
-                            max_size_bytes: self.max_clipboard_size_bytes,
+                            requested_type: &local_fetch_request.requested_type,
+                            max_size_bytes: self.max_clipboard_size_bytes as u64,
                         });
                         let serializedmsg = postcard::to_stdvec_cobs(&msg)
                             .map_err(|e| anyhow!("Failed to serialize clipboard request message: {:?}", e))?;
@@ -170,6 +174,9 @@ impl Connection {
                             serializedmsg.len(),
                             &serializedmsg
                         );
+                        if let Some(old_fetch_request) = &self.waiting_clipboard_fetch.replace(local_fetch_request) {
+                            warn!("Overwriting prior fetch request for type={}", old_fetch_request.requested_type);
+                        }
                         self.bulk_send.write_all(&serializedmsg)
                             .await
                             .context("Failed to send clipboard request message")?;
@@ -178,15 +185,16 @@ impl Connection {
                     }
                 },
                 types_notify = local_clipboard.local_types_rx.changed() => {
+                    // Local machine has a new clipboard entry.
+                    // If we're currently active, then store it until we're deactivated by a switch.
+                    // Ignore clipboard changes when inactive: Avoid polluting the rotation with "external" clipboards.
                     if let Err(e) = types_notify {
                         warn!("local_types_rx is closed: {:?}", e);
                         return Err(anyhow!(e));
                     }
                     if self.active {
-                        // New clipboard entry on local machine, and we're active.
-                        // We'll advertise it to the server when there's a switch.
-                        // Avoid polluting the rotation with "external" clipboards: only collect info if we're active.
                         local_clipboard.local_types.replace(local_clipboard.local_types_rx.borrow().clone());
+                        // Now that we have a local clipboard, don't fetch clipboards from the server.
                         local_clipboard.serving_remote_clipboard = false;
                     }
                 },
@@ -194,6 +202,7 @@ impl Connection {
                     // Incoming data may contain one or more messages, but I've never seen fragments of messages.
                     let resp = event_result
                         .with_context(|| if is_new_connection(connect_time) {
+                            // Additional help for typical behavior when setting things up
                             "Lost events connection, does server need to approve our fingerprint?"
                         } else {
                             "Lost events connection"
@@ -208,6 +217,7 @@ impl Connection {
                 bulk_result = self.bulk_recv.read_chunk(65536, true) => {
                     let resp = bulk_result
                         .with_context(|| if is_new_connection(connect_time) {
+                            // Additional help for typical behavior when setting things up
                             "Lost bulk connection, does server need to approve our fingerprint?"
                         } else {
                             "Lost bulk connection"
@@ -333,18 +343,18 @@ impl Connection {
 
     async fn handle_bulk_data_or_messages(
         &mut self,
-        mut local_clipboard: Option<&mut LocalClipboard>,
+        local_clipboard: Option<&mut LocalClipboard>,
         resp_bytes: Bytes,
     ) -> Result<()> {
         if let Some(c) = &mut self.incoming_clipboard_data {
-            // Clipboard data streaming is in progress. Interpret as raw clipboard data.
+            // Clipboard data streaming is in progress. The message should be raw clipboard data.
             if c.remaining_bytes >= resp_bytes.len() {
                 // This chunk should entirely be raw clipboard data.
                 c.data.extend_from_slice(&resp_bytes);
                 c.remaining_bytes -= resp_bytes.len();
             } else {
                 // Chunk contains more data than expected for the clipboard entry.
-                // Finish the clipboard entry, then pass the rest to bytes for processing below.
+                // Finish the clipboard entry, then save the remainder to bulk_recv_bytes for processing below.
                 c.data
                     .extend_from_slice(&(*resp_bytes)[..c.remaining_bytes]);
                 self.bulk_recv_bytes
@@ -353,14 +363,16 @@ impl Connection {
             }
 
             if c.remaining_bytes == 0 {
-                // Raw clipboard data has all been accumulated, flush and clear.
+                // Raw clipboard data has all been accumulated, send it to the pending fetch.
                 // Pass ownership of the data to the writer and clear local state.
-                // unwrap(): We just checked above that incoming_clipboard_data is present
-                if let Some(local_clipboard) = &mut local_clipboard {
-                    local_clipboard
-                        .writer
-                        .store_data(self.incoming_clipboard_data.take().unwrap())
-                        .await?;
+                if let Some(waiting_clipboard_fetch) = self.waiting_clipboard_fetch.take() {
+                    let d = self.incoming_clipboard_data.take().expect("Just checked data was present");
+                    if let Err(_d_again) = waiting_clipboard_fetch.fetch_result_tx.send(d) {
+                        warn!("Discarding clipboard data from server: no pending clipboard request (timed out?)");
+                    }
+                } else {
+                    warn!("Discarding unexpected clipboard data from server: no clipboard request is pending");
+                    self.incoming_clipboard_data = None;
                 }
             }
 
@@ -416,8 +428,8 @@ impl Connection {
                         }
                     };
                     info!(
-                        "Sending clipboard data with type={} to {}",
-                        c.type_,
+                        "Reading clipboard data for requested type {} to {}",
+                        c.requested_type,
                         if let Some(c) = c.request_client {
                             format!("server for {}", c)
                         } else {
@@ -425,12 +437,13 @@ impl Connection {
                         }
                     );
                     // Read the clipboard data from the local application.
-                    let local_clipboard_data = local_clipboard
+                    let (local_clipboard_data, data_type) = local_clipboard
                         .reader
-                        .read(c.type_, c.max_size_bytes, &c.request_client)
+                        .read(c.requested_type, c.max_size_bytes, &c.request_client)
                         .await?;
                     let msg = bulk::ClientBulk::ClipboardHeader(bulk::ClientClipboardHeader {
-                        type_: c.type_,
+                        requested_type: c.requested_type,
+                        data_type: data_type.as_ref().map(|t| t.as_str()),
                         content_len_bytes: local_clipboard_data.len() as u64,
                         request_client: c.request_client,
                     });
@@ -452,12 +465,6 @@ impl Connection {
                         })?;
                 }
                 bulk::ServerBulk::ClipboardHeader(c) => {
-                    let local_clipboard = match &mut local_clipboard {
-                        Some(lc) => lc,
-                        None => {
-                            bail!("Got ClipboardHeader event from server when we don't support clipboards, resetting connection");
-                        }
-                    };
                     if c.content_len_bytes > self.max_clipboard_size_bytes {
                         // The content length from the server is bigger than what we advertised.
                         // Reset the connection since this shouldn't happen to begin with.
@@ -467,16 +474,23 @@ impl Connection {
                             self.max_clipboard_size_bytes
                         );
                     } else if c.content_len_bytes as usize <= resp_remainder.len() {
-                        // The clipboard content fits fully within resp_remainder.
+                        // The clipboard content fits fully within resp_remainder, send it to the pending fetch.
                         // Mark content as consumed and continue looping in case another message follows.
-                        let mut data = Vec::with_capacity(c.content_len_bytes as usize);
-                        data.extend_from_slice(&resp_remainder[..c.content_len_bytes as usize]);
-                        let d = ClipboardData {
-                            type_: c.type_.to_string(),
-                            data,
-                            remaining_bytes: 0,
-                        };
-                        local_clipboard.writer.store_data(d).await?;
+                        if let Some(waiting_clipboard_fetch) = self.waiting_clipboard_fetch.take() {
+                            let mut data = Vec::with_capacity(c.content_len_bytes as usize);
+                            data.extend_from_slice(&resp_remainder[..c.content_len_bytes as usize]);
+                            let d = ClipboardData {
+                                requested_type: c.requested_type.to_string(),
+                                data_type: c.data_type.map(|t| t.to_string()),
+                                data,
+                                remaining_bytes: 0,
+                            };
+                            if let Err(_d_again) = waiting_clipboard_fetch.fetch_result_tx.send(d) {
+                                warn!("Discarding clipboard data from server: no pending clipboard request (previous request timed out?)");
+                            }
+                        } else {
+                            warn!("Ignoring unexpected clipboard data from server: no clipboard request is pending");
+                        }
                         offset += c.content_len_bytes as usize;
                     } else {
                         // Need to collect more data.
@@ -484,7 +498,8 @@ impl Connection {
                         let mut data = Vec::with_capacity(c.content_len_bytes as usize);
                         data.extend_from_slice(resp_remainder);
                         return Ok(Some(ClipboardData {
-                            type_: c.type_.to_string(),
+                            requested_type: c.requested_type.to_string(),
+                            data_type: c.data_type.map(|t| t.to_string()),
                             data,
                             remaining_bytes: c.content_len_bytes as usize - resp_remainder.len(),
                         }));
