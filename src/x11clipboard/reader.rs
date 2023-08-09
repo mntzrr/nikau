@@ -3,13 +3,13 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use tokio::{sync::watch, task, time};
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, trace, warn};
 use x11rb_async::connection::Connection;
 use x11rb_async::protocol::xproto::{Atom, AtomEnum, ConnectionExt, Property, Time};
 use x11rb_async::protocol::{xfixes, Event};
 use x11rb_async::x11_utils::TryParse;
 
-use crate::x11clipboard::shared;
+use crate::x11clipboard::{convert, shared};
 
 /// Task that listens for updates to the clipboard types (local cut or copy).
 /// Sends out an event when an update occurs, indicating a new clipboard is available.
@@ -209,20 +209,7 @@ impl ClipboardReader {
             .check()
             .await?;
 
-        if shared::NIKAU_ZIPPED_PATHS_TYPES.contains(&requested_type) {
-            // TODO(clipboard) create zip file with the referenced paths
-            Ok((buf, None))
-        } else if buf.len() >= 100 {
-            // Compress clipboard using zstd
-            let orig_len = buf.len();
-            buf = zstd::stream::encode_all(buf.as_slice(), 0)?;
-            // TODO(later): don't bother compressing certain incompressible datatypes like image/png
-            info!("Compressed {}: {} => {} bytes", requested_type, orig_len, buf.len());
-            Ok((buf, Some(shared::NIKAU_ZSTD_TARGET_DATATYPE.to_string())))
-        } else {
-            // Don't bother compressing empty data
-            Ok((buf, None))
-        }
+        convert::read(buf, max_size_bytes, requested_type)
     }
 }
 

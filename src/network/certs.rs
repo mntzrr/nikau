@@ -7,9 +7,9 @@ use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
-pub fn load_known_certs() -> Result<Vec<rustls::Certificate>> {
+pub fn load_known_certs(config_dir: &PathBuf) -> Result<Vec<rustls::Certificate>> {
     let mut certs = vec![];
-    for path in fs::read_dir(init_known_certs_dir()?)? {
+    for path in fs::read_dir(init_known_certs_dir(config_dir)?)? {
         let path = path?;
         let filetype = path.file_type()?;
         if !filetype.is_file() {
@@ -33,8 +33,8 @@ fn splash(label: &str, fingerprint: &str) {
     );
 }
 
-pub fn load_keypair(splash_label: &str) -> Result<(rustls::Certificate, rustls::PrivateKey)> {
-    let file_path = init_config_dir()?.join("private.pem");
+pub fn load_keypair(splash_label: &str, config_dir: &PathBuf) -> Result<(rustls::Certificate, rustls::PrivateKey)> {
+    let file_path = config_dir.join("private.pem");
     if file_path.is_file() {
         let mut reader =
             io::BufReader::new(fs::File::open(&file_path).with_context(|| {
@@ -112,8 +112,8 @@ pub fn fingerprint(cert: &rustls::Certificate) -> String {
     format!("{:x}", Sha256::digest(cert))
 }
 
-pub fn write_approved_cert(cert: &rustls::Certificate) -> Result<()> {
-    let file_path = init_known_certs_dir()
+pub fn write_approved_cert(cert: &rustls::Certificate, config_dir: &PathBuf) -> Result<()> {
+    let file_path = init_known_certs_dir(config_dir)
         .context("Failed to init known_certs dir")?
         .join(format!("{}.pem", fingerprint(cert)));
     let content = pem::encode_config(
@@ -157,8 +157,8 @@ fn load_cert(file_path: &PathBuf) -> Result<rustls::Certificate> {
     }
 }
 
-fn init_known_certs_dir() -> Result<PathBuf> {
-    let dir_path = init_config_dir()?.join("known_certs");
+fn init_known_certs_dir(config_dir: &PathBuf) -> Result<PathBuf> {
+    let dir_path = config_dir.join("known_certs");
     fs::create_dir_all(&dir_path)
         .with_context(|| format!("Failed to ensure certs dir exists: {}", dir_path.display()))?;
     ensure_permissions(&dir_path, 0o755).with_context(|| {
@@ -178,13 +178,4 @@ fn ensure_permissions(path: &PathBuf, perms: u32) -> Result<()> {
         permissions.set_mode(perms);
     }
     Ok(())
-}
-
-fn init_config_dir() -> Result<PathBuf> {
-    let mut homedir = home::home_dir().context("No home dir found: Unable to store certs")?;
-    homedir.push(".config");
-    homedir.push("nikau");
-    fs::create_dir_all(&homedir)
-        .with_context(|| format!("Failed to create config directory: {}", homedir.display()))?;
-    Ok(homedir)
 }

@@ -1,6 +1,9 @@
 pub mod reader;
-mod shared;
 pub mod writer;
+
+mod convert;
+mod limited_cursor;
+mod shared;
 
 pub struct ClipboardData {
     /// The type that this data is associated with, the format it should be returned as.

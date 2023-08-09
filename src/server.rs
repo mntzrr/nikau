@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -14,12 +15,14 @@ use crate::{rotation, x11clipboard};
 pub async fn run_server(
     listen_addr: &SocketAddr,
     cert_verifier: Arc<approval::NikauCertVerification>,
+    config_dir: PathBuf,
     mut input_rx: mpsc::Receiver<input::Event>,
     grab_tx: broadcast::Sender<watch::GrabEvent>,
     max_clipboard_size_bytes: u64,
 ) -> Result<()> {
     let (rotation_tx, mut rotation_rx) = mpsc::channel::<rotation::RotationEvent>(32);
     let local_clipboard = match rotation::LocalClipboard::start(
+        config_dir,
         rotation_tx.clone(),
         max_clipboard_size_bytes,
     )

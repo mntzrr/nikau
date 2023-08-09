@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -13,7 +14,7 @@ use x11rb_async::protocol::xproto::{
 use x11rb_async::protocol::Event;
 use x11rb_async::rust_connection::RustConnection;
 
-use crate::x11clipboard::{shared, ClipboardData};
+use crate::x11clipboard::{convert, shared, ClipboardData};
 
 /// Max X11 property size. We ignore the 16M size reported by X11 via conn.maximum_request_bytes(),
 /// which is apparently a lie because e.g. a 4M property will cause panics.
@@ -40,13 +41,13 @@ pub struct ClipboardWriter {
 impl ClipboardWriter {
     /// Launches the async background task and returns a call for sending clipboard type updates.
     /// fetch_data_tx is the call for requesting clipboard contents for a given type from Nikau.
-    pub async fn start(fetch_data_tx: mpsc::Sender<ClipboardFetch>) -> Result<Self> {
+    pub async fn start(config_dir: PathBuf, fetch_data_tx: mpsc::Sender<ClipboardFetch>) -> Result<Self> {
         let context = shared::XContext::new()
             .await
             .context("Failed to set up X11 API context")?;
         let (store_types_tx, store_types_rx) = watch::channel(vec![]);
         task::spawn(async move {
-            if let Err(e) = serve(context, store_types_rx, fetch_data_tx).await {
+            if let Err(e) = serve(config_dir, context, store_types_rx, fetch_data_tx).await {
                 warn!("clipboard server died: {}", e);
             }
         });
@@ -61,6 +62,7 @@ impl ClipboardWriter {
 }
 
 async fn serve(
+    config_dir: PathBuf,
     context: shared::XContext,
     // Receive available clipboard types, advertised by Nikau server.
     // Uses watch rather than an mpsc since we only care about the current/latest clipboard.
@@ -69,7 +71,7 @@ async fn serve(
     // via store_types()/store_types_rx. The ClipboardFetch has a oneshot for sending the data.
     fetch_data_tx: mpsc::Sender<ClipboardFetch>,
 ) -> Result<()> {
-    let mut state = ClipboardServerState::new(&context.conn).await?;
+    let mut state = ClipboardServerState::new(&context.conn, config_dir).await?;
     loop {
         tokio::select! {
             types_notify = store_types_rx.changed() => {
@@ -122,6 +124,7 @@ struct IncrState {
 }
 
 struct ClipboardServerState {
+    config_dir: PathBuf,
     selection_to_property: HashMap<Atom, Atom>,
     property_to_state: HashMap<Atom, IncrState>,
     atoms: shared::Atoms,
@@ -133,8 +136,9 @@ struct ClipboardServerState {
 }
 
 impl ClipboardServerState {
-    async fn new(conn: &RustConnection) -> Result<Self> {
+    async fn new(conn: &RustConnection, config_dir: PathBuf) -> Result<Self> {
         let ret = ClipboardServerState {
+            config_dir,
             selection_to_property: HashMap::<Atom, Atom>::new(),
             property_to_state: HashMap::<Atom, IncrState>::new(),
             atoms: shared::Atoms::new(conn).await?,
@@ -201,7 +205,7 @@ impl ClipboardServerState {
                             .unwrap_or(true);
                         if needs_fetch {
                             self.clipboard_data =
-                                Some(fetch_clipboard_data(fetch_data_tx, &target.1, &event).await?);
+                                Some(fetch_clipboard_data(fetch_data_tx, &target.1, &event, &self.config_dir).await?);
                         } else {
                             info!(
                                 "Reusing existing clipboard content to requestor={} with type {}: {} bytes",
@@ -313,6 +317,7 @@ async fn fetch_clipboard_data(
     fetch_data_tx: &mpsc::Sender<ClipboardFetch>,
     requested_type: &str,
     event: &SelectionRequestEvent,
+    config_dir: &PathBuf,
 ) -> Result<ClipboardData> {
     debug!(
         "Fetching clipboard with type {} for requestor={}",
@@ -335,14 +340,7 @@ async fn fetch_clipboard_data(
     {
         Ok(Ok(mut clipboard_data)) => {
             if let Some(data_type) = &clipboard_data.data_type {
-                if data_type == shared::NIKAU_ZSTD_TARGET_DATATYPE {
-                    // Decompress payload using zstd
-                    let compressed_len = clipboard_data.data.len();
-                    clipboard_data.data = zstd::stream::decode_all(clipboard_data.data.as_slice())?;
-                    info!("Decompressed {}: {} => {} bytes", requested_type, compressed_len, clipboard_data.data.len());
-                } else {
-                    error!("Clipboard data conversion from data_type={} to requested_type={} isn't supported, writing empty clipboard", data_type, clipboard_data.requested_type);
-                }
+                clipboard_data.data = convert::write(clipboard_data.data, requested_type, data_type, config_dir)?;
             } else if clipboard_data.requested_type != requested_type {
                 error!("Returned clipboard type {} doesn't match requested type {} for requestor={}, writing empty clipboard", clipboard_data.requested_type, requested_type, event.requestor);
             } else {

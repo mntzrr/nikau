@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -27,12 +28,12 @@ pub struct LocalClipboard {
 }
 
 impl LocalClipboard {
-    pub async fn new() -> Result<Self> {
+    pub async fn new(config_dir: PathBuf) -> Result<Self> {
         let (fetch_tx, fetch_rx) = mpsc::channel(32);
         let reader = ClipboardReader::new().await?;
         let (local_types_tx, local_types_rx) = watch::channel(vec![]);
         ClipboardTypeWatcher::start(local_types_tx).await?;
-        let writer = ClipboardWriter::start(fetch_tx).await?;
+        let writer = ClipboardWriter::start(config_dir, fetch_tx).await?;
         Ok(Self {
             reader,
             writer,

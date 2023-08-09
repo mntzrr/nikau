@@ -1,4 +1,6 @@
+use std::fs;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -104,8 +106,8 @@ fn handle_signals(mut signals: Signals, out: mpsc::Sender<input::Event>) {
 #[tokio::main]
 async fn main() -> Result<()> {
     logging::init_logging();
-
     let cli = Cli::parse();
+    let config_dir = init_config_dir()?;
 
     match cli.command {
         Commands::Server(args) => {
@@ -113,8 +115,10 @@ async fn main() -> Result<()> {
             let verifier = approval::NikauCertVerification::new(
                 "server",
                 args.fingerprints.unwrap_or(vec![]),
+                &config_dir,
             )?;
             server(
+                config_dir,
                 listen_addr,
                 &args.shortcut,
                 args.shortcut_prev.as_deref(),
@@ -142,13 +146,24 @@ async fn main() -> Result<()> {
             let verifier = approval::NikauCertVerification::new(
                 "client",
                 args.fingerprints.unwrap_or(vec![]),
+                &config_dir,
             )?;
-            client(connect_addr, verifier, args.max_clipboard_size_kb * 1024).await
+            client(config_dir, connect_addr, verifier, args.max_clipboard_size_kb * 1024).await
         }
     }
 }
 
+fn init_config_dir() -> Result<PathBuf> {
+    let mut homedir = home::home_dir().context("No home dir found: Unable to store certs")?;
+    homedir.push(".config");
+    homedir.push("nikau");
+    fs::create_dir_all(&homedir)
+        .with_context(|| format!("Failed to create config directory: {}", homedir.display()))?;
+    Ok(homedir)
+}
+
 async fn server(
+    config_dir: PathBuf,
     listen_addr: SocketAddr,
     next_keys: &str,
     prev_keys: Option<&str>,
@@ -181,6 +196,7 @@ async fn server(
             server_exit = server::run_server(
                 &listen_addr,
                 verifier,
+                config_dir,
                 event_rx,
                 grab_tx2,
                 max_clipboard_size_bytes,
@@ -195,6 +211,7 @@ async fn server(
         server::run_server(
             &listen_addr,
             verifier,
+            config_dir,
             event_rx,
             grab_tx2,
             max_clipboard_size_bytes,
@@ -205,6 +222,7 @@ async fn server(
 }
 
 async fn client(
+    config_dir: PathBuf,
     connect_addr: SocketAddr,
     verifier: Arc<approval::NikauCertVerification>,
     max_clipboard_size_bytes: u64,
@@ -213,7 +231,7 @@ async fn client(
     let mut virtual_devices =
         output::VirtualDevices::new().context("Failed to create virtual devices, are you root?")?;
 
-    let mut local_clipboard = match client::LocalClipboard::new().await {
+    let mut local_clipboard = match client::LocalClipboard::new(config_dir).await {
         Ok(c) => Some(c),
         Err(e) => {
             info!("Disabled system clipboard support: {}", e);

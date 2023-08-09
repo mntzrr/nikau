@@ -34,5 +34,8 @@ signal-hook = "0.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2.4"
+walkdir = "2.3"
 x11rb-async = { version = "0.12", features = ["xfixes"] }
+zip = { version = "0.6", default-features = false, features = ["zstd"] }
 zstd = "0.12"

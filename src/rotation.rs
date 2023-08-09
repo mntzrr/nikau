@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -71,6 +72,7 @@ pub struct LocalClipboard {
 
 impl LocalClipboard {
     pub async fn start(
+        config_dir: PathBuf,
         rotation_tx: mpsc::Sender<RotationEvent>,
         max_clipboard_size_bytes: u64,
     ) -> Result<Self> {
@@ -123,7 +125,7 @@ impl LocalClipboard {
 
         Ok(Self {
             reader: ClipboardReader::new().await?,
-            writer: ClipboardWriter::start(clipboard_fetch_tx).await?,
+            writer: ClipboardWriter::start(config_dir, clipboard_fetch_tx).await?,
             waiting_clipboard_tx: None,
         })
     }

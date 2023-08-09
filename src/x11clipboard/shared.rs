@@ -13,13 +13,20 @@ pub(crate) const CLIPBOARD_TIMEOUT_SECS: u64 = 5;
 /// A clipboard type that we advertise to tell if we're serving a clipboard already
 pub(crate) const NIKAU_REMOTE_TARGET: &str = "__NIKAU_REMOTE__";
 
-pub(crate) const NIKAU_ZIPPED_PATHS_TYPES: &[&str] = &["x-special/gnome-copied-files", "text/uri-list"];
+/// X11 clipboard types for copying one or more files in a file manager.
+/// In this case the payload is a list of paths, which doesn't work over the network.
+pub(crate) const PATHS_TARGET_GNOME: &str = "x-special/gnome-copied-files";
+pub(crate) const PATHS_TARGET_URIS: &str = "text/uri-list";
+
+/// Clipboard types that should not be compressed by zstd (since it's a waste of time).
+/// This is not meant to be an exhaustive list of compressed types, just ones often seen in clipboards.
+pub(crate) const UNCOMPRESSIBLE_TYPES: &[&str] = &["image/png"];
 
 /// data_type value for one or more files that are referenced by path.
 /// Special handling to support cases where the clipboard is a set of local file paths:
 /// The reader combines the file(s) as a single .zip payload to preserve their filenames.
 /// The writer extracts the file(s) into a temp directory and advertises the paths in that directory.
-pub(crate) const NIKAU_ZIPPED_PATHS_DATATYPE: &str = "application/zip+clipboard-paths";
+pub(crate) const NIKAU_COPIED_FILES_DATATYPE: &str = "application/zip+clipboard-paths";
 
 /// data_type value for data that has been compressed using zstandard to improve clipboard transfer performance.
 /// In practice this should be used for all payloads that aren't ZIPPED_FILES.

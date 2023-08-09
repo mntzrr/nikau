@@ -1,4 +1,5 @@
 use std::io::{self, prelude::*};
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -48,6 +49,8 @@ struct ApprovalState {
 }
 
 pub struct NikauCertVerification {
+    /// For storing certs to disk
+    config_dir: PathBuf,
     /// Used for building rustls configs
     our_cert: rustls::Certificate,
     /// Used for building rustls configs
@@ -59,8 +62,8 @@ pub struct NikauCertVerification {
 }
 
 impl NikauCertVerification {
-    pub fn new(splash_label: &str, approved_cert_fingerprints: Vec<String>) -> Result<Arc<Self>> {
-        let (our_cert, our_privkey) = certs::load_keypair(splash_label)
+    pub fn new(splash_label: &str, approved_cert_fingerprints: Vec<String>, config_dir: &PathBuf) -> Result<Arc<Self>> {
+        let (our_cert, our_privkey) = certs::load_keypair(splash_label, config_dir)
             .with_context(|| format!("Failed to load {} keypair", splash_label))?;
         // Convert e.g. "18:AE:75:F2..." (openssl style) => "18ae75f2..." (our style)
         // Can get the openssl style from: openssl x509 -noout -sha256 -fingerprint -in /path/to/private.pem
@@ -69,11 +72,12 @@ impl NikauCertVerification {
             .map(|fingerprint| fingerprint.to_lowercase().replace(':', ""))
             .collect();
         Ok(Arc::new(NikauCertVerification {
+            config_dir: config_dir.clone(),
             our_cert,
             our_privkey,
             approved_cert_fingerprints,
             approval_state: RwLock::new(ApprovalState {
-                known_certs: certs::load_known_certs()?,
+                known_certs: certs::load_known_certs(config_dir)?,
                 prompt_active: false,
             }),
         }))
@@ -128,7 +132,7 @@ impl NikauCertVerification {
         // especially on the server, where it can break all clients until the server is restarted.
         if prompt_unknown_cert(their_cert, we_are_server) {
             info!("{} cert approved: {}", their_name, their_cert_fingerprint);
-            if let Err(e) = certs::write_approved_cert(their_cert) {
+            if let Err(e) = certs::write_approved_cert(their_cert, &self.config_dir) {
                 warn!(
                     "{} was approved, but couldn't save cert to disk: {}",
                     their_name, e
