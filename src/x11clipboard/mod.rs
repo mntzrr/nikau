@@ -2,7 +2,7 @@ pub mod reader;
 pub mod writer;
 
 mod convert;
-mod limited_cursor;
+mod limited;
 mod shared;
 
 pub struct ClipboardData {

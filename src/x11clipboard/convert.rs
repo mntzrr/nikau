@@ -1,11 +1,15 @@
+use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, bail, Result};
-use tracing::{error, info, warn};
+use anyhow::{anyhow, bail, Context, Result};
+use tracing::{debug, error, info, warn};
 
-use crate::x11clipboard::{limited_cursor, shared};
+use crate::x11clipboard::{limited, shared};
 
+/// Converts clipboard data received from an X11 application
+/// to a payload and/or datatype suitable for sending to a Nikau peer.
+/// If the datatype String is None, then the data is being sent as-is.
 pub fn read(
     buf: Vec<u8>,
     max_compressed_size_bytes: u64,
@@ -32,7 +36,8 @@ pub fn read(
     }
 }
 
-// TODO max_size_bytes here would be of the output payload, lets have it be higher (10x clipboard?)
+/// Converts clipboard data received from another Nikau peer over the network
+/// to a payload suitable for sending to an X11 application.
 pub fn write(
     buf: Vec<u8>,
     max_uncompressed_size_bytes: u64,
@@ -100,7 +105,6 @@ fn read_uri_file_paths(buf: Vec<u8>, max_compressed_size_bytes: u64) -> Result<V
 fn write_uri_file_paths(paths: Vec<PathBuf>) -> Result<Vec<u8>> {
     let mut buf: Vec<u8> = vec![];
     for path in paths {
-        // TODO(someday) other uri schemas here?
         let uri = url::Url::from_file_path(&path)
             .map_err(|_e| anyhow!("Failed to format path '{:?}' as uri", path))?;
         buf.extend_from_slice(format!("{}\r\n", uri).as_bytes());
@@ -115,7 +119,7 @@ fn read_zstd(
     requested_type: &str,
 ) -> Result<Vec<u8>> {
     let orig_len = buf.len();
-    let mut limited = limited_cursor::LimitedCursor::new(max_compressed_size_bytes);
+    let mut limited = limited::LimitedCursor::new(max_compressed_size_bytes);
     zstd::stream::copy_encode(buf.as_slice(), &mut limited, 0)?;
     buf = limited.into_inner();
     info!(
@@ -134,7 +138,7 @@ fn write_zstd(
     requested_type: &str,
 ) -> Result<Vec<u8>> {
     let compressed_len = buf.len();
-    let mut limited = limited_cursor::LimitedCursor::new(max_uncompressed_size_bytes);
+    let mut limited = limited::LimitedCursor::new(max_uncompressed_size_bytes);
     zstd::stream::copy_decode(buf.as_slice(), &mut limited)?;
     buf = limited.into_inner();
     info!(
@@ -146,23 +150,25 @@ fn write_zstd(
     Ok(buf)
 }
 
-// TODO this is all synchronous, wrap to make tokio happy?
+/// Unzips a zip file to a temporary directory under config_dir and returns the list of files.
 fn unpack_zip_payload(
     zipdata: Vec<u8>,
-    max_uncompressed_size_bytes: u64,
+    mut max_uncompressed_size_bytes: u64,
     config_dir: &PathBuf,
 ) -> Result<Vec<PathBuf>> {
     let clipboard_dir = config_dir.join("clipboard");
     // Wipe temp directory to get a clean slate
     if clipboard_dir.exists() {
+        debug!("Clearing temp directory: {}", clipboard_dir.display());
         if clipboard_dir.is_dir() {
             std::fs::remove_dir_all(&clipboard_dir)?;
         }
         bail!(
-            "Temp directory exists, but isn't a directory: {:?}",
-            clipboard_dir
+            "Temp directory exists, but isn't a directory: {}",
+            clipboard_dir.display()
         );
     }
+    debug!("Creating temp directory: {}", clipboard_dir.display());
     std::fs::create_dir_all(&clipboard_dir)?;
 
     // Unzip payload into temp directory
@@ -170,9 +176,32 @@ fn unpack_zip_payload(
     let mut files = vec![];
     for i in 0..ziparchive.len() {
         let mut zipfile = ziparchive.by_index(i)?;
-        let destpath = clipboard_dir.join(zipfile.name());
-        info!("Unpacking {:?}", destpath);
-        // TODO std::io::copy to disk
+        let mut destpath = clipboard_dir.clone();
+        for component in Path::new(zipfile.name()).components() {
+            if let std::path::Component::Normal(n) = component {
+                destpath = destpath.join(n);
+            }
+        }
+        debug!("Unpacking {} to {}", zipfile.name(), destpath.display());
+        if destpath == clipboard_dir {
+            bail!("Invalid path for file: {}", zipfile.name());
+        }
+        if let Some(parent) = destpath.parent() {
+            std::fs::create_dir_all(&parent).with_context(|| {
+                format!("Failed to create temp directory: {}", parent.display())
+            })?;
+        }
+        let outfile = File::create(&destpath).with_context(|| {
+            format!(
+                "Failed to open keypair file for writing: {}",
+                destpath.display()
+            )
+        })?;
+        let mut limited_outfile = limited::LimitedWrite::new(outfile, max_uncompressed_size_bytes);
+        std::io::copy(&mut zipfile, &mut limited_outfile)
+            .with_context(|| format!("Failed to unzip file: {}", destpath.display()))?;
+        // Update remaining total max to reflect the bytes written by this file
+        max_uncompressed_size_bytes = limited_outfile.remaining();
         files.push(destpath);
     }
     Ok(files)
@@ -219,7 +248,7 @@ fn zip_files(
     max_compressed_size_bytes: u64,
 ) -> Result<(usize, Vec<u8>)> {
     let mut uncompressed_len = 0;
-    let mut cursor = limited_cursor::LimitedCursor::new(max_compressed_size_bytes);
+    let mut cursor = limited::LimitedCursor::new(max_compressed_size_bytes);
     {
         let mut zipwriter = zip::ZipWriter::new(&mut cursor);
         let options =
