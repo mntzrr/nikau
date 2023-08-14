@@ -3,6 +3,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
+use tokio::task;
 use tracing::{debug, error, info, warn};
 
 use crate::x11clipboard::{limited, shared};
@@ -10,24 +11,35 @@ use crate::x11clipboard::{limited, shared};
 /// Converts clipboard data received from an X11 application
 /// to a payload and/or datatype suitable for sending to a Nikau peer.
 /// If the datatype String is None, then the data is being sent as-is.
-pub fn read(
+pub async fn read(
     buf: Vec<u8>,
     max_compressed_size_bytes: u64,
     requested_type: &str,
 ) -> Result<(Vec<u8>, Option<String>)> {
     if requested_type == shared::PATHS_TARGET_GNOME {
+        let converted =
+            task::spawn_blocking(move || read_gnome_file_paths(buf, max_compressed_size_bytes))
+                .await??;
         Ok((
-            read_gnome_file_paths(buf, max_compressed_size_bytes)?,
+            converted,
             Some(shared::NIKAU_COPIED_FILES_DATATYPE.to_string()),
         ))
     } else if requested_type == shared::PATHS_TARGET_URIS {
+        let converted =
+            task::spawn_blocking(move || read_uri_file_paths(buf, max_compressed_size_bytes))
+                .await??;
         Ok((
-            read_uri_file_paths(buf, max_compressed_size_bytes)?,
+            converted,
             Some(shared::NIKAU_COPIED_FILES_DATATYPE.to_string()),
         ))
     } else if buf.len() >= 100 && !shared::UNCOMPRESSIBLE_TYPES.contains(&requested_type) {
+        let requested_type = requested_type.to_string();
+        let converted = task::spawn_blocking(move || {
+            read_zstd(buf, max_compressed_size_bytes, &requested_type)
+        })
+        .await??;
         Ok((
-            read_zstd(buf, max_compressed_size_bytes, requested_type)?,
+            converted,
             Some(shared::NIKAU_ZSTD_TARGET_DATATYPE.to_string()),
         ))
     } else {
@@ -38,7 +50,7 @@ pub fn read(
 
 /// Converts clipboard data received from another Nikau peer over the network
 /// to a payload suitable for sending to an X11 application.
-pub fn write(
+pub async fn write(
     buf: Vec<u8>,
     max_uncompressed_size_bytes: u64,
     requested_type: &str,
@@ -47,14 +59,26 @@ pub fn write(
 ) -> Result<Vec<u8>> {
     match (requested_type, data_type) {
         (requested_type, shared::NIKAU_ZSTD_TARGET_DATATYPE) => {
-            write_zstd(buf, max_uncompressed_size_bytes, requested_type)
+            let requested_type = requested_type.to_string();
+            task::spawn_blocking(move || {
+                write_zstd(buf, max_uncompressed_size_bytes, &requested_type)
+            })
+            .await?
         }
         (shared::PATHS_TARGET_GNOME, shared::NIKAU_COPIED_FILES_DATATYPE) => {
-            let paths = unpack_zip_payload(buf, max_uncompressed_size_bytes, config_dir)?;
+            let config_dir = config_dir.clone();
+            let paths = task::spawn_blocking(move || {
+                unpack_zip_payload(buf, max_uncompressed_size_bytes, &config_dir)
+            })
+            .await??;
             write_gnome_file_paths(paths)
         }
         (shared::PATHS_TARGET_URIS, shared::NIKAU_COPIED_FILES_DATATYPE) => {
-            let paths = unpack_zip_payload(buf, max_uncompressed_size_bytes, config_dir)?;
+            let config_dir = config_dir.clone();
+            let paths = task::spawn_blocking(move || {
+                unpack_zip_payload(buf, max_uncompressed_size_bytes, &config_dir)
+            })
+            .await??;
             write_uri_file_paths(paths)
         }
         (requested_type, data_type) => {
@@ -210,7 +234,6 @@ fn unpack_zip_payload(
     Ok(files)
 }
 
-// TODO this is all synchronous, wrap to make tokio happy?
 fn build_zip_payload(file_uri_strs: Vec<&str>, max_compressed_size_bytes: u64) -> Result<Vec<u8>> {
     // Start by collecting all of the filenames, including any needed recursive scanning.
     let mut files_to_zip = vec![];

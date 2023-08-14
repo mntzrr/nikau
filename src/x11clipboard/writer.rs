@@ -380,7 +380,8 @@ async fn fetch_clipboard_data(
                         requested_type,
                         data_type,
                         config_dir,
-                    )?;
+                    )
+                    .await?;
                 }
                 info!(
                     "Writing clipboard data to requestor={} with type {}: {} bytes",

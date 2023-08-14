@@ -209,7 +209,7 @@ impl ClipboardReader {
             .check()
             .await?;
 
-        convert::read(buf, max_size_bytes, requested_type)
+        convert::read(buf, max_size_bytes, requested_type).await
     }
 }
 
