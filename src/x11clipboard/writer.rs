@@ -250,7 +250,7 @@ impl ClipboardServerState {
 
                         if let Some(data) = &self.clipboard_data {
                             send_clipboard_data(
-                                data,
+                                &data.data,
                                 &context,
                                 &event,
                                 self.max_chunk_size_bytes,
@@ -370,17 +370,18 @@ async fn fetch_clipboard_data(
     .await
     {
         Ok(Ok(mut clipboard_data)) => {
-            if let Some(data_type) = &clipboard_data.data_type {
-                clipboard_data.data = convert::write(
-                    clipboard_data.data,
-                    max_uncompressed_size_bytes,
-                    requested_type,
-                    data_type,
-                    config_dir,
-                )?;
-            } else if clipboard_data.requested_type != requested_type {
+            if clipboard_data.requested_type != requested_type {
                 error!("Returned clipboard type {} doesn't match requested type {} for requestor={}, writing empty clipboard", clipboard_data.requested_type, requested_type, event.requestor);
             } else {
+                if let Some(data_type) = &clipboard_data.data_type {
+                    clipboard_data.data = convert::write(
+                        clipboard_data.data,
+                        max_uncompressed_size_bytes,
+                        requested_type,
+                        data_type,
+                        config_dir,
+                    )?;
+                }
                 info!(
                     "Writing clipboard data to requestor={} with type {}: {} bytes",
                     event.requestor,
@@ -414,13 +415,13 @@ async fn fetch_clipboard_data(
 }
 
 async fn send_clipboard_data(
-    clipboard_data: &ClipboardData,
+    clipboard_data: &Vec<u8>,
     context: &shared::XContext,
     event: &SelectionRequestEvent,
     max_chunk_size_bytes: usize,
     incr_atom: Atom,
 ) -> Result<()> {
-    if clipboard_data.data.len() < max_chunk_size_bytes - 24 {
+    if clipboard_data.len() < max_chunk_size_bytes - 24 {
         // Request to get clipboard content, and data fits within max_chunk_size_bytes
         // If the size is too big, then the underlying X11 thread will panic here.
         context
@@ -431,8 +432,8 @@ async fn send_clipboard_data(
                 event.property,
                 event.target,
                 8,
-                clipboard_data.data.len() as u32,
-                &clipboard_data.data,
+                clipboard_data.len() as u32,
+                clipboard_data,
             )
             .await?;
         return Ok(());

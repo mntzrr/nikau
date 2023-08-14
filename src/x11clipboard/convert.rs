@@ -82,7 +82,9 @@ fn write_gnome_file_paths(paths: Vec<PathBuf>) -> Result<Vec<u8>> {
     let mut buf: Vec<u8> = vec![];
     buf.extend_from_slice(b"copy");
     for path in paths {
-        buf.extend_from_slice(format!("\n{}", path.to_string_lossy()).as_bytes());
+        let uri = url::Url::from_file_path(&path)
+            .map_err(|_e| anyhow!("Failed to format path '{:?}' as uri", path))?;
+        buf.extend_from_slice(format!("\n{}", uri).as_bytes());
     }
     Ok(buf)
 }
@@ -162,11 +164,12 @@ fn unpack_zip_payload(
         debug!("Clearing temp directory: {}", clipboard_dir.display());
         if clipboard_dir.is_dir() {
             std::fs::remove_dir_all(&clipboard_dir)?;
+        } else {
+            bail!(
+                "Temp directory exists, but isn't a directory: {}",
+                clipboard_dir.display()
+            );
         }
-        bail!(
-            "Temp directory exists, but isn't a directory: {}",
-            clipboard_dir.display()
-        );
     }
     debug!("Creating temp directory: {}", clipboard_dir.display());
     std::fs::create_dir_all(&clipboard_dir)?;
