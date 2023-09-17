@@ -100,16 +100,18 @@ async fn serve(
                     debug!("Received new clipboard types for serving locally: {}", clipboard_types.join(" "));
                     if clipboard_types.is_empty() {
                         // Treat empty types as a clipboard clear
-                        state.clipboard_types = None;
+                        state.clipboard = None;
                     } else {
                         let mut type_atoms = Vec::with_capacity(clipboard_types.len());
                         for type_ in clipboard_types {
                             type_atoms.push((state.atoms.get_atom(&context.conn, &type_).await?, type_));
                         }
-                        state.clipboard_types = Some(type_atoms);
+                        state.clipboard = Some(ClipboardInfo{
+                            types: type_atoms,
+                            data: None,
+                        });
                     }
                 }
-                state.clipboard_data = None;
 
                 // Advertise the new clipboard (or lack thereof) to X11
                 context.conn.set_selection_owner(
@@ -137,6 +139,13 @@ struct IncrState {
     pos: usize,
 }
 
+struct ClipboardInfo {
+    /// Received via advertisement from a server or client
+    types: Vec<(Atom, String)>,
+    /// Received in response to retrieval request
+    data: Option<ClipboardData>,
+}
+
 struct ClipboardServerState {
     config_dir: PathBuf,
     selection_to_property: HashMap<Atom, Atom>,
@@ -146,10 +155,8 @@ struct ClipboardServerState {
     max_uncompressed_size_bytes: u64,
     /// Large X11 clipboards are passed in chunks. Max size per chunk.
     max_chunk_size_bytes: usize,
-    /// Received via server advertisement
-    clipboard_types: Option<Vec<(Atom, String)>>,
-    /// Received in response to lookup from server
-    clipboard_data: Option<ClipboardData>,
+    /// Populated with latest clipboard details
+    clipboard: Option<ClipboardInfo>,
 }
 
 impl ClipboardServerState {
@@ -165,8 +172,7 @@ impl ClipboardServerState {
             atoms: shared::Atoms::new(conn).await?,
             max_uncompressed_size_bytes,
             max_chunk_size_bytes: CLIPBOARD_MAX_CHUNK_BYTES,
-            clipboard_types: None,
-            clipboard_data: None,
+            clipboard: None,
         };
         Ok(ret)
     }
@@ -180,20 +186,20 @@ impl ClipboardServerState {
         trace!("X11 writer/server event: {:?}", event);
         match event {
             Event::SelectionRequest(event) => {
-                if let Some(clipboard_types) = &self.clipboard_types {
+                if let Some(clipboard) = &mut self.clipboard {
                     // We have a clipboard to advertise
                     if event.target == self.atoms.targets {
                         // request to get the available clipboard targets
                         debug!(
                             "Returning available clipboard types to requestor={}: {:?}",
-                            event.requestor, clipboard_types
+                            event.requestor, clipboard.types
                         );
                         // TARGETS, NIKAU_REMOTE, and the data types themselves:
-                        let target_count = 2 + clipboard_types.len();
+                        let target_count = 2 + clipboard.types.len();
                         let mut data_u8 = Vec::with_capacity(4 * target_count);
                         data_u8.extend(self.atoms.targets.to_ne_bytes());
                         data_u8.extend(self.atoms.nikau_remote.to_ne_bytes());
-                        for type_ in clipboard_types {
+                        for type_ in &clipboard.types {
                             data_u8.extend(type_.0.to_ne_bytes());
                         }
                         context
@@ -208,25 +214,42 @@ impl ClipboardServerState {
                                 &data_u8,
                             )
                             .await?;
+                    } else if event.target == self.atoms.timestamp {
+                        // Clients may ask for TIMESTAMP even if we don't advertise it.
+                        // Let's keep it simple and just return the CURRENT_TIME, rather than tracking real time.
+                        debug!("Returning clipboard timestamp to requestor={}", event.requestor);
+                        context
+                            .conn
+                            .change_property(
+                                PropMode::REPLACE,
+                                event.requestor,
+                                event.property,
+                                Atom::from(AtomEnum::ATOM),
+                                8,
+                                1,
+                                // CURRENT_TIME
+                                &[0 as u8],
+                            )
+                            .await?;
                     } else {
                         // This is a clipboard retrieval.
                         // If we don't have the correct type data already, fetch it.
-                        let target = match clipboard_types.iter().find(|t| t.0 == event.target) {
+                        let target = match clipboard.types.iter().find(|t| t.0 == event.target) {
                             Some(t) => t,
                             None => bail!(
-                                "Got request for clipboard type {} from requestor={} when we have {:?}",
+                                "Got request for clipboard type {} ({:?}) from requestor={} when we have {:?}",
                                 event.target,
+                                self.atoms.get_name(&context.conn, event.target).await,
                                 event.requestor,
-                                clipboard_types
+                                clipboard.types
                             ),
                         };
-                        let needs_fetch = self
-                            .clipboard_data
+                        let needs_fetch = clipboard.data
                             .as_ref()
                             .map(|d| d.requested_type != target.1)
                             .unwrap_or(true);
                         if needs_fetch {
-                            self.clipboard_data = Some(
+                            clipboard.data = Some(
                                 fetch_clipboard_data(
                                     fetch_data_tx,
                                     &target.1,
@@ -241,14 +264,14 @@ impl ClipboardServerState {
                                 "Reusing existing clipboard content to requestor={} with type {}: {} bytes",
                                 event.requestor,
                                 target.1,
-                                self.clipboard_data
+                                clipboard.data
                                     .as_ref()
                                     .map(|d| d.data.len())
                                     .unwrap_or(0),
                             );
                         }
 
-                        if let Some(data) = &self.clipboard_data {
+                        if let Some(data) = &clipboard.data {
                             send_clipboard_data(
                                 &data.data,
                                 &context,
@@ -303,8 +326,11 @@ impl ClipboardServerState {
                     Some(val) => val,
                     None => return Ok(()),
                 };
-                let clipboard_data = match &self.clipboard_data {
-                    Some(data) => data,
+                let clipboard_data = match &self.clipboard {
+                    Some(clipboard) => match &clipboard.data {
+                        Some(data) => data,
+                        None => return Ok(()),
+                    },
                     None => return Ok(()),
                 };
 

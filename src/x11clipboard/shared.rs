@@ -36,6 +36,7 @@ pub(crate) struct Atoms {
     // atoms that are needed internally:
     pub(crate) clipboard: Atom,
     pub(crate) targets: Atom,
+    pub(crate) timestamp: Atom,
     pub(crate) nikau_remote: Atom,
     pub(crate) incr: Atom,
     pub(crate) recv_clipboard: Atom,
@@ -50,6 +51,7 @@ impl Atoms {
             // start with stub values:
             clipboard: Atom::MIN,
             targets: Atom::MIN,
+            timestamp: Atom::MIN,
             nikau_remote: Atom::MIN,
             incr: Atom::MIN,
             recv_clipboard: Atom::MIN,
@@ -59,6 +61,7 @@ impl Atoms {
         // populate values and fill in cache maps:
         atoms.clipboard = atoms.get_atom(conn, "CLIPBOARD").await?;
         atoms.targets = atoms.get_atom(conn, "TARGETS").await?;
+        atoms.timestamp = atoms.get_atom(conn, "TIMESTAMP").await?;
         atoms.nikau_remote = atoms.get_atom(conn, NIKAU_REMOTE_TARGET).await?;
         atoms.incr = atoms.get_atom(conn, "INCR").await?;
         atoms.recv_clipboard = atoms.get_atom(conn, "NIKAU_CLIPBOARD_OUT").await?;
