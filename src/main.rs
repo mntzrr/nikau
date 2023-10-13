@@ -75,7 +75,6 @@ struct ServerArgs {
 #[derive(Args)]
 struct ClientArgs {
     /// Server hostname or IP
-    #[arg(long, value_name = "host/ip")]
     host: String,
 
     /// Server port
