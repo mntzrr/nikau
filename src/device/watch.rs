@@ -130,10 +130,19 @@ async fn handle_device_event<F: DeviceHandler>(
                     if !matches_filters(device_filters, &device, &event.path) {
                         return;
                     }
-                    let device_info = util::log_device_info(&device, &event.path, "Listening to new device", true);
+                    let device_info = util::log_device_info(
+                        &device,
+                        &event.path,
+                        "Listening to new device",
+                        true,
+                    );
                     match start_device_stream(device, &event.path) {
                         Ok(stream) => {
-                            match handler.handle_device_stream(stream, grab_tx.subscribe(), device_info) {
+                            match handler.handle_device_stream(
+                                stream,
+                                grab_tx.subscribe(),
+                                device_info,
+                            ) {
                                 Ok(join_handle) => {
                                     devices.insert(event.path, join_handle);
                                 }
@@ -177,14 +186,12 @@ async fn handle_device_event<F: DeviceHandler>(
 
 fn compatible_path(path: &Path) -> bool {
     // Filename should be 'event<N>', like 'event3' or 'event14'
-    let is_match = path.file_name()
+    let is_match = path
+        .file_name()
         .filter(|f| f.to_string_lossy().starts_with("event"))
         .is_some();
     if !is_match {
-        debug!(
-            "Ignoring new device path: {}",
-            path.display()
-        );
+        debug!("Ignoring new device path: {}", path.display());
     }
     is_match
 }
@@ -194,7 +201,11 @@ fn compatible_device(d: &Device, path: &Path) -> bool {
     // This could happen if client and server are running on the same machine (e.g. for testing)
     if let Some(name) = d.name() {
         if name.contains(output::VIRTUAL_DEVICE_NAME_PREFIX) {
-            trace!("Ignoring nikau virtual device to avoid loopback problem: {} @ {}", name, path.display());
+            trace!(
+                "Ignoring nikau virtual device to avoid loopback problem: {} @ {}",
+                name,
+                path.display()
+            );
             return false;
         }
     }
@@ -220,7 +231,12 @@ fn compatible_device(d: &Device, path: &Path) -> bool {
         }
     } else {
         // For example this might be an audio device
-        util::log_device_info(d, path, "Ignoring device that isn't ABSOLUTE or RELATIVE or KEY", false);
+        util::log_device_info(
+            d,
+            path,
+            "Ignoring device that isn't ABSOLUTE or RELATIVE or KEY",
+            false,
+        );
         false
     }
 }
@@ -236,7 +252,12 @@ fn matches_filters(name_filters: &Vec<Regex>, d: &Device, path: &Path) -> bool {
         .collect();
     let is_match = !matches.is_empty();
     if !is_match {
-        util::log_device_info(d, path, "Ignoring device that doesn't match --device name filters", true);
+        util::log_device_info(
+            d,
+            path,
+            "Ignoring device that doesn't match --device name filters",
+            true,
+        );
     }
     is_match
 }

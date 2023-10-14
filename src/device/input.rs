@@ -119,8 +119,9 @@ impl DeviceHandler for InputHandler {
         device_info: util::DeviceInfo,
     ) -> Result<DeviceHandle> {
         let config = self.config.clone();
-        let handle =
-            task::spawn(async move { read_device_events(&mut events, config, grab_rx, device_info).await });
+        let handle = task::spawn(async move {
+            read_device_events(&mut events, config, grab_rx, device_info).await
+        });
         Ok(DeviceHandle { handle })
     }
 }
