@@ -5,7 +5,7 @@ use anyhow::{anyhow, bail, Result};
 use evdev::{EventStream, EventType, InputEvent, Key};
 use tokio::sync::{broadcast, mpsc};
 use tokio::task;
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::device::util;
 use crate::device::watch::{DeviceHandle, DeviceHandler, GrabEvent};
@@ -116,10 +116,11 @@ impl DeviceHandler for InputHandler {
         &mut self,
         mut events: EventStream,
         grab_rx: broadcast::Receiver<GrabEvent>,
+        device_info: util::DeviceInfo,
     ) -> Result<DeviceHandle> {
         let config = self.config.clone();
         let handle =
-            task::spawn(async move { read_device_events(&mut events, config, grab_rx).await });
+            task::spawn(async move { read_device_events(&mut events, config, grab_rx, device_info).await });
         Ok(DeviceHandle { handle })
     }
 }
@@ -186,8 +187,8 @@ async fn read_device_events(
     stream: &mut EventStream,
     mut c: HandlerConfig,
     mut grab_rx: broadcast::Receiver<GrabEvent>,
+    device_info: util::DeviceInfo,
 ) {
-    let device_info = util::device_info(stream.device());
     loop {
         tokio::select! {
             event = stream.next_event() => {
@@ -199,9 +200,9 @@ async fn read_device_events(
                         // Common when the device has been unplugged.
                         // We'll frequently get this error just as inotify is telling us the file is deleted.
                         // Exit to avoid an infinite loop on trying to read the missing file.
-                        warn!(
-                            "Error event for {:?}, removing device: {}",
-                            stream.device().name(),
+                        info!(
+                            "Got an error event for {:?}, removing device (might be unplugged?): {}",
+                            stream.device().name().unwrap_or("(Unnamed device)"),
                             e
                         );
                         return;

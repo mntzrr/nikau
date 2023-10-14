@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use evdev::{AbsoluteAxisType, Device, EvdevEnum, EventType, InputEvent, InputEventKind, Key};
-use tracing::{debug, trace};
+use tracing::{debug, info, trace};
 
 use crate::msgs::event;
 
@@ -71,7 +72,7 @@ pub struct DeviceInfo {
     pub dims: BTreeMap<u16, (i32, i32)>,
 }
 
-pub fn device_info(device: &Device) -> DeviceInfo {
+pub fn log_device_info(device: &Device, path: &Path, log_prefix: &str, info: bool) -> DeviceInfo {
     let supported_events = device.supported_events();
     let mut dims = BTreeMap::new();
     let target = if supported_events.contains(EventType::ABSOLUTE) {
@@ -94,7 +95,17 @@ pub fn device_info(device: &Device) -> DeviceInfo {
     } else {
         event::EventTarget::Keyboard
     };
-    log_device(device, &target, &dims);
+    // under info, show device name/path only
+    let msg = format!("{}: {} @ {}", log_prefix, device.name().unwrap_or("(Unnamed device)"), path.display());
+    if info {
+        info!("{}", msg);
+    } else {
+        debug!("{}", msg);
+    }
+    // under debug, show nikau version of device details
+    debug!("Nikau device details:{}", device_info_string(device, &target, &dims));
+    // under trace, show evdev version of things too, but note that the abs values are missing:
+    trace!("Evdev device details:\n{}", device);
     DeviceInfo { target, dims }
 }
 
@@ -109,8 +120,7 @@ pub fn log_event(event: &InputEvent) -> String {
     format!("{:?}={}", kind, event.value())
 }
 
-fn log_device(device: &Device, target: &event::EventTarget, dims: &BTreeMap<u16, (i32, i32)>) {
-    let device_name = device.name().unwrap_or("(Unnamed device)").to_string();
+fn device_info_string(device: &Device, target: &event::EventTarget, dims: &BTreeMap<u16, (i32, i32)>) -> String {
     let mut abs_entries = vec![];
     if let Some(abs_axes) = device.supported_absolute_axes() {
         if let Ok(state) = device.get_abs_state() {
@@ -122,8 +132,10 @@ fn log_device(device: &Device, target: &event::EventTarget, dims: &BTreeMap<u16,
             }
         }
     }
-    debug!(
-        "Input {} device {} details:
+    format!(
+        "
+  target: {}
+  name: {}
   props: {:?}
   misc: {:?}
   events: {:?}
@@ -133,7 +145,7 @@ fn log_device(device: &Device, target: &event::EventTarget, dims: &BTreeMap<u16,
   abs: {:?}
   dims: {:?}",
         target,
-        device_name,
+        device.name().unwrap_or("(Unnamed device)"),
         device.properties(),
         device.misc_properties(),
         device.supported_events(),
@@ -142,7 +154,5 @@ fn log_device(device: &Device, target: &event::EventTarget, dims: &BTreeMap<u16,
         device.supported_relative_axes(),
         abs_entries,
         dims,
-    );
-    // under trace, show evdev version of things too, but note that the abs values are missing:
-    trace!("{}", device);
+    )
 }

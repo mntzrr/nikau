@@ -9,7 +9,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::task;
 use tracing::{debug, info, trace, warn};
 
-use crate::device::output;
+use crate::device::{output, util};
 
 #[derive(Debug)]
 enum DeviceEventKind {
@@ -39,6 +39,7 @@ pub trait DeviceHandler: Send + 'static {
         &mut self,
         events: EventStream,
         grab_rx: broadcast::Receiver<GrabEvent>,
+        device_info: util::DeviceInfo,
     ) -> Result<DeviceHandle>;
 }
 
@@ -73,27 +74,22 @@ pub async fn watch_loop<F: DeviceHandler>(
     let mut devices = HashMap::new();
     for (path, device) in evdev::enumerate() {
         // enumerate() already filters for 'event*' filenames
-        if !compatible_device(&device) {
-            trace!(
-                "Ignoring device: {} @ {}",
-                device.name().unwrap_or("(Unnamed device)"),
-                path.to_string_lossy()
-            );
+        if !compatible_device(&device, &path) {
             continue;
         }
-        if !matches_filters(&device_filters, &device) {
+        if !matches_filters(&device_filters, &device, &path) {
             continue;
         }
+        let device_info = util::log_device_info(&device, &path, "Listening to device", true);
         let events = start_device_stream(device, &path)?;
         devices.insert(
             path,
-            handler.handle_device_stream(events, grab_tx.subscribe())?,
+            handler.handle_device_stream(events, grab_tx.subscribe(), device_info)?,
         );
     }
     if devices.is_empty() {
         bail!("Didn't find any compatible input devices to listen to.");
     }
-    info!("Listening to {} input device{}", devices.len(), if devices.len() > 1 { "s" } else { "" });
 
     // Start handler to consume new/removed device events
     loop {
@@ -128,25 +124,16 @@ async fn handle_device_event<F: DeviceHandler>(
             }
             match Device::open(&event.path) {
                 Ok(device) => {
-                    if !matches_filters(device_filters, &device) {
+                    if !compatible_device(&device, &event.path) {
                         return;
                     }
-                    if !compatible_device(&device) {
-                        debug!(
-                            "Ignoring new device: {} @ {}",
-                            device.name().unwrap_or("(Unnamed device)"),
-                            event.path.to_string_lossy()
-                        );
+                    if !matches_filters(device_filters, &device, &event.path) {
                         return;
                     }
-                    info!(
-                        "Listening to new input device: {} @ {}",
-                        device.name().unwrap_or("(Unnamed device)"),
-                        event.path.to_string_lossy()
-                    );
+                    let device_info = util::log_device_info(&device, &event.path, "Listening to new device", true);
                     match start_device_stream(device, &event.path) {
                         Ok(stream) => {
-                            match handler.handle_device_stream(stream, grab_tx.subscribe()) {
+                            match handler.handle_device_stream(stream, grab_tx.subscribe(), device_info) {
                                 Ok(join_handle) => {
                                     devices.insert(event.path, join_handle);
                                 }
@@ -188,48 +175,26 @@ async fn handle_device_event<F: DeviceHandler>(
     }
 }
 
-fn matches_filters(name_filters: &Vec<Regex>, device: &evdev::Device) -> bool {
-    if name_filters.is_empty() {
-        return true;
+fn compatible_path(path: &Path) -> bool {
+    // Filename should be 'event<N>', like 'event3' or 'event14'
+    let is_match = path.file_name()
+        .filter(|f| f.to_string_lossy().starts_with("event"))
+        .is_some();
+    if !is_match {
+        debug!(
+            "Ignoring new device path: {}",
+            path.display()
+        );
     }
-    let device_name = match device.name() {
-        Some(d) => d,
-        None => return false,
-    };
-    let matches: Vec<&Regex> = name_filters
-        .iter()
-        .filter(|p| p.is_match(device_name))
-        .collect();
-    let is_match = !matches.is_empty();
-    info!(
-        "Device name {}: '{}' vs --device patterns: {}",
-        if is_match {
-            "match, monitoring device"
-        } else {
-            "mismatch, ignoring device"
-        },
-        device_name,
-        name_filters
-            .iter()
-            .map(|p| format!("'{}'", p.as_str()))
-            .collect::<Vec<String>>()
-            .join(", ")
-    );
     is_match
 }
 
-fn compatible_path(path: &Path) -> bool {
-    // Filename should be 'event<N>', like 'event3' or 'event14'
-    path.file_name()
-        .filter(|f| f.to_string_lossy().starts_with("event"))
-        .is_some()
-}
-
-fn compatible_device(d: &Device) -> bool {
+fn compatible_device(d: &Device, path: &Path) -> bool {
     // Avoid a situation where we're consuming our own virtual output device, risking an infinite loop.
     // This could happen if client and server are running on the same machine (e.g. for testing)
     if let Some(name) = d.name() {
         if name.contains(output::VIRTUAL_DEVICE_NAME_PREFIX) {
+            trace!("Ignoring nikau virtual device to avoid loopback problem: {} @ {}", name, path.display());
             return false;
         }
     }
@@ -250,11 +215,30 @@ fn compatible_device(d: &Device) -> bool {
                 .all(|key| key == Key::KEY_POWER || key == Key::KEY_SLEEP || key == Key::KEY_WAKEUP)
         } else {
             // Key device without any keys? Skip it
+            util::log_device_info(d, path, "Ignoring KEY device lacking supported keys", false);
             false
         }
     } else {
+        // For example this might be an audio device
+        util::log_device_info(d, path, "Ignoring device that isn't ABSOLUTE or RELATIVE or KEY", false);
         false
     }
+}
+
+fn matches_filters(name_filters: &Vec<Regex>, d: &Device, path: &Path) -> bool {
+    let device_name = d.name().unwrap_or("(Unnamed device)");
+    if name_filters.is_empty() {
+        return true;
+    }
+    let matches: Vec<&Regex> = name_filters
+        .iter()
+        .filter(|p| p.is_match(device_name))
+        .collect();
+    let is_match = !matches.is_empty();
+    if !is_match {
+        util::log_device_info(d, path, "Ignoring device that doesn't match --device name filters", false);
+    }
+    is_match
 }
 
 fn start_device_stream(device: Device, path: &Path) -> Result<EventStream> {
