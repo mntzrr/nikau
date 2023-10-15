@@ -14,7 +14,7 @@ RUN cd /nikau && cargo build --release
 # Release image: copy executable from builder
 # Debian version needs to match builder image to avoid linker issues.
 
-FROM docker.io/library/debian:bullseye-slim
+FROM docker.io/library/debian:bookworm-slim
 RUN apt-get update \
   && apt-get clean \
   && rm -rf /var/lib/apt/lists /var/cache/apt/archives
