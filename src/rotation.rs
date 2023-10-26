@@ -252,7 +252,7 @@ impl Rotation {
                 )
                 .await
             }
-            RotationEvent::RemoveClient(endpoint) => self.remove_client(endpoint).await,
+            RotationEvent::RemoveClient(endpoint) => self.remove_client_and_clear_clipboard(endpoint).await,
             RotationEvent::ClipboardUpdateSource(args) => {
                 if let Err(e) = self
                     .clipboard_update_source(args.source, args.types, args.max_size_bytes)
@@ -370,16 +370,8 @@ impl Rotation {
         }
     }
 
-    async fn remove_client(&mut self, endpoint: SocketAddr) {
-        let idx = match self.clients.binary_search_by(|c| c.endpoint.cmp(&endpoint)) {
-            Ok(idx) => idx,
-            Err(_e) => {
-                // Noop. Can happen if we're cleaning up for a client that wasn't added yet.
-                debug!("Client {} not found in rotation", endpoint);
-                return;
-            }
-        };
-        if self.handle_client_removal(&endpoint, idx).await {
+    async fn remove_client_and_clear_clipboard(&mut self, endpoint: SocketAddr) {
+        if self.handle_client_removal(&endpoint).await {
             self.clipboard_clear().await;
         }
     }
@@ -425,7 +417,7 @@ impl Rotation {
             self.update_current_client(self.clients.get(idx + 1).map(|c| c.endpoint))
                 .await;
         } else {
-            // Currently on local machine, go to last entry on vec (if any)
+            // Currently on local machine, go to first entry on vec (if any)
             self.update_current_client(self.clients.first().map(|c| c.endpoint))
                 .await;
         }
@@ -613,7 +605,7 @@ impl Rotation {
             "Sending clipboard content of requested_type={} data_type={:?} with len={} from source={:?} to dest={:?}",
             data.requested_type,
             data.data_type,
-            data.data.len(),
+            data.bytes.len(),
             data_source,
             request_client
         );
@@ -622,9 +614,9 @@ impl Rotation {
             let msg = bulk::ServerBulk::ClipboardHeader(bulk::ServerClipboardHeader {
                 requested_type: &data.requested_type,
                 data_type: data.data_type.as_ref().map(|t| t.as_str()),
-                content_len_bytes: data.data.len() as u64,
+                content_len_bytes: data.bytes.len() as u64,
             });
-            self.send_bulk(&request_client, msg, Some(data.data)).await
+            self.send_bulk(&request_client, msg, Some(data.bytes)).await
         } else if let Some(local_clipboard) = &mut self.local_clipboard {
             // Send to local X11 clipboard, using response oneshot that we'd gotten with the request.
             if let Some(waiting_clipboard_tx) = local_clipboard.waiting_clipboard_tx.take() {
@@ -794,12 +786,12 @@ impl Rotation {
         F: Fn(&ClientInfo) -> bool,
     {
         let mut clients_to_remove = vec![];
-        for (idx, client) in self.clients.iter_mut().enumerate() {
+        for client in self.clients.iter_mut() {
             if test_fn(client) {
                 if let Err(e) =
                     send_message_to_client(&mut client.events_send, &msg, &mut self.buf).await
                 {
-                    clients_to_remove.push((idx, client.endpoint));
+                    clients_to_remove.push(client.endpoint);
                     return Err(e);
                 }
             }
@@ -807,8 +799,8 @@ impl Rotation {
         // Reverse: Avoid issues with idx moving as entries are removed
         clients_to_remove.reverse();
         let mut should_clear_clipboard = false;
-        for (idx, endpoint) in clients_to_remove {
-            if self.handle_client_removal(&endpoint, idx).await {
+        for endpoint in clients_to_remove {
+            if self.handle_client_removal(&endpoint).await {
                 should_clear_clipboard = true;
             }
         }
@@ -840,10 +832,10 @@ impl Rotation {
     /// If sending the message fails, removes the client and returns Err
     async fn send_event(
         &mut self,
-        client: &SocketAddr,
+        endpoint: &SocketAddr,
         msg: event::ServerEvent<'_>,
     ) -> Result<bool> {
-        match self.clients.binary_search_by(|c| c.endpoint.cmp(client)) {
+        match self.clients.binary_search_by(|c| c.endpoint.cmp(endpoint)) {
             Ok(idx) => {
                 let events_send = &mut self
                     .clients
@@ -851,10 +843,7 @@ impl Rotation {
                     .expect("missing current_client")
                     .events_send;
                 if let Err(e) = send_message_to_client(events_send, &msg, &mut self.buf).await {
-                    let current_client = &self
-                        .current_client
-                        .expect("Should have exited if current_client was none");
-                    if self.handle_client_removal(current_client, idx).await {
+                    if self.handle_client_removal(endpoint).await {
                         self.clipboard_clear().await;
                     }
                     Err(e)
@@ -863,7 +852,7 @@ impl Rotation {
                 }
             }
             Err(_idx) => {
-                warn!("Client {} not found in clients map", client);
+                warn!("Client {} not found in clients map", endpoint);
                 Ok(false)
             }
         }
@@ -884,7 +873,7 @@ impl Rotation {
                     .bulk_send;
                 // Try sending the message, then the payload. Stop on the first failure, to handle below.
                 if let Err(e) = send_message_to_client(bulk_send, &msg, &mut self.buf).await {
-                    if self.handle_client_removal(endpoint, idx).await {
+                    if self.handle_client_removal(endpoint).await {
                         self.clipboard_clear().await;
                     }
                     return Err(e);
@@ -892,7 +881,7 @@ impl Rotation {
                 if let Some(payload) = payload {
                     trace!("Sending {} byte payload", payload.len());
                     if let Err(e) = bulk_send.write_all(&payload).await {
-                        if self.handle_client_removal(endpoint, idx).await {
+                        if self.handle_client_removal(endpoint).await {
                             self.clipboard_clear().await;
                         }
                         return Err(e.into());
@@ -913,8 +902,19 @@ impl Rotation {
 
     /// Removes the client and switches to the server if it was the active client.
     /// If this returns true, then clipboard_clear() should also be called.
-    async fn handle_client_removal(&mut self, endpoint: &SocketAddr, idx: usize) -> bool {
-        self.clients.remove(idx);
+    async fn handle_client_removal(&mut self, endpoint: &SocketAddr) -> bool {
+        // Always refetch the idx to avoid issues if there was an await in which the client was
+        // removed behind our back.
+        match self.clients.binary_search_by(|c| c.endpoint.cmp(&endpoint)) {
+            Ok(idx) => {
+                self.clients.remove(idx);
+            },
+            Err(_e) => {
+                // Noop. Can happen if we're cleaning up for a client that wasn't added yet.
+                debug!("Client to remove not found in rotation: {}", endpoint);
+                return false;
+            }
+        }
         let client_list = self
             .clients
             .iter()

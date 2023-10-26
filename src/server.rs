@@ -190,11 +190,11 @@ async fn handle_connection(
                 if let Some((c, request_client)) = &mut incoming_clipboard_data {
                     if c.remaining_bytes >= resp.bytes.len() {
                         // Chunk is all clipboard data.
-                        c.data.extend_from_slice(&resp.bytes);
+                        c.bytes.extend_from_slice(&resp.bytes);
                         c.remaining_bytes -= resp.bytes.len();
                     } else {
                         // Chunk contains additional data past the clipboard entry.
-                        c.data.extend_from_slice(&(*resp.bytes)[..c.remaining_bytes]);
+                        c.bytes.extend_from_slice(&(*resp.bytes)[..c.remaining_bytes]);
                         bulk_bytes.extend_from_slice(&(*resp.bytes)[c.remaining_bytes..]);
                         c.remaining_bytes = 0;
                     }
@@ -326,8 +326,8 @@ async fn handle_bulk_messages(
                 } else if c.content_len_bytes as usize <= resp_remainder.len() {
                     // The clipboard content fits fully within resp_remainder.
                     // Mark content as consumed and continue looping in case another message follows.
-                    let mut data = Vec::new();
-                    data.extend_from_slice(&resp_remainder[..c.content_len_bytes as usize]);
+                    let mut bytes = Vec::new();
+                    bytes.extend_from_slice(&resp_remainder[..c.content_len_bytes as usize]);
                     rotation_tx
                         .send(rotation::RotationEvent::ClipboardSendContent(
                             rotation::ClipboardSendContentArgs {
@@ -336,7 +336,7 @@ async fn handle_bulk_messages(
                                 data: x11clipboard::ClipboardData {
                                     requested_type: c.requested_type.to_string(),
                                     data_type: c.data_type.map(|t| t.to_string()),
-                                    data,
+                                    bytes,
                                     remaining_bytes: 0,
                                 },
                             },
@@ -346,13 +346,13 @@ async fn handle_bulk_messages(
                 } else {
                     // Need to collect more data.
                     // Save what we've got so far, and assign remaining_bytes to what's left.
-                    let mut data = Vec::with_capacity(c.content_len_bytes as usize);
-                    data.extend_from_slice(resp_remainder);
+                    let mut bytes = Vec::with_capacity(c.content_len_bytes as usize);
+                    bytes.extend_from_slice(resp_remainder);
                     return Ok(Some((
                         x11clipboard::ClipboardData {
                             requested_type: c.requested_type.to_string(),
                             data_type: c.data_type.map(|t| t.to_string()),
-                            data,
+                            bytes,
                             remaining_bytes: c.content_len_bytes as usize - resp_remainder.len(),
                         },
                         c.request_client,

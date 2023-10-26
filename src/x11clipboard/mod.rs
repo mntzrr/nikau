@@ -14,7 +14,7 @@ pub struct ClipboardData {
     pub data_type: Option<String>,
 
     /// The retrieved data
-    pub data: Vec<u8>,
+    pub bytes: Vec<u8>,
 
     /// Zero once the data is retrieved
     pub remaining_bytes: usize,

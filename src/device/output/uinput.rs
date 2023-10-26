@@ -1,17 +1,19 @@
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use evdev::{uinput, AbsInfo, AbsoluteAxisType, AttributeSet, EvdevEnum, InputEvent, Key};
 use tracing::{info, trace, warn};
 
+use crate::device::output::{OutputHandler, VIRTUAL_DEVICE_NAME_PREFIX};
 use crate::device::util;
 use crate::msgs::event;
 
-pub const VIRTUAL_DEVICE_NAME_PREFIX: &str = "nikau virtual";
 pub const SCALED_DIM_MIN: i32 = 0;
 pub const SCALED_DIM_MAX: i32 = 65535;
 pub const SCALED_DIM_RES_X: i32 = 640; // 65536 / 640 = 102.4mm
 pub const SCALED_DIM_RES_Y: i32 = 960; // for a 3/2 ratio vs X: 65536 / 960 = 68.3mm
 
-pub struct VirtualDevices {
+/// Creates virtual uinput devices on the client machine and emits input events locally.
+pub struct VirtualUInputDevices {
     keyboard_events: Vec<InputEvent>,
     mouse_events: Vec<InputEvent>,
     touchpad_events: Vec<InputEvent>,
@@ -21,10 +23,10 @@ pub struct VirtualDevices {
     touchpad_device: uinput::VirtualDevice,
 }
 
-impl VirtualDevices {
-    pub fn new() -> Result<VirtualDevices> {
+impl VirtualUInputDevices {
+    pub fn new() -> Result<VirtualUInputDevices> {
         let pid = std::process::id();
-        let ret = VirtualDevices {
+        let ret = VirtualUInputDevices {
             keyboard_events: vec![],
             mouse_events: vec![],
             touchpad_events: vec![],
@@ -35,22 +37,25 @@ impl VirtualDevices {
             touchpad_device: touchpad(pid)
                 .context("Failed to create virtual touchpad for simulated output")?,
         };
-        info!("Created virtual devices: keyboard, mouse, touchpad");
+        info!("Created virtual uinput devices: keyboard, mouse, touchpad");
         Ok(ret)
     }
+}
 
-    pub fn add_event(&mut self, net_event: event::InputEvent) -> Result<()> {
-        let (events, device) = match net_event.target {
+#[async_trait]
+impl OutputHandler for VirtualUInputDevices {
+    async fn add_event(&mut self, event: event::InputEvent) -> Result<()> {
+        let (events, device) = match event.target {
             event::EventTarget::Keyboard => (&mut self.keyboard_events, &mut self.keyboard_device),
             event::EventTarget::Mouse => (&mut self.mouse_events, &mut self.mouse_device),
             event::EventTarget::Touchpad => (&mut self.touchpad_events, &mut self.touchpad_device),
         };
 
-        if let Some(e) = net_event.inputf64 {
+        if let Some(e) = event.inputf64 {
             let event = e.to_evdev(SCALED_DIM_MIN, SCALED_DIM_MAX);
             trace!("Queued event {:?} -> {}", e, util::log_event(&event));
             events.push(event);
-        } else if let Some(e) = net_event.inputi32 {
+        } else if let Some(e) = event.inputi32 {
             if e.type_ == evdev::EventType::SYNCHRONIZATION.0 {
                 // If it's a sync event, then flush the queued events if any.
                 // We only do this queueing because VirtualDevice::emit() internally
@@ -59,7 +64,7 @@ impl VirtualDevices {
                     trace!(
                         "Sending {} queued events to {} device: {:?}",
                         events.len(),
-                        net_event.target,
+                        event.target,
                         events.iter().map(util::log_event).collect::<Vec<String>>(),
                     );
                     device.emit(events)?;
@@ -71,7 +76,7 @@ impl VirtualDevices {
                 events.push(event);
             }
         } else {
-            warn!("Event missing either an i32 or an f64 value: {}", net_event);
+            warn!("Event missing either an i32 or an f64 value: {}", event);
         }
 
         if events.len() >= 100 {
@@ -84,8 +89,7 @@ impl VirtualDevices {
         Ok(())
     }
 
-    pub fn switch(&mut self) -> Result<()> {
-        // TODO(feature): flash LEDs on the OTHER, NON-virtual devices when this client becomes enabled
+    async fn flush_events(&mut self) -> Result<()> {
         if !self.keyboard_events.is_empty() {
             self.keyboard_device.emit(&self.keyboard_events)?;
             self.keyboard_events.clear();

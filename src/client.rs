@@ -57,18 +57,18 @@ impl LocalClipboard {
 
 /// Initializes a new client connection and runs its event loop.
 /// Returns an error on connection failure or other logic error, in which case a new connection can be tried.
-pub async fn run(
+pub async fn run<O: output::OutputHandler>(
     server_addr: &SocketAddr,
     cert_verifier: Arc<approval::NikauCertVerification>,
     max_clipboard_size_bytes: u64,
     local_clipboard: &mut Option<LocalClipboard>,
-    virtual_devices: &mut output::VirtualDevices,
+    output_handler: &mut O,
 ) -> Result<()> {
     let (mut client, connect_time) =
         Connection::new(server_addr, cert_verifier, max_clipboard_size_bytes).await?;
     loop {
         client
-            .step(local_clipboard, virtual_devices, &connect_time)
+            .step(local_clipboard, output_handler, &connect_time)
             .await?
     }
 }
@@ -153,10 +153,10 @@ impl Connection {
     }
 
     /// Performs a step of the client event loop, returning an error if the connection should be retried.
-    async fn step(
+    async fn step<O: output::OutputHandler>(
         &mut self,
         local_clipboard: &mut Option<LocalClipboard>,
-        virtual_devices: &mut output::VirtualDevices,
+        output_handler: &mut O,
         connect_time: &Instant,
     ) -> Result<()> {
         if let Some(local_clipboard) = local_clipboard {
@@ -213,7 +213,7 @@ impl Connection {
                     trace!("Received {} bytes from events stream: {:X?}", resp.bytes.len(), &*resp.bytes);
                     // Copy the immutable response data into a mutable buffer
                     self.event_bytes.extend_from_slice(&resp.bytes);
-                    self.handle_event_messages(Some(local_clipboard), virtual_devices).await?;
+                    self.handle_event_messages(Some(local_clipboard), output_handler).await?;
                     self.event_bytes.clear();
                 },
                 bulk_result = self.bulk_recv.read_chunk(65536, true) => {
@@ -244,7 +244,7 @@ impl Connection {
                     trace!("Received {} bytes from events stream: {:X?}", resp.bytes.len(), &*resp.bytes);
                     // Copy the immutable response data into a mutable buffer
                     self.event_bytes.extend_from_slice(&resp.bytes);
-                    self.handle_event_messages(None, virtual_devices).await?;
+                    self.handle_event_messages(None, output_handler).await?;
                     self.event_bytes.clear();
                 },
                 bulk_result = self.bulk_recv.read_chunk(65536, true) => {
@@ -263,10 +263,10 @@ impl Connection {
         Ok(())
     }
 
-    async fn handle_event_messages(
+    async fn handle_event_messages<O: output::OutputHandler>(
         &mut self,
         mut local_clipboard: Option<&mut LocalClipboard>,
-        virtual_devices: &mut output::VirtualDevices,
+        output_handler: &mut O,
     ) -> Result<()> {
         let mut offset = 0;
         let bytes_len = self.event_bytes.len();
@@ -289,7 +289,7 @@ impl Connection {
                         "This client is {}",
                         if e.enabled { "active" } else { "inactive" }
                     );
-                    virtual_devices.switch()?;
+                    output_handler.flush_events().await?;
                     self.active = e.enabled;
                     if let Some(local_clipboard) = &mut local_clipboard {
                         if let Some(types) = &local_clipboard.local_types {
@@ -321,7 +321,7 @@ impl Connection {
                 }
                 event::ServerEvent::Input(input) => {
                     // User input event
-                    virtual_devices.add_event(input)?;
+                    output_handler.add_event(input).await?;
                 }
                 event::ServerEvent::ClipboardTypes(types) => {
                     // Receiving types announcement from server (following recent activation)
@@ -352,12 +352,12 @@ impl Connection {
             // Clipboard data streaming is in progress. The message should be raw clipboard data.
             if c.remaining_bytes >= resp_bytes.len() {
                 // This chunk should entirely be raw clipboard data.
-                c.data.extend_from_slice(&resp_bytes);
+                c.bytes.extend_from_slice(&resp_bytes);
                 c.remaining_bytes -= resp_bytes.len();
             } else {
                 // Chunk contains more data than expected for the clipboard entry.
                 // Finish the clipboard entry, then save the remainder to bulk_recv_bytes for processing below.
-                c.data
+                c.bytes
                     .extend_from_slice(&(*resp_bytes)[..c.remaining_bytes]);
                 self.bulk_recv_bytes
                     .extend_from_slice(&(*resp_bytes)[c.remaining_bytes..]);
@@ -482,12 +482,12 @@ impl Connection {
                         // The clipboard content fits fully within resp_remainder, send it to the pending fetch.
                         // Mark content as consumed and continue looping in case another message follows.
                         if let Some(waiting_clipboard_fetch) = self.waiting_clipboard_fetch.take() {
-                            let mut data = Vec::with_capacity(c.content_len_bytes as usize);
-                            data.extend_from_slice(&resp_remainder[..c.content_len_bytes as usize]);
+                            let mut bytes = Vec::with_capacity(c.content_len_bytes as usize);
+                            bytes.extend_from_slice(&resp_remainder[..c.content_len_bytes as usize]);
                             let d = ClipboardData {
                                 requested_type: c.requested_type.to_string(),
                                 data_type: c.data_type.map(|t| t.to_string()),
-                                data,
+                                bytes,
                                 remaining_bytes: 0,
                             };
                             if let Err(_d_again) = waiting_clipboard_fetch.fetch_result_tx.send(d) {
@@ -500,12 +500,12 @@ impl Connection {
                     } else {
                         // Need to collect more data.
                         // Save what we've got so far, and assign remaining_bytes to what's left.
-                        let mut data = Vec::with_capacity(c.content_len_bytes as usize);
-                        data.extend_from_slice(resp_remainder);
+                        let mut bytes = Vec::with_capacity(c.content_len_bytes as usize);
+                        bytes.extend_from_slice(resp_remainder);
                         return Ok(Some(ClipboardData {
                             requested_type: c.requested_type.to_string(),
                             data_type: c.data_type.map(|t| t.to_string()),
-                            data,
+                            bytes,
                             remaining_bytes: c.content_len_bytes as usize - resp_remainder.len(),
                         }));
                     }

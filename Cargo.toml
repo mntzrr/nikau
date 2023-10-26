@@ -13,6 +13,7 @@ exclude = ["README.md", "Dockerfile", ".build.yml", "*.sh"]
 
 [dependencies]
 anyhow = "1.0"
+async-trait = "0.1"
 atty = "0.2"
 bit-vec = "0.6"
 bytes = "1.4"

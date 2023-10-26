@@ -286,7 +286,7 @@ async fn client(
     max_clipboard_size_bytes: u64,
 ) -> Result<()> {
     // Try to set up virtual devices up-front - exit early if we aren't root
-    let mut virtual_devices = output::VirtualDevices::new()
+    let mut output_handler = output::uinput::VirtualUInputDevices::new()
         .context("Failed to create virtual devices for output, possible solutions:
 - The client may need to be run as root with 'sudo -E nikau client ...' to allow creating virtual devices.
 - Enable uinput and/or evdev in the kernel, check for /dev/uinput and /dev/input/")?;
@@ -307,7 +307,7 @@ async fn client(
             verifier.clone(),
             max_clipboard_size_bytes,
             &mut local_clipboard,
-            &mut virtual_devices,
+            &mut output_handler,
         )
         .await
         {
