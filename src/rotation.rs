@@ -17,9 +17,9 @@ use crate::x11clipboard::{
     ClipboardData,
 };
 
-/// If the selected client reconnects within 5 seconds of being removed, then reselect it automatically.
+/// If the selected client reconnects within 10 seconds of being removed, then reselect it automatically.
 /// This is intended to help with fast recovery following networking flakes.
-const REMOVED_CLIENT_RECOVERY_DEADLINE: Duration = Duration::from_secs(5);
+const REMOVED_CLIENT_RECOVERY_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Channels for communicating with a connected client.
 #[derive(Debug)]
