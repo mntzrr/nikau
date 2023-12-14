@@ -1,3 +1,4 @@
+pub mod gadget;
 pub mod uinput;
 
 use crate::msgs::event;
