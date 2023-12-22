@@ -160,7 +160,7 @@ pub fn touchpad(pid: u32) -> Result<uinput::VirtualDevice> {
     let mut keys = AttributeSet::<Key>::new();
     for code in 1..libc::KEY_MAX {
         let key = Key::new(code);
-        // HACK: Limit to only (most) BTN_* keys or else the device won't work,
+        // HACK: Limit to only (most) BTN_* keys or else the device won't work.
         let key_name = format!("{:?}", key);
         if key_name.starts_with("BTN_")
         // If one of these keys is present, libinput will classify the device as an ID_INPUT_TABLET,
