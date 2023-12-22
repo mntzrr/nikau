@@ -26,7 +26,7 @@ notify = "6.0"
 pem = "3.0"
 postcard = { version = "1.0", features = ["use-std"] }
 quinn = { version = "0.10", default-features = false, features = ["tls-rustls", "runtime-tokio", "log"]}
-rcgen = "0.11"
+rcgen = "0.12"
 regex = "1.10"
 rustls = { version = "0.21", features = ["dangerous_configuration"] } # dangerous_configuration: Required for custom ServerCertVerifier
 rustls-pemfile = "1.0"
@@ -39,6 +39,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2.4"
 usb-gadget = { version = "0.6", features = ["tokio"] }
 walkdir = "2.3"
-x11rb-async = { version = "0.12", features = ["xfixes"] }
+x11rb-async = { version = "0.13", features = ["xfixes"] }
 zip = { version = "0.6", default-features = false, features = ["zstd"] }
 zstd = "0.13"
