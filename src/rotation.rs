@@ -557,7 +557,7 @@ impl Rotation {
                             self.clients,
                         );
                     }
-                },
+                }
                 ClipboardRequestSource::Remote(client) => {
                     // Clipboard request is from a client.
                     // Route the request to the clipboard owner.
@@ -569,7 +569,7 @@ impl Rotation {
                             self.clients,
                         );
                     }
-                },
+                }
             }
             Ok(())
         } else {

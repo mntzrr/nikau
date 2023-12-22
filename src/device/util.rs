@@ -97,10 +97,7 @@ pub fn log_device_info(device: &Device, path: &Path, log_prefix: &str, info: boo
         debug!("{}", msg);
     }
     // under debug, show nikau version of device details
-    debug!(
-        "Nikau device details:{}",
-        device_info_string(device, &dims)
-    );
+    debug!("Nikau device details:{}", device_info_string(device, &dims));
     // under trace, show evdev version of things too, but note that the abs values are missing:
     trace!("Evdev device details:\n{}", device);
     DeviceInfo { dims }
@@ -117,10 +114,7 @@ pub fn log_event(event: &InputEvent) -> String {
     format!("{:?}={}", kind, event.value())
 }
 
-fn device_info_string(
-    device: &Device,
-    dims: &BTreeMap<u16, (i32, i32)>,
-) -> String {
+fn device_info_string(device: &Device, dims: &BTreeMap<u16, (i32, i32)>) -> String {
     let mut abs_entries = vec![];
     if let Some(abs_axes) = device.supported_absolute_axes() {
         if let Ok(state) = device.get_abs_state() {

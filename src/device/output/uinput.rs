@@ -1,6 +1,9 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use evdev::{uinput, AbsInfo, AbsoluteAxisType, AttributeSet, EvdevEnum, InputEvent, InputEventKind, Key, MiscType, RelativeAxisType};
+use evdev::{
+    uinput, AbsInfo, AbsoluteAxisType, AttributeSet, EvdevEnum, InputEvent, InputEventKind, Key,
+    MiscType, RelativeAxisType,
+};
 use tracing::{debug, info, trace, warn};
 
 use crate::device::output::{OutputHandler, VIRTUAL_DEVICE_NAME_PREFIX};
@@ -39,12 +42,12 @@ pub struct VirtualUInputDevices {
 impl VirtualUInputDevices {
     pub fn new() -> Result<VirtualUInputDevices> {
         let pid = std::process::id();
-        let (keyboard_device, keyboard_keys, keyboard_misc) = keyboard(pid)
-            .context("Failed to create virtual keyboard for simulated output")?;
-        let (mouse_device, mouse_keys, mouse_misc, mouse_axes) = mouse(pid)
-            .context("Failed to create virtual mouse for simulated output")?;
-        let (touchpad_device, touchpad_keys, touchpad_misc, touchpad_axes) = touchpad(pid)
-            .context("Failed to create virtual touchpad for simulated output")?;
+        let (keyboard_device, keyboard_keys, keyboard_misc) =
+            keyboard(pid).context("Failed to create virtual keyboard for simulated output")?;
+        let (mouse_device, mouse_keys, mouse_misc, mouse_axes) =
+            mouse(pid).context("Failed to create virtual mouse for simulated output")?;
+        let (touchpad_device, touchpad_keys, touchpad_misc, touchpad_axes) =
+            touchpad(pid).context("Failed to create virtual touchpad for simulated output")?;
         debug!(
             "Event->device routing:
 
@@ -116,21 +119,21 @@ impl VirtualUInputDevices {
                 } else {
                     info!("Dropping key event with unsupported code: {:?}", e);
                 }
-            },
+            }
             InputEventKind::RelAxis(e) => {
                 if self.mouse_axes.contains(e) {
                     self.mouse_events.push(event);
                 } else {
                     info!("Dropping relaxis event with unsupported code: {:?}", e);
                 }
-            },
+            }
             InputEventKind::AbsAxis(e) => {
                 if self.touchpad_axes.contains(e) {
                     self.touchpad_events.push(event);
                 } else {
                     info!("Dropping absaxis event with unsupported code: {:?}", e);
                 }
-            },
+            }
             InputEventKind::Misc(e) => {
                 if self.keyboard_misc.contains(e) {
                     // keyboard_misc and mouse_misc have MSC_SCAN overlap
@@ -146,10 +149,10 @@ impl VirtualUInputDevices {
                 } else {
                     info!("Dropping misc event with unsupported code: {:?}", e);
                 }
-            },
+            }
             _ => {
                 info!("Dropping event with unsupported type: {:?}", event);
-            },
+            }
         }
     }
 }
@@ -157,14 +160,19 @@ impl VirtualUInputDevices {
 #[async_trait]
 impl OutputHandler for VirtualUInputDevices {
     async fn write(&mut self, events: Vec<event::InputEvent>) -> Result<()> {
-        let events = events.iter().filter_map(|event| if let Some(e) = &event.inputf64 {
-            Some(e.to_evdev(SCALED_DIM_MIN, SCALED_DIM_MAX))
-        } else if let Some(e) = &event.inputi32 {
-            Some(e.to_evdev())
-        } else {
-            warn!("Event missing either an i32 or an f64 value: {}", event);
-            None
-        }).collect::<Vec<evdev::InputEvent>>();
+        let events = events
+            .iter()
+            .filter_map(|event| {
+                if let Some(e) = &event.inputf64 {
+                    Some(e.to_evdev(SCALED_DIM_MIN, SCALED_DIM_MAX))
+                } else if let Some(e) = &event.inputi32 {
+                    Some(e.to_evdev())
+                } else {
+                    warn!("Event missing either an i32 or an f64 value: {}", event);
+                    None
+                }
+            })
+            .collect::<Vec<evdev::InputEvent>>();
 
         for event in events {
             self.route_event(event);
@@ -174,19 +182,23 @@ impl OutputHandler for VirtualUInputDevices {
         // This likely reorders events vs how we received them, but it shouldn't matter within a batch.
         if !self.keyboard_or_mouse_events.is_empty() {
             if !self.mouse_events.is_empty() {
-                self.mouse_events.extend(self.keyboard_or_mouse_events.iter());
+                self.mouse_events
+                    .extend(self.keyboard_or_mouse_events.iter());
             } else {
                 // Default
-                self.keyboard_events.extend(self.keyboard_or_mouse_events.iter());
+                self.keyboard_events
+                    .extend(self.keyboard_or_mouse_events.iter());
             }
             self.keyboard_or_mouse_events.clear();
         }
         if !self.mouse_or_touchpad_events.is_empty() {
             if !self.touchpad_events.is_empty() {
-                self.touchpad_events.extend(self.mouse_or_touchpad_events.iter());
+                self.touchpad_events
+                    .extend(self.mouse_or_touchpad_events.iter());
             } else {
                 // Default
-                self.mouse_events.extend(self.mouse_or_touchpad_events.iter());
+                self.mouse_events
+                    .extend(self.mouse_or_touchpad_events.iter());
             }
             self.mouse_or_touchpad_events.clear();
         }
@@ -195,9 +207,12 @@ impl OutputHandler for VirtualUInputDevices {
         // If our mapping is working well, we should only be sending to one device per batch
         trace!(
             "Emitting events: keyboard({})={:?} mouse({})={:?} touchpad({})={:?}",
-            self.keyboard_events.len(), self.keyboard_events,
-            self.mouse_events.len(), self.mouse_events,
-            self.touchpad_events.len(), self.touchpad_events,
+            self.keyboard_events.len(),
+            self.keyboard_events,
+            self.mouse_events.len(),
+            self.mouse_events,
+            self.touchpad_events.len(),
+            self.touchpad_events,
         );
         if !self.keyboard_events.is_empty() {
             self.keyboard_device.emit(&self.keyboard_events)?;
@@ -216,7 +231,13 @@ impl OutputHandler for VirtualUInputDevices {
     }
 }
 
-pub fn keyboard(pid: u32) -> Result<(uinput::VirtualDevice, AttributeSet<Key>, AttributeSet<MiscType>)> {
+pub fn keyboard(
+    pid: u32,
+) -> Result<(
+    uinput::VirtualDevice,
+    AttributeSet<Key>,
+    AttributeSet<MiscType>,
+)> {
     let mut keys = AttributeSet::<Key>::new();
     // Report as many keys as possible to emit by the virtual device.
     for code in 1..libc::KEY_MAX {
@@ -239,7 +260,14 @@ pub fn keyboard(pid: u32) -> Result<(uinput::VirtualDevice, AttributeSet<Key>, A
     Ok((device, keys, misc))
 }
 
-pub fn mouse(pid: u32) -> Result<(uinput::VirtualDevice, AttributeSet<Key>, AttributeSet<MiscType>, AttributeSet<RelativeAxisType>)> {
+pub fn mouse(
+    pid: u32,
+) -> Result<(
+    uinput::VirtualDevice,
+    AttributeSet<Key>,
+    AttributeSet<MiscType>,
+    AttributeSet<RelativeAxisType>,
+)> {
     let mut keys = AttributeSet::<Key>::new();
     for code in 1..libc::KEY_MAX {
         let key = Key::new(code);
@@ -269,7 +297,14 @@ pub fn mouse(pid: u32) -> Result<(uinput::VirtualDevice, AttributeSet<Key>, Attr
     Ok((device, keys, misc, axes))
 }
 
-pub fn touchpad(pid: u32) -> Result<(uinput::VirtualDevice, AttributeSet<Key>, AttributeSet<MiscType>, AttributeSet<AbsoluteAxisType>)> {
+pub fn touchpad(
+    pid: u32,
+) -> Result<(
+    uinput::VirtualDevice,
+    AttributeSet<Key>,
+    AttributeSet<MiscType>,
+    AttributeSet<AbsoluteAxisType>,
+)> {
     let mut props = AttributeSet::<evdev::PropType>::new();
     // Doesn't seem to be required, but real touchpads have it:
     props.insert(evdev::PropType::BUTTONPAD);
@@ -389,7 +424,13 @@ pub fn touchpad(pid: u32) -> Result<(uinput::VirtualDevice, AttributeSet<Key>, A
     Ok((device, keys, misc, axis_codes))
 }
 
-fn abs_axis(axis: AbsoluteAxisType, min: i32, max: i32, res: i32, codes: &mut AttributeSet<AbsoluteAxisType>) -> evdev::UinputAbsSetup {
+fn abs_axis(
+    axis: AbsoluteAxisType,
+    min: i32,
+    max: i32,
+    res: i32,
+    codes: &mut AttributeSet<AbsoluteAxisType>,
+) -> evdev::UinputAbsSetup {
     codes.insert(axis);
     evdev::UinputAbsSetup::new(
         axis,

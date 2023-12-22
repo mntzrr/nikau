@@ -1,11 +1,8 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use tracing::debug;
-use usb_gadget::{
-    default_udc,
-    Class, Config, Gadget, Id, OsDescriptor, Strings, WebUsb,
-};
 use usb_gadget::function::hid::Hid;
+use usb_gadget::{default_udc, Class, Config, Gadget, Id, OsDescriptor, Strings, WebUsb};
 
 use crate::device::output::OutputHandler;
 use crate::msgs::event;
@@ -42,8 +39,7 @@ product: "Virtual Input Gadget"
 */
 
 /// Sends events to the Linux HID Gadget API, acting as a USB HID device to another machine.
-pub struct GadgetDevices {
-}
+pub struct GadgetDevices {}
 
 impl GadgetDevices {
     pub async fn new() -> Result<GadgetDevices> {
@@ -63,19 +59,18 @@ impl GadgetDevices {
             Id::new(6, 0x11),
             Strings::new("Nikau", "Virtual Input Gadget", "123"),
         )
-            .with_config(Config::new("config").with_function(handle))
-            .with_os_descriptor(OsDescriptor::microsoft())
-            .with_web_usb(WebUsb::new(0xf1, "http://webusb.org"))
-            .bind(&udc)
-            .expect("cannot bind to UDC");
+        .with_config(Config::new("config").with_function(handle))
+        .with_os_descriptor(OsDescriptor::microsoft())
+        .with_web_usb(WebUsb::new(0xf1, "http://webusb.org"))
+        .bind(&udc)
+        .expect("cannot bind to UDC");
 
         println!("hid function at {}", hid.status().path().unwrap().display());
         println!();
 
         println!("Unregistering");
         reg.remove().unwrap();
-        let ret = GadgetDevices {
-        };
+        let ret = GadgetDevices {};
         Ok(ret)
     }
 }
