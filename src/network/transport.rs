@@ -100,7 +100,7 @@ pub async fn recv_version(recv: &mut RecvStream, buf: &mut Vec<u8>) -> Result<()
     }
     if version != shared::PROTOCOL_VERSION {
         bail!(
-            "Their version {} doesn't match our expected version {}",
+            "Their protocol version {} doesn't match our expected version {}. You need to update nikau across your server and client(s) so that the protocol versions line up. Use 'nikau -V' to check the version.",
             version,
             shared::PROTOCOL_VERSION
         );
