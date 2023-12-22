@@ -225,7 +225,8 @@ impl Connection {
                             "Lost bulk connection"
                         })?
                         .context("Server closed bulk connection")?;
-                    trace!("Received {} bytes from bulk stream: {:X?}", resp.bytes.len(), &*resp.bytes);
+                    // Don't log the bytes themselves, there can be a lot for larger file copies
+                    trace!("Received {} bytes from bulk stream", resp.bytes.len());
                     self.handle_bulk_data_or_messages(Some(local_clipboard), resp.bytes).await?;
                 },
             }
