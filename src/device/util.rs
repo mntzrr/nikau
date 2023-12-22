@@ -75,7 +75,10 @@ pub struct DeviceInfo {
 pub fn log_device_info(device: &Device, path: &Path, log_prefix: &str, info: bool) -> DeviceInfo {
     let supported_events = device.supported_events();
     let mut dims = BTreeMap::new();
-    let target = if supported_events.contains(EventType::ABSOLUTE) && device.properties().contains(evdev::PropType::POINTER) {
+    // TODO Ideally the server would not try to categorize input devices at all, instead events would be routed to matching virtual devices at the client.
+    let target = if supported_events.contains(EventType::ABSOLUTE)
+        && device.properties().contains(evdev::PropType::POINTER) {
+        // This is probably a touchpad (check pointer property: can have a keyboard with e.g. ABS_VOLUME)
         // For each abs axis supported by the device, record its max and min
         // Result will be something like ABS_X(0,100), ABS_Y(0,70), ABS_MT_POSITION_X(0,100) ...
         if let Some(abs_axes) = device.supported_absolute_axes() {
@@ -90,16 +93,20 @@ pub fn log_device_info(device: &Device, path: &Path, log_prefix: &str, info: boo
             }
         }
         event::EventTarget::Touchpad
-    } else if supported_events.contains(EventType::RELATIVE) && device.supported_keys().is_some_and(|keys| keys.contains(Key::BTN_LEFT)) {
+    } else if supported_events.contains(EventType::RELATIVE)
+        && device.supported_relative_axes().is_some_and(|axes| axes.contains(evdev::RelativeAxisType::REL_X)) {
+        // This is probably a mouse (check for relative axis: can have a keyboard with e.g. REL_HWHEEL)
         event::EventTarget::Mouse
     } else {
+        // This is probably a keyboard.
         event::EventTarget::Keyboard
     };
     // under info, show device name/path only
     let msg = format!(
-        "{}: {} @ {}",
+        "{}: {} ({}) @ {}",
         log_prefix,
         device.name().unwrap_or("(Unnamed device)"),
+        target,
         path.display()
     );
     if info {
