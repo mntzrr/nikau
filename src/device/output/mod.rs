@@ -11,6 +11,5 @@ pub const VIRTUAL_DEVICE_NAME_PREFIX: &str = "nikau virtual";
 /// Trait for watching the addition and removal of devices from the machine
 #[async_trait]
 pub trait OutputHandler {
-    async fn add_event(&mut self, event: event::InputEvent) -> Result<()>;
-    async fn flush_events(&mut self) -> Result<()>;
+    async fn write(&mut self, event: Vec<event::InputEvent>) -> Result<()>;
 }

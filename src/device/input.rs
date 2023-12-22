@@ -13,8 +13,8 @@ use crate::msgs::event;
 
 #[derive(Clone, Debug)]
 pub enum Event {
-    /// A keypress event to send to the active client, if any
-    Input(event::InputEvent),
+    /// A group of input events to send to the active client, if any
+    Input(Vec<event::InputEvent>),
     /// Activate the next client (or the server) in the rotation
     SwitchNext,
     /// Activate the previous client (or the server) in the rotation
@@ -190,12 +190,42 @@ async fn read_device_events(
     mut grab_rx: broadcast::Receiver<GrabEvent>,
     device_info: util::DeviceInfo,
 ) {
+    let mut input_events_batch = Vec::new();
+    let mut combo_events_batch = Vec::new();
     loop {
         tokio::select! {
             event = stream.next_event() => {
                 match event {
                     Ok(event) => {
-                        read_device_event(event, &mut c.event_tx, stream.device(), &device_info, &mut c.combo_states).await;
+                        // 100 limit: Just in case, avoid the risk of collecting queued events forever.
+                        //            In practice we should only be collecting 2-3 events between syncs.
+                        if event.event_type() == evdev::EventType::SYNCHRONIZATION
+                            || (input_events_batch.len() + combo_events_batch.len()) >= 100 {
+                            // Flush events to be handled by the client as a group
+                            if !input_events_batch.is_empty() {
+                                if let Err(e) = c.event_tx.send(Event::Input(input_events_batch)).await {
+                                    warn!("Error sending input events for routing: {:?}", e);
+                                }
+                                input_events_batch = Vec::new();
+                            }
+                            // Follow original events with event(s) from combo completion(s)
+                            if !combo_events_batch.is_empty() {
+                                for combo_event in combo_events_batch {
+                                    if let Err(e) = c.event_tx.send(combo_event).await {
+                                        warn!("Error sending combo events for routing: {:?}", e);
+                                    }
+                                }
+                                combo_events_batch = Vec::new();
+                            }
+                        } else {
+                            // Check whether this event completes a key combo, which creates an additional event.
+                            // No short-circuit: Ensure that all combo_states have a chance to be updated
+                            combo_events_batch.extend(c.combo_states
+                                .iter_mut()
+                                .filter_map(|c| c.check_combo(&event))
+                                .collect::<Vec<Event>>());
+                            input_events_batch.push(convert_device_event(event, stream.device(), &device_info))
+                        }
                     }
                     Err(e) => {
                         // Common when the device has been unplugged.
@@ -239,61 +269,37 @@ async fn read_device_events(
     }
 }
 
-async fn read_device_event(
+fn convert_device_event(
     event: evdev::InputEvent,
-    event_tx: &mut mpsc::Sender<Event>,
     device: &evdev::Device,
     device_info: &util::DeviceInfo,
-    combo_states: &mut Vec<ComboState>,
-) {
-    // Check whether this event completes a key combo, which creates an additional event.
-    // No short-circuit: Ensure that all combo_states have a chance to be updated
-    let combo_events: Vec<Event> = combo_states
-        .iter_mut()
-        .filter_map(|c| c.check_combo(&event))
-        .collect();
-
-    // Convert and send the original event before any combo-generated events.
+) -> event::InputEvent {
+    // Convert the original event before any combo-generated events.
     let net_event = if let evdev::InputEventKind::AbsAxis(axis) = event.kind() {
-        // Special handling for evdev touchpad axis events
+        // Special handling for evdev absolute axis (e.g. touchpad) events
         if let Some((axis_min, axis_max)) = device_info.dims.get(&axis.0) {
             // Apply scaling from hardware width to [0.0, 1.0]
-            Event::Input(event::InputEvent {
-                target: device_info.target.clone(),
+            event::InputEvent {
                 inputi32: None,
                 inputf64: Some(event::InputF64::from_evdev(event, *axis_min, *axis_max)),
-            })
+            }
         } else {
-            Event::Input(event::InputEvent {
-                target: device_info.target.clone(),
+            event::InputEvent {
                 inputi32: Some(event::InputI32::from_evdev(event)),
                 inputf64: None,
-            })
+            }
         }
     } else {
-        Event::Input(event::InputEvent {
-            target: device_info.target.clone(),
+        event::InputEvent {
             inputi32: Some(event::InputI32::from_evdev(event)),
             inputf64: None,
-        })
+        }
     };
-
     trace!(
-        "{} event {:?}: {} -> {:?}",
-        device_info.target,
+        "Input event @ {}: {} -> {:?}",
         device.name().unwrap_or("(Unnamed device)"),
         util::log_event(&event),
         net_event
     );
-
-    if let Err(e) = event_tx.send(net_event).await {
-        warn!("Error trying to send event to server for routing: {:?}", e);
-    }
-
-    // Follow original event with event(s) from combo completion(s)
-    for combo_event in combo_events {
-        if let Err(e) = event_tx.send(combo_event).await {
-            warn!("Error trying to send event to server for routing: {:?}", e);
-        }
-    }
+    net_event
 }

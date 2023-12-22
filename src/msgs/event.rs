@@ -8,8 +8,8 @@ pub enum ServerEvent<'a> {
     /// This allows the client to init or clear any local state, or to indicate being selected to the user.
     Switch(SwitchEvent),
 
-    /// An input event to be written to a virtual device on the client as indicated by the target.
-    Input(InputEvent),
+    /// One or more input events to be written as a group to virtual devices on the client.
+    Input(Vec<InputEvent>),
 
     /// Broadcasts the types of a clipboard that can be retrieved from the server.
     #[serde(borrow)]
@@ -20,7 +20,7 @@ impl<'a> std::fmt::Display for ServerEvent<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             ServerEvent::Switch(e) => e.fmt(f),
-            ServerEvent::Input(e) => e.fmt(f),
+            ServerEvent::Input(e) => f.write_str(format!("{:?}", e).as_str()),
             ServerEvent::ClipboardTypes(e) => e.fmt(f),
         }
     }
@@ -61,7 +61,6 @@ impl std::fmt::Display for SwitchEvent {
 /// An input event to be written to a virtual device indicated by the target.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct InputEvent {
-    pub target: EventTarget,
     /// For discrete unscaled values
     pub inputi32: Option<InputI32>,
     /// For continuous values, this is scaled from 0.0 to 1.0
@@ -70,43 +69,12 @@ pub struct InputEvent {
 
 impl std::fmt::Display for InputEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        let inputi32 = if let Some(evt) = &self.inputi32 {
-            format!(", inputi32={}", evt)
+        if let Some(evt) = &self.inputi32 {
+            f.write_str(format!("InputEvent(inputi32={})", evt).as_str())
+        } else if let Some(evt) = &self.inputf64 {
+            f.write_str(format!("InputEvent(inputf64={})", evt).as_str())
         } else {
-            "".to_string()
-        };
-        let inputf64 = if let Some(evt) = &self.inputf64 {
-            format!(", inputf64={}", evt)
-        } else {
-            "".to_string()
-        };
-        f.write_str(format!("InputEvent(target={}{}{})", self.target, inputi32, inputf64).as_str())
-    }
-}
-
-/// The device type where the event should be sent on the client.
-/// This maps to the virtual devices created by the client.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub enum EventTarget {
-    /// A keyboard device: events from uinput key devices (that aren't rel or abs) go here
-    Keyboard,
-    /// A mouse device: events from uinput rel devices go here
-    Mouse,
-    /// A touchpad device: events from uinput abs devices go here
-    Touchpad,
-    // Other devices (tablet, joystick?) may be added here someday, but I don't have any to test.
-    // From uinput's perspective, they will be other rel/abs devices, but libinput detects them
-    // based on the controls they advertise support for, and treats them differently.
-    // For example, a 'tablet' is an abs device where touching the device immediately moves the
-    // cursor to that coordinate location on screen.
-}
-
-impl std::fmt::Display for EventTarget {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        match &self {
-            EventTarget::Keyboard => f.write_str("Keyboard"),
-            EventTarget::Mouse => f.write_str("Mouse"),
-            EventTarget::Touchpad => f.write_str("Touchpad"),
+            f.write_str("InputEvent(?)")
         }
     }
 }

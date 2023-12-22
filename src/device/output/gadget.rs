@@ -82,13 +82,8 @@ impl GadgetDevices {
 
 #[async_trait]
 impl OutputHandler for GadgetDevices {
-    async fn add_event(&mut self, event: event::InputEvent) -> Result<()> {
-        debug!("Got event: {:?}", event);
-        Ok(())
-    }
-
-    async fn flush_events(&mut self) -> Result<()> {
-        debug!("Flushing events");
+    async fn write(&mut self, events: Vec<event::InputEvent>) -> Result<()> {
+        debug!("Got events: {:?}", events);
         Ok(())
     }
 }

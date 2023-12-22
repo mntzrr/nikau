@@ -58,9 +58,9 @@ pub async fn run_server(
                     None => bail!("input_rx is closed, exiting server"),
                 };
                 match event {
-                    input::Event::Input(evt) => {
-                        if let Err(e) = rotation.send_event_current(event::ServerEvent::Input(evt)).await {
-                            warn!("Failed to send input event to current client: {:?}", e);
+                    input::Event::Input(events) => {
+                        if let Err(e) = rotation.send_event_current(event::ServerEvent::Input(events)).await {
+                            warn!("Failed to send input events to current client: {:?}", e);
                         }
                     }
                     input::Event::SwitchNext => {

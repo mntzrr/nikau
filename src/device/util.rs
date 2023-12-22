@@ -1,10 +1,8 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use evdev::{AbsoluteAxisType, Device, EvdevEnum, EventType, InputEvent, InputEventKind, Key};
+use evdev::{AbsoluteAxisType, Device, EvdevEnum, InputEvent, InputEventKind, Key};
 use tracing::{debug, info, trace};
-
-use crate::msgs::event;
 
 #[derive(Debug, PartialEq)]
 pub enum AxisScale {
@@ -68,45 +66,29 @@ pub fn axis_scale_type(axis: AbsoluteAxisType) -> AxisScale {
 }
 
 pub struct DeviceInfo {
-    pub target: event::EventTarget,
     pub dims: BTreeMap<u16, (i32, i32)>,
 }
 
 pub fn log_device_info(device: &Device, path: &Path, log_prefix: &str, info: bool) -> DeviceInfo {
-    let supported_events = device.supported_events();
     let mut dims = BTreeMap::new();
-    // TODO Ideally the server would not try to categorize input devices at all, instead events would be routed to matching virtual devices at the client.
-    let target = if supported_events.contains(EventType::ABSOLUTE)
-        && device.properties().contains(evdev::PropType::POINTER) {
-        // This is probably a touchpad (check pointer property: can have a keyboard with e.g. ABS_VOLUME)
-        // For each abs axis supported by the device, record its max and min
-        // Result will be something like ABS_X(0,100), ABS_Y(0,70), ABS_MT_POSITION_X(0,100) ...
-        if let Some(abs_axes) = device.supported_absolute_axes() {
-            if let Ok(state) = device.get_abs_state() {
-                // clippy recommends this ugly way to get a loop counter
-                for (i, s) in (0_u16..).zip(state.into_iter()) {
-                    let type_ = AbsoluteAxisType::from_index(i as usize);
-                    if abs_axes.contains(type_) && axis_scale_type(type_) != AxisScale::Invalid {
-                        dims.insert(i, (s.minimum, s.maximum));
-                    }
+    // For each abs axis supported by the device, record its max and min
+    // Result will be something like ABS_X(0,100), ABS_Y(0,70), ABS_MT_POSITION_X(0,100) ...
+    if let Some(abs_axes) = device.supported_absolute_axes() {
+        if let Ok(state) = device.get_abs_state() {
+            // clippy recommends this ugly way to get a loop counter
+            for (i, s) in (0_u16..).zip(state.into_iter()) {
+                let type_ = AbsoluteAxisType::from_index(i as usize);
+                if abs_axes.contains(type_) && axis_scale_type(type_) != AxisScale::Invalid {
+                    dims.insert(i, (s.minimum, s.maximum));
                 }
             }
         }
-        event::EventTarget::Touchpad
-    } else if supported_events.contains(EventType::RELATIVE)
-        && device.supported_relative_axes().is_some_and(|axes| axes.contains(evdev::RelativeAxisType::REL_X)) {
-        // This is probably a mouse (check for relative axis: can have a keyboard with e.g. REL_HWHEEL)
-        event::EventTarget::Mouse
-    } else {
-        // This is probably a keyboard.
-        event::EventTarget::Keyboard
-    };
+    }
     // under info, show device name/path only
     let msg = format!(
-        "{}: {} ({}) @ {}",
+        "{}: {} @ {}",
         log_prefix,
         device.name().unwrap_or("(Unnamed device)"),
-        target,
         path.display()
     );
     if info {
@@ -117,11 +99,11 @@ pub fn log_device_info(device: &Device, path: &Path, log_prefix: &str, info: boo
     // under debug, show nikau version of device details
     debug!(
         "Nikau device details:{}",
-        device_info_string(device, &target, &dims)
+        device_info_string(device, &dims)
     );
     // under trace, show evdev version of things too, but note that the abs values are missing:
     trace!("Evdev device details:\n{}", device);
-    DeviceInfo { target, dims }
+    DeviceInfo { dims }
 }
 
 pub fn log_event(event: &InputEvent) -> String {
@@ -137,7 +119,6 @@ pub fn log_event(event: &InputEvent) -> String {
 
 fn device_info_string(
     device: &Device,
-    target: &event::EventTarget,
     dims: &BTreeMap<u16, (i32, i32)>,
 ) -> String {
     let mut abs_entries = vec![];
@@ -153,7 +134,6 @@ fn device_info_string(
     }
     format!(
         "
-  target: {}
   name: {}
   props: {:?}
   misc: {:?}
@@ -163,7 +143,6 @@ fn device_info_string(
   rel: {:?}
   abs: {:?}
   dims: {:?}",
-        target,
         device.name().unwrap_or("(Unnamed device)"),
         device.properties(),
         device.misc_properties(),

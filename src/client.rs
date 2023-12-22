@@ -289,7 +289,6 @@ impl Connection {
                         "This client is {}",
                         if e.enabled { "active" } else { "inactive" }
                     );
-                    output_handler.flush_events().await?;
                     self.active = e.enabled;
                     if let Some(local_clipboard) = &mut local_clipboard {
                         if let Some(types) = &local_clipboard.local_types {
@@ -319,9 +318,9 @@ impl Connection {
                         }
                     }
                 }
-                event::ServerEvent::Input(input) => {
-                    // User input event
-                    output_handler.add_event(input).await?;
+                event::ServerEvent::Input(events) => {
+                    // User input events
+                    output_handler.write(events).await?;
                 }
                 event::ServerEvent::ClipboardTypes(types) => {
                     // Receiving types announcement from server (following recent activation)
