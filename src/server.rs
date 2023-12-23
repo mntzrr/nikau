@@ -7,7 +7,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::task;
 use tracing::{debug, error, info, trace, warn};
 
-use crate::device::{input, watch};
+use crate::device::{Event, watch};
 use crate::msgs::{bulk, event};
 use crate::network::{approval, transport};
 use crate::{rotation, x11clipboard};
@@ -16,7 +16,7 @@ pub async fn run_server(
     listen_addr: &SocketAddr,
     cert_verifier: Arc<approval::NikauCertVerification>,
     config_dir: PathBuf,
-    mut input_rx: mpsc::Receiver<input::Event>,
+    mut input_rx: mpsc::Receiver<Event>,
     fingerprint: Arc<Mutex<Option<String>>>,
     grab_tx: broadcast::Sender<watch::GrabEvent>,
     max_clipboard_size_bytes: u64,
@@ -58,18 +58,18 @@ pub async fn run_server(
                     None => bail!("input_rx is closed, exiting server"),
                 };
                 match event {
-                    input::Event::Input(events) => {
+                    Event::Input(events) => {
                         if let Err(e) = rotation.send_event_current(event::ServerEvent::Input(events)).await {
                             warn!("Failed to send input events to current client: {:?}", e);
                         }
                     }
-                    input::Event::SwitchNext => {
+                    Event::SwitchNext => {
                         rotation.next_client().await;
                     }
-                    input::Event::SwitchPrev => {
+                    Event::SwitchPrev => {
                         rotation.prev_client().await;
                     }
-                    input::Event::SwitchTo(fingerprint) => {
+                    Event::SwitchTo(fingerprint) => {
                         rotation.set_client(fingerprint).await;
                     }
                 }

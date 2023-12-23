@@ -1,27 +1,14 @@
 use std::collections::HashMap;
-use std::str::FromStr;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{bail, Result};
 use evdev::{EventStream, EventType, Key};
 use tokio::sync::{broadcast, mpsc};
 use tokio::task;
 use tracing::{debug, info, trace, warn};
 
-use crate::device::util;
+use crate::device::{Event, shortcut, util};
 use crate::device::watch::{DeviceHandle, DeviceHandler, GrabEvent};
 use crate::msgs::event;
-
-#[derive(Clone, Debug)]
-pub enum Event {
-    /// A group of input events to send to the active client, if any
-    Input(Vec<event::InputEvent>),
-    /// Activate the next client (or the server) in the rotation
-    SwitchNext,
-    /// Activate the previous client (or the server) in the rotation
-    SwitchPrev,
-    /// Activate the client with matching cert fingerprint, or the server if the string is empty
-    SwitchTo(String),
-}
 
 pub struct InputHandler {
     config: HandlerConfig,
@@ -29,34 +16,24 @@ pub struct InputHandler {
 
 #[derive(Clone)]
 struct HandlerConfig {
-    combo_states: Vec<ComboState>,
+    combo_states: Vec<shortcut::ComboState>,
     event_tx: mpsc::Sender<Event>,
 }
 
 impl InputHandler {
     pub fn new(
-        keys_next: &str,
-        keys_prev: Option<&str>,
-        keys_goto: Vec<String>,
+        keys_next: shortcut::KeysAction,
+        keys_prev: Option<shortcut::KeysAction>,
+        keys_goto: Vec<shortcut::KeysAction>,
         event_tx: mpsc::Sender<Event>,
     ) -> Result<InputHandler> {
         let mut keymap = HashMap::new();
-        add_key_combo(&mut keymap, keys_next, Event::SwitchNext)?;
+        add_key_combo(&mut keymap, keys_next)?;
         if let Some(keys_prev) = keys_prev {
-            add_key_combo(&mut keymap, keys_prev, Event::SwitchPrev)?;
+            add_key_combo(&mut keymap, keys_prev)?;
         }
         for entry in keys_goto {
-            let entry_split: Vec<&str> = entry.split('=').collect();
-            if entry_split.len() != 2 {
-                bail!("Invalid --shortcut-goto: Expected 'key1,key2,key3=[fingerprint-prefix]', but was '{}'", entry);
-            }
-            let keystr = entry_split.get(0).expect("entry_split has len=2");
-            let fingerprint = entry_split.get(1).expect("entry_split has len=2");
-            add_key_combo(
-                &mut keymap,
-                keystr,
-                Event::SwitchTo(fingerprint.to_string()),
-            )?;
+            add_key_combo(&mut keymap, entry)?;
         }
         if keymap.is_empty() {
             bail!(
@@ -71,7 +48,7 @@ impl InputHandler {
                         if keys.is_empty() {
                             None
                         } else {
-                            Some(ComboState::new(keys, action))
+                            Some(shortcut::ComboState::new(keys, action))
                         }
                     })
                     .collect(),
@@ -83,33 +60,15 @@ impl InputHandler {
 
 fn add_key_combo(
     keymap: &mut HashMap<Vec<Key>, Event>,
-    keys_raw: &str,
-    action: Event,
+    keysaction: shortcut::KeysAction,
 ) -> Result<()> {
-    // Allow key string to be either 'x,y,z' or 'x+y+z' but not a mix of both
-    let keys_iter = if keys_raw.contains(",") {
-        keys_raw.split(',')
-    } else {
-        keys_raw.split('+')
-    };
-    let mut keys = vec![];
-    for key in keys_iter {
-        keys.push(
-            Key::from_str(format!("KEY_{}", key.trim().to_uppercase()).as_str())
-                .map_err(|e| anyhow!("Unsupported key '{}': {:?}", key, e))?,
-        );
-    }
-    // Sort the keys to detect duplicates across e.g. "shift+alt+n" and "alt+shift+n".
-    // The key combo handling waits for all keys to be held simultaneously in any order and
-    // so doesn't check for keypress ordering. So sorting the keys here shouldn't affect that.
-    keys.sort();
     // Add combo to keymap, complain if an identical combo already exists
-    if !keys.is_empty() {
-        if let Some(existing_action) = keymap.insert(keys.clone(), action.clone()) {
+    if !keysaction.keys.is_empty() {
+        if let Some(existing_action) = keymap.insert(keysaction.keys.clone(), keysaction.action.clone()) {
             bail!(
                 "Key combination '{:?}' for {:?} collides with existing combination for {:?}",
-                keys,
-                action,
+                keysaction.keys,
+                keysaction.action,
                 existing_action
             )
         }
@@ -130,127 +89,6 @@ impl DeviceHandler for InputHandler {
             read_device_events(&mut events, config, grab_rx, device_info).await
         });
         Ok(DeviceHandle { handle })
-    }
-}
-
-/// Result of checking an input event for matching key combination shortcuts
-enum ComboAction {
-    /// The caller should not send the input event.
-    ConsumeEvent,
-    /// The caller should emit the input event as-is.
-    PassEvent,
-    /// The caller should emit the provided switch event, without sending the original input event.
-    ConsumeEventAndEmitAction(Event),
-    /// The caller should emit the provided switch event after sending the original input event as-is.
-    PassEventAndEmitAction(Event),
-}
-
-/// Checks input events for a specified key combination.
-///
-/// For now we allow the keys to be pressed in any order, as long as there's a point where they're all being held down at the same time.
-///
-/// The key combination is only considered "complete" after the combo keys have all been released.
-/// This avoids issues around the server machine thinking device keys are still held down when we grab the device.
-#[derive(Clone)]
-struct ComboState {
-    /// The action to take
-    action: Event,
-    /// The combo keys that we're looking for. Indexes are mapped to pressed_keys.
-    combo_key_codes: Vec<u16>,
-    pressed_keys: bit_vec::BitVec,
-    last_keypress: Option<evdev::InputEvent>,
-}
-
-impl ComboState {
-    fn new(combo_keys: Vec<Key>, action: Event) -> ComboState {
-        let len = combo_keys.len();
-        ComboState {
-            action,
-            combo_key_codes: combo_keys.into_iter().map(|k| k.code()).collect(),
-            pressed_keys: bit_vec::BitVec::from_elem(len, false),
-            last_keypress: None,
-        }
-    }
-
-    /// Checks if the provided event completes a combo according to internal state.
-    /// If so, then the action to be taken is returned.
-    fn check_combo(&mut self, event: &evdev::InputEvent) -> ComboAction {
-        if event.event_type() != EventType::KEY {
-            // Not a keypress, pass through
-            return ComboAction::PassEvent;
-        }
-        // Check if this key is one of our assigned combo keys.
-        // This search should be cheap as it's limited to the size of the key combo (2-4 keys?)
-        if let Some(idx) = self.key_idx(event.code()) {
-            // The key event is related to our combo. Update our state to reflect the keypress or release.
-            self.pressed_keys.set(idx, event.value() >= 1);
-            if let Some(last_keypress) = &self.last_keypress {
-                // We're in the stage of waiting for keys to be released so that we can activate the switch.
-                // We specifically wait for keys to be released so that a target machine doesn't see a "hanging" keypress.
-                // We want the target machine to see the full press+release cycle before we switch targets.
-                // However, we do consume/block the last keypress event in the combo, when the combo is "activated".
-                // We need to check for the matching release event so that we can block that too.
-                // We only block the last event because before that point we don't know if the user is intending to activate a combo,
-                // and if we consume keys then the user will notice that e.g. their N key isn't working in the ALT+N combo case.
-                let matching = last_keypress.event_type() == event.event_type()
-                    && last_keypress.code() == event.code();
-                if self.pressed_keys.none() {
-                    // Waiting for keys to be released, and all the keys are released.
-                    // The combo is complete.
-                    self.last_keypress = None;
-                    if matching {
-                        // This key being released is the one that we consumed the press on earlier.
-                        // For example, user pressed ALT, N: We consumed the N press.
-                        // Now the user has released ALT and is now releasing N, and we should consume the N release.
-                        ComboAction::ConsumeEventAndEmitAction(self.action.clone())
-                    } else {
-                        // This key being released isn't the one that we consumed earlier.
-                        // In the above example, the user released N first and is now releasing ALT, and ALT's keypress wasn't consumed.
-                        ComboAction::PassEventAndEmitAction(self.action.clone())
-                    }
-                } else {
-                    // Not all keys have been released yet.
-                    // Pass or consume the release event depending on what matching keypress had been consumed.
-                    if matching {
-                        // This key being released is the one that we consumed the press on earlier.
-                        // For example, user pressed ALT, N: We consumed the N press.
-                        // Now the user is releasing N first before releasing ALT, and we should consume the N release.
-                        ComboAction::ConsumeEvent
-                    } else {
-                        // This key being released isn't the one that we consumed earlier.
-                        // In the above example, the user is releasing ALT before releasing N, and ALT's keypress wasn't consumed.
-                        ComboAction::PassEvent
-                    }
-                }
-            } else {
-                // Waiting for keys to be pressed before considering the combo to be complete.
-                // We consume the last keypress, for example with ALT,N in that order, the destination machine only sees the ALT press/release, we consume the N press/release.
-                // If the user pressed N before ALT then we consume the ALT press/release instead. It's just whatever key was pressed last.
-                // We only consume the last keypress because we can't speculatively consume keypresses.
-                // For example the user might be pressing N,P: If we consume the N keypress before ALT is pressed, it'll look like the N button isn't working.
-                if self.pressed_keys.all() {
-                    // All the keys are now pressed. Now we start waiting for them to be released.
-                    // We also consume this last keypress event. For example if someone presses Alt+N, we drop the N keypress.
-                    self.last_keypress = Some(event.clone());
-                    ComboAction::ConsumeEvent
-                } else {
-                    // Not all of the keys are pressed. Keep waiting and let this event through since it might not intended as a combo activation.
-                    ComboAction::PassEvent
-                }
-            }
-        } else {
-            // The key isn't relevant to the combo at all. Pass it through.
-            ComboAction::PassEvent
-        }
-    }
-
-    fn key_idx(&self, key_code: u16) -> Option<usize> {
-        for (idx, combo_key_code) in self.combo_key_codes.iter().enumerate() {
-            if key_code == *combo_key_code {
-                return Some(idx);
-            }
-        }
-        return None;
     }
 }
 
@@ -293,16 +131,16 @@ async fn read_device_events(
                             let mut any_consume = false;
                             for cs in c.combo_states.iter_mut() {
                                 match cs.check_combo(&event) {
-                                    ComboAction::ConsumeEvent => {
+                                    shortcut::ComboAction::ConsumeEvent => {
                                         any_consume = true;
                                     }
-                                    ComboAction::PassEvent => {
+                                    shortcut::ComboAction::PassEvent => {
                                     }
-                                    ComboAction::ConsumeEventAndEmitAction(action) => {
+                                    shortcut::ComboAction::ConsumeEventAndEmitAction(action) => {
                                         any_consume = true;
                                         combo_events_batch.push(action);
                                     }
-                                    ComboAction::PassEventAndEmitAction(action) => {
+                                    shortcut::ComboAction::PassEventAndEmitAction(action) => {
                                         combo_events_batch.push(action);
                                     }
                                 }

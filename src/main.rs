@@ -12,7 +12,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::{runtime, task, time};
 use tracing::{error, info, warn};
 
-use nikau::device::{input, output, watch};
+use nikau::device::{Event, input, output, shortcut, watch};
 use nikau::network::approval;
 use nikau::{client, logging, server};
 
@@ -98,17 +98,17 @@ struct ClientArgs {
 }
 
 /// Listens for SIGUSR1 and SIGUSR2, treating them as "switch to next client" and "switch to prev client" respectively.
-fn handle_signals(mut signals: Signals, out: mpsc::Sender<input::Event>) {
+fn handle_signals(mut signals: Signals, out: mpsc::Sender<Event>) {
     let mut iter = signals.into_iter();
     loop {
         match iter.next() {
             Some(signal::SIGUSR1) => {
-                if let Err(e) = out.blocking_send(input::Event::SwitchNext) {
+                if let Err(e) = out.blocking_send(Event::SwitchNext) {
                     error!("Failed to submit SwitchNext event for SIGUSR1: {:?}", e);
                 }
             }
             Some(signal::SIGUSR2) => {
-                if let Err(e) = out.blocking_send(input::Event::SwitchPrev) {
+                if let Err(e) = out.blocking_send(Event::SwitchPrev) {
                     error!("Failed to submit SwitchPrev event for SIGUSR2: {:?}", e);
                 }
             }
@@ -212,7 +212,7 @@ async fn server(
     fingerprint: Arc<Mutex<Option<String>>>,
     max_clipboard_size_bytes: u64,
 ) -> Result<()> {
-    let (event_tx, event_rx): (mpsc::Sender<input::Event>, mpsc::Receiver<input::Event>) =
+    let (event_tx, event_rx): (mpsc::Sender<Event>, mpsc::Receiver<Event>) =
         mpsc::channel(32);
 
     let event_tx2 = event_tx.clone();
@@ -222,7 +222,19 @@ async fn server(
     let (grab_tx, _grab_rx) = broadcast::channel(1);
     let grab_tx2 = grab_tx.clone();
 
-    let input_handler = input::InputHandler::new(keys_next, keys_prev, keys_goto, event_tx)?;
+    // TODO server should grab any input devices which contain keys relevant to configured keys_* combos
+    //      this would be paired with a virtual keyboard device to re-emit keys
+    let keys_next = shortcut::parse_action(keys_next, Event::SwitchNext)?;
+    let keys_prev = if let Some(kp) = keys_prev {
+        Some(shortcut::parse_action(kp, Event::SwitchNext)?)
+    } else {
+        None
+    };
+    let mut keys_goto_parsed = vec![];
+    for kg in keys_goto.into_iter() {
+        keys_goto_parsed.push(shortcut::parse_goto(&kg)?);
+    }
+    let input_handler = input::InputHandler::new(keys_next, keys_prev, keys_goto_parsed, event_tx)?;
 
     let watch_handle = task::spawn(async move {
         watch::watch_loop(input_handler, grab_tx, devices)
