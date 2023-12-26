@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use evdev::{
-    uinput, AbsInfo, AbsoluteAxisType, AttributeSet, EvdevEnum, InputEvent, InputEventKind, Key,
+    uinput, AbsInfo, AbsoluteAxisType, AttributeSet, EvdevEnum, InputEventKind, Key,
     MiscType, RelativeAxisType,
 };
 use tracing::{debug, info, trace, warn};
@@ -17,12 +17,6 @@ pub const SCALED_DIM_RES_Y: i32 = 960; // for a 3/2 ratio vs X: 65536 / 960 = 68
 
 /// Creates virtual uinput devices on the client machine and emits input events locally.
 pub struct VirtualUInputDevices {
-    keyboard_events: Vec<InputEvent>,
-    mouse_events: Vec<InputEvent>,
-    touchpad_events: Vec<InputEvent>,
-    keyboard_or_mouse_events: Vec<InputEvent>,
-    mouse_or_touchpad_events: Vec<InputEvent>,
-
     keyboard_keys: AttributeSet<Key>,
     mouse_keys: AttributeSet<Key>,
     touchpad_keys: AttributeSet<Key>,
@@ -76,12 +70,6 @@ impl VirtualUInputDevices {
             touchpad_misc
         );
         let ret = VirtualUInputDevices {
-            keyboard_events: vec![],
-            mouse_events: vec![],
-            touchpad_events: vec![],
-            keyboard_or_mouse_events: vec![],
-            mouse_or_touchpad_events: vec![],
-
             keyboard_keys,
             mouse_keys,
             touchpad_keys,
@@ -101,60 +89,73 @@ impl VirtualUInputDevices {
         Ok(ret)
     }
 
-    fn route_event(&mut self, event: evdev::InputEvent) {
+    fn route_event(&self, event: evdev::InputEvent) -> Option<EventDest> {
         match event.kind() {
             InputEventKind::Key(e) => {
-                // TODO route mouse vs touchpad BTN_* events based on any axes in the BATCH
                 if self.keyboard_keys.contains(e) {
-                    self.keyboard_events.push(event);
+                    Some(EventDest::Keyboard)
                 } else if self.mouse_keys.contains(e) {
                     // mouse_keys and touchpad_keys have a lot of BTN_* key overlap
                     if self.touchpad_keys.contains(e) {
-                        self.mouse_or_touchpad_events.push(event);
+                        Some(EventDest::MouseOrTouchpad)
                     } else {
-                        self.mouse_events.push(event);
+                        Some(EventDest::Mouse)
                     }
                 } else if self.touchpad_keys.contains(e) {
-                    self.touchpad_events.push(event);
+                    Some(EventDest::Touchpad)
                 } else {
                     info!("Dropping key event with unsupported code: {:?}", e);
+                    None
                 }
             }
             InputEventKind::RelAxis(e) => {
                 if self.mouse_axes.contains(e) {
-                    self.mouse_events.push(event);
+                    Some(EventDest::Mouse)
                 } else {
                     info!("Dropping relaxis event with unsupported code: {:?}", e);
+                    None
                 }
             }
             InputEventKind::AbsAxis(e) => {
                 if self.touchpad_axes.contains(e) {
-                    self.touchpad_events.push(event);
+                    Some(EventDest::Touchpad)
                 } else {
                     info!("Dropping absaxis event with unsupported code: {:?}", e);
+                    None
                 }
             }
             InputEventKind::Misc(e) => {
                 if self.keyboard_misc.contains(e) {
                     // keyboard_misc and mouse_misc have MSC_SCAN overlap
                     if self.mouse_misc.contains(e) {
-                        self.keyboard_or_mouse_events.push(event);
+                        Some(EventDest::KeyboardOrMouse)
                     } else {
-                        self.keyboard_events.push(event);
+                        Some(EventDest::Keyboard)
                     }
                 } else if self.mouse_misc.contains(e) {
-                    self.mouse_events.push(event);
+                    Some(EventDest::Mouse)
                 } else if self.touchpad_misc.contains(e) {
-                    self.touchpad_events.push(event);
+                    Some(EventDest::Touchpad)
                 } else {
                     info!("Dropping misc event with unsupported code: {:?}", e);
+                    None
                 }
             }
             _ => {
                 info!("Dropping event with unsupported type: {:?}", event);
+                None
             }
         }
     }
+}
+
+#[derive(PartialEq)]
+enum EventDest {
+    Keyboard,
+    Mouse,
+    Touchpad,
+    KeyboardOrMouse,
+    MouseOrTouchpad,
 }
 
 #[async_trait]
@@ -164,67 +165,141 @@ impl OutputHandler for VirtualUInputDevices {
             .iter()
             .filter_map(|event| {
                 if let Some(e) = &event.inputf64 {
-                    Some(e.to_evdev(SCALED_DIM_MIN, SCALED_DIM_MAX))
+                    let evdev_event = e.to_evdev(SCALED_DIM_MIN, SCALED_DIM_MAX);
+                    if let Some(dest) = self.route_event(evdev_event) {
+                        Some((evdev_event, dest))
+                    } else {
+                        None
+                    }
                 } else if let Some(e) = &event.inputi32 {
-                    Some(e.to_evdev())
+                    let evdev_event = e.to_evdev();
+                    if let Some(dest) = self.route_event(evdev_event) {
+                        Some((evdev_event, dest))
+                    } else {
+                        None
+                    }
                 } else {
                     warn!("Event missing either an i32 or an f64 value: {}", event);
                     None
                 }
             })
-            .collect::<Vec<evdev::InputEvent>>();
-
-        for event in events {
-            self.route_event(event);
+            .collect::<Vec<(evdev::InputEvent, EventDest)>>();
+        if events.is_empty() {
+            return Ok(());
         }
 
-        // Guess where to route non-definitive events based on any device-only events in the batch.
-        // This likely reorders events vs how we received them, but it shouldn't matter within a batch.
-        if !self.keyboard_or_mouse_events.is_empty() {
-            if !self.mouse_events.is_empty() {
-                self.mouse_events
-                    .extend(self.keyboard_or_mouse_events.iter());
-            } else {
-                // Default
-                self.keyboard_events
-                    .extend(self.keyboard_or_mouse_events.iter());
+        // Collect stats on how many events apply to each device
+        // We specifically avoid grouping the events themselves so that ordering is preserved
+        let mut keyboard_count = 0;
+        let mut mouse_count = 0;
+        let mut touchpad_count = 0;
+        for e in &events {
+            match e.1 {
+                EventDest::Keyboard => {
+                    keyboard_count += 1;
+                }
+                EventDest::Mouse => {
+                    mouse_count += 1;
+                }
+                EventDest::Touchpad => {
+                    touchpad_count += 1;
+                }
+                EventDest::KeyboardOrMouse => {
+                    keyboard_count += 1;
+                    mouse_count += 1;
+                }
+                EventDest::MouseOrTouchpad => {
+                    mouse_count += 1;
+                    touchpad_count += 1;
+                }
             }
-            self.keyboard_or_mouse_events.clear();
         }
-        if !self.mouse_or_touchpad_events.is_empty() {
-            if !self.touchpad_events.is_empty() {
-                self.touchpad_events
-                    .extend(self.mouse_or_touchpad_events.iter());
-            } else {
-                // Default
-                self.mouse_events
-                    .extend(self.mouse_or_touchpad_events.iter());
+        // Route the events according to the count stats.
+        // The events should be single-device in most cases, but we support mixed events too, just in case.
+        if keyboard_count == events.len() {
+            // All of the events can be classified as keyboard
+            let events = events.iter().map(|e| e.0).collect::<Vec<evdev::InputEvent>>();
+            trace!(
+                "Emitting {} keyboard events: {:?}",
+                events.len(),
+                events.iter().map(|e| util::log_event(e)).collect::<Vec<String>>()
+            );
+            self.keyboard_device.emit(&events)?;
+        } else if mouse_count == events.len() {
+            // All of the events can be classified as mouse
+            let events = events.iter().map(|e| e.0).collect::<Vec<evdev::InputEvent>>();
+            trace!(
+                "Emitting {} mouse events: {:?}",
+                events.len(),
+                events.iter().map(|e| util::log_event(e)).collect::<Vec<String>>()
+            );
+            self.mouse_device.emit(&events)?;
+        } else if touchpad_count == events.len() {
+            // All of the events can be classified as touchpad
+            let events = events.iter().map(|e| e.0).collect::<Vec<evdev::InputEvent>>();
+            trace!(
+                "Emitting {} touchpad events: {:?}",
+                events.len(),
+                events.iter().map(|e| util::log_event(e)).collect::<Vec<String>>()
+            );
+            self.touchpad_device.emit(&events)?;
+        } else {
+            // Events don't all 'fit' in one device, group by device
+            let mut keyboard_events = vec![];
+            let mut mouse_events = vec![];
+            let mut touchpad_events = vec![];
+            for event in &events {
+                match event.1 {
+                    EventDest::Keyboard => {
+                        keyboard_events.push(event.0);
+                    }
+                    EventDest::Mouse => {
+                        mouse_events.push(event.0);
+                    }
+                    EventDest::Touchpad => {
+                        touchpad_events.push(event.0);
+                    }
+                    EventDest::KeyboardOrMouse => {
+                        // Arbitrarily pick whichever device has the most events
+                        // For example, if the batch is a mix of keyboard and touchpad events,
+                        // then this lets us keep the keyboard-or-mouse events with the keyboard.
+                        if keyboard_count >= mouse_count {
+                            keyboard_events.push(event.0);
+                        } else {
+                            mouse_events.push(event.0);
+                        }
+                    }
+                    EventDest::MouseOrTouchpad => {
+                        // Arbitrarily pick whichever device has the most events
+                        // For example, if the batch is a mix of keyboard and touchpad events,
+                        // then this lets us keep the mouse-or-touchpad events with the touchpad.
+                        if mouse_count >= touchpad_count {
+                            mouse_events.push(event.0);
+                        } else {
+                            touchpad_events.push(event.0);
+                        }
+                    }
+                }
             }
-            self.mouse_or_touchpad_events.clear();
-        }
-
-        // Send the events to the respective devices.
-        // If our mapping is working well, we should only be sending to one device per batch
-        trace!(
-            "Emitting events: keyboard({})={:?} mouse({})={:?} touchpad({})={:?}",
-            self.keyboard_events.len(),
-            self.keyboard_events,
-            self.mouse_events.len(),
-            self.mouse_events,
-            self.touchpad_events.len(),
-            self.touchpad_events,
-        );
-        if !self.keyboard_events.is_empty() {
-            self.keyboard_device.emit(&self.keyboard_events)?;
-            self.keyboard_events.clear();
-        }
-        if !self.mouse_events.is_empty() {
-            self.mouse_device.emit(&self.mouse_events)?;
-            self.mouse_events.clear();
-        }
-        if !self.touchpad_events.is_empty() {
-            self.touchpad_device.emit(&self.touchpad_events)?;
-            self.touchpad_events.clear();
+            trace!(
+                "Emitting events: keyboard({})={:?} mouse({})={:?} touchpad({})={:?}",
+                keyboard_events.len(),
+                keyboard_events.iter().map(|e| util::log_event(e)).collect::<Vec<String>>(),
+                mouse_events.len(),
+                mouse_events.iter().map(|e| util::log_event(e)).collect::<Vec<String>>(),
+                touchpad_events.len(),
+                touchpad_events.iter().map(|e| util::log_event(e)).collect::<Vec<String>>(),
+            );
+            if !keyboard_events.is_empty() {
+                info!("emit keeb: {:?}", keyboard_events);
+                self.keyboard_device.emit(&keyboard_events)?;
+            }
+            if !mouse_events.is_empty() {
+                self.mouse_device.emit(&mouse_events)?;
+            }
+            if !touchpad_events.is_empty() {
+                self.touchpad_device.emit(&touchpad_events)?;
+            }
         }
 
         Ok(())
