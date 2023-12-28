@@ -231,7 +231,8 @@ async fn server(
     let input_handler = input::InputHandler::new(&key_combos, event_tx)?;
 
     let watch_handle = task::spawn(async move {
-        let device_handles = handles::DeviceHandles::new(input_handler, grab_tx, key_combos.all_keys);
+        let device_handles =
+            handles::DeviceHandles::new(input_handler, grab_tx, key_combos.all_keys);
         watch::watch_loop(device_handles, device_filters)
             .await
             .context(

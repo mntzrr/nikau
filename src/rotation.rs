@@ -870,7 +870,8 @@ impl<O: device::output::OutputHandler> Rotation<O> {
     pub async fn send_input_events(&mut self, batch: device::InputBatch) -> Result<()> {
         if let Some(_) = self.current_client {
             // Remote client is active, send all input to client and not to local machine.
-            self.send_event_to_remote_client(event::ServerEvent::Input(batch.events)).await
+            self.send_event_to_remote_client(event::ServerEvent::Input(batch.events))
+                .await
         } else if batch.is_grabbed {
             // Local machine is active and device is grabbed, write input to local virtual devices.
             // For example, we grab keyboards so that we can skip sending switch combos to the local system.

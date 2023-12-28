@@ -90,7 +90,13 @@ impl DeviceInfo {
     }
 }
 
-pub fn log_device_info(device: &Device, path: &Path, device_info: &DeviceInfo, log_prefix: &str, info: bool) {
+pub fn log_device_info(
+    device: &Device,
+    path: &Path,
+    device_info: &DeviceInfo,
+    log_prefix: &str,
+    info: bool,
+) {
     // under info, show device name/path only
     let msg = format!(
         "{}: {} @ {}",
@@ -104,7 +110,10 @@ pub fn log_device_info(device: &Device, path: &Path, device_info: &DeviceInfo, l
         debug!("{}", msg);
     }
     // under debug, show nikau version of device details
-    debug!("Nikau device details:{}", device_info_string(device, &device_info.dims));
+    debug!(
+        "Nikau device details:{}",
+        device_info_string(device, &device_info.dims)
+    );
     // under trace, show evdev version of things too, but note that the abs values are missing:
     trace!("Evdev device details:\n{}", device);
 }

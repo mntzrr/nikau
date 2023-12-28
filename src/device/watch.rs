@@ -164,7 +164,13 @@ fn compatible_device(d: &Device, path: &Path, device_info: &util::DeviceInfo) ->
                 .all(|key| key == Key::KEY_POWER || key == Key::KEY_SLEEP || key == Key::KEY_WAKEUP)
         } else {
             // Key device without any keys? Skip it
-            util::log_device_info(d, path, device_info, "Ignoring KEY device lacking supported keys", false);
+            util::log_device_info(
+                d,
+                path,
+                device_info,
+                "Ignoring KEY device lacking supported keys",
+                false,
+            );
             false
         }
     } else {
@@ -180,7 +186,12 @@ fn compatible_device(d: &Device, path: &Path, device_info: &util::DeviceInfo) ->
     }
 }
 
-fn matches_filters(name_filters: &Vec<Regex>, device: &Device, path: &Path, device_info: &util::DeviceInfo) -> bool {
+fn matches_filters(
+    name_filters: &Vec<Regex>,
+    device: &Device,
+    path: &Path,
+    device_info: &util::DeviceInfo,
+) -> bool {
     let device_name = device.name().unwrap_or("(Unnamed device)");
     if name_filters.is_empty() {
         return true;

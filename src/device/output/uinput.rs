@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use evdev::{
-    uinput, AbsInfo, AbsoluteAxisType, AttributeSet, EvdevEnum, InputEventKind, Key,
-    MiscType, RelativeAxisType,
+    uinput, AbsInfo, AbsoluteAxisType, AttributeSet, EvdevEnum, InputEventKind, Key, MiscType,
+    RelativeAxisType,
 };
 use tracing::{debug, info, trace, warn};
 
@@ -218,29 +218,47 @@ impl OutputHandler for VirtualUInputDevices {
         // The events should be single-device in most cases, but we support mixed events too, just in case.
         if keyboard_count == events.len() {
             // All of the events can be classified as keyboard
-            let events = events.iter().map(|e| e.0).collect::<Vec<evdev::InputEvent>>();
+            let events = events
+                .iter()
+                .map(|e| e.0)
+                .collect::<Vec<evdev::InputEvent>>();
             trace!(
                 "Emitting {} keyboard events: {:?}",
                 events.len(),
-                events.iter().map(|e| util::log_event(e)).collect::<Vec<String>>()
+                events
+                    .iter()
+                    .map(|e| util::log_event(e))
+                    .collect::<Vec<String>>()
             );
             self.keyboard_device.emit(&events)?;
         } else if mouse_count == events.len() {
             // All of the events can be classified as mouse
-            let events = events.iter().map(|e| e.0).collect::<Vec<evdev::InputEvent>>();
+            let events = events
+                .iter()
+                .map(|e| e.0)
+                .collect::<Vec<evdev::InputEvent>>();
             trace!(
                 "Emitting {} mouse events: {:?}",
                 events.len(),
-                events.iter().map(|e| util::log_event(e)).collect::<Vec<String>>()
+                events
+                    .iter()
+                    .map(|e| util::log_event(e))
+                    .collect::<Vec<String>>()
             );
             self.mouse_device.emit(&events)?;
         } else if touchpad_count == events.len() {
             // All of the events can be classified as touchpad
-            let events = events.iter().map(|e| e.0).collect::<Vec<evdev::InputEvent>>();
+            let events = events
+                .iter()
+                .map(|e| e.0)
+                .collect::<Vec<evdev::InputEvent>>();
             trace!(
                 "Emitting {} touchpad events: {:?}",
                 events.len(),
-                events.iter().map(|e| util::log_event(e)).collect::<Vec<String>>()
+                events
+                    .iter()
+                    .map(|e| util::log_event(e))
+                    .collect::<Vec<String>>()
             );
             self.touchpad_device.emit(&events)?;
         } else {
@@ -284,11 +302,20 @@ impl OutputHandler for VirtualUInputDevices {
             trace!(
                 "Emitting events: keyboard({})={:?} mouse({})={:?} touchpad({})={:?}",
                 keyboard_events.len(),
-                keyboard_events.iter().map(|e| util::log_event(e)).collect::<Vec<String>>(),
+                keyboard_events
+                    .iter()
+                    .map(|e| util::log_event(e))
+                    .collect::<Vec<String>>(),
                 mouse_events.len(),
-                mouse_events.iter().map(|e| util::log_event(e)).collect::<Vec<String>>(),
+                mouse_events
+                    .iter()
+                    .map(|e| util::log_event(e))
+                    .collect::<Vec<String>>(),
                 touchpad_events.len(),
-                touchpad_events.iter().map(|e| util::log_event(e)).collect::<Vec<String>>(),
+                touchpad_events
+                    .iter()
+                    .map(|e| util::log_event(e))
+                    .collect::<Vec<String>>(),
             );
             if !keyboard_events.is_empty() {
                 info!("emit keeb: {:?}", keyboard_events);

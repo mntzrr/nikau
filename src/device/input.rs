@@ -89,9 +89,7 @@ impl DeviceHandler for InputHandler {
         } else {
             // Device is to be permanently grabbed
             handle_grab_event(&mut stream, &mut device_info, GrabEvent::Grab);
-            task::spawn(async move {
-                read_device_events(&mut stream, config, device_info).await
-            })
+            task::spawn(async move { read_device_events(&mut stream, config, device_info).await })
         };
         Ok(DeviceHandle { handle })
     }
@@ -107,7 +105,15 @@ async fn read_device_events(
     loop {
         match stream.next_event().await {
             Ok(event) => {
-                handle_input_event(stream, &mut handler_config, event, &device_info, &mut input_events_batch, &mut combo_events_batch).await
+                handle_input_event(
+                    stream,
+                    &mut handler_config,
+                    event,
+                    &device_info,
+                    &mut input_events_batch,
+                    &mut combo_events_batch,
+                )
+                .await
             }
             Err(e) => {
                 // Common when the device has been unplugged.
@@ -183,7 +189,8 @@ async fn handle_input_event(
     // 100 limit: Just in case, avoid the risk of collecting queued events forever.
     //            In practice we should only be collecting 2-3 events between syncs.
     if event.event_type() == EventType::SYNCHRONIZATION
-        || (input_events_batch.len() + combo_events_batch.len()) >= 100 {
+        || (input_events_batch.len() + combo_events_batch.len()) >= 100
+    {
         // Flush events to be handled by the client as a group
         if !input_events_batch.is_empty() {
             let event = Event::Input(InputBatch {
@@ -212,8 +219,7 @@ async fn handle_input_event(
                 shortcut::ComboAction::ConsumeEvent => {
                     any_consume = true;
                 }
-                shortcut::ComboAction::PassEvent => {
-                }
+                shortcut::ComboAction::PassEvent => {}
                 shortcut::ComboAction::ConsumeEventAndEmitAction(action) => {
                     any_consume = true;
                     combo_events_batch.push(action);
@@ -224,32 +230,53 @@ async fn handle_input_event(
             }
         }
         if any_consume {
-            debug!("Dropping key event as it's the last key completing one or more combos: {:?}", event);
+            debug!(
+                "Dropping key event as it's the last key completing one or more combos: {:?}",
+                event
+            );
         } else {
             input_events_batch.push(convert_device_event(event, stream.device(), device_info))
         }
     }
 }
 
-fn handle_grab_event(stream: &mut EventStream, device_info: &mut util::DeviceInfo, grab: GrabEvent) -> bool {
+fn handle_grab_event(
+    stream: &mut EventStream,
+    device_info: &mut util::DeviceInfo,
+    grab: GrabEvent,
+) -> bool {
     match grab {
         GrabEvent::Grab => {
-            debug!("Grabbing device: {:?}", stream.device().name().unwrap_or("(Unnamed device)"));
+            debug!(
+                "Grabbing device: {:?}",
+                stream.device().name().unwrap_or("(Unnamed device)")
+            );
             if let Err(e) = stream.device_mut().grab() {
-                warn!("Failed to grab device {:?}, removing device: {}", stream.device().name(), e);
-                return false
+                warn!(
+                    "Failed to grab device {:?}, removing device: {}",
+                    stream.device().name(),
+                    e
+                );
+                return false;
             }
             device_info.is_grabbed = true;
-            return true
+            return true;
         }
         GrabEvent::Ungrab => {
-            debug!("Ungrabbing device: {:?}", stream.device().name().unwrap_or("(Unnamed device)"));
+            debug!(
+                "Ungrabbing device: {:?}",
+                stream.device().name().unwrap_or("(Unnamed device)")
+            );
             if let Err(e) = stream.device_mut().ungrab() {
-                warn!("Failed to ungrab device {:?}, : {}", stream.device().name(), e);
-                return false
+                warn!(
+                    "Failed to ungrab device {:?}, : {}",
+                    stream.device().name(),
+                    e
+                );
+                return false;
             }
             device_info.is_grabbed = false;
-            return true
+            return true;
         }
     }
 }

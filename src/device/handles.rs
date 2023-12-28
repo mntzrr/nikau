@@ -45,7 +45,11 @@ pub struct DeviceHandles<H: DeviceHandler> {
 }
 
 impl<H: DeviceHandler> DeviceHandles<H> {
-    pub fn new(handler: H, grab_tx: broadcast::Sender<device::GrabEvent>, all_combo_keys: HashSet<Key>) -> DeviceHandles<H> {
+    pub fn new(
+        handler: H,
+        grab_tx: broadcast::Sender<device::GrabEvent>,
+        all_combo_keys: HashSet<Key>,
+    ) -> DeviceHandles<H> {
         DeviceHandles {
             always_grabbed_devices: HashMap::<PathBuf, DeviceHandle>::new(),
             toggled_devices: HashMap::<PathBuf, DeviceHandle>::new(),
@@ -60,7 +64,10 @@ impl<H: DeviceHandler> DeviceHandles<H> {
         util::log_device_info(&device, &path, &device_info, "Listening to device", true);
         let supports_any_keys = supports_any_keys(&device, &self.all_combo_keys);
         if supports_any_keys {
-            debug!("Device supports one or more configured combo keys: {}", device.name().unwrap_or("(Unnamed device)"));
+            debug!(
+                "Device supports one or more configured combo keys: {}",
+                device.name().unwrap_or("(Unnamed device)")
+            );
         }
         if supports_any_keys {
             // This device supports one or more keys configured for client switch key combinations.
@@ -70,7 +77,8 @@ impl<H: DeviceHandler> DeviceHandles<H> {
                 None,
                 device_info,
             )?;
-            self.always_grabbed_devices.insert(path.clone(), join_handle);
+            self.always_grabbed_devices
+                .insert(path.clone(), join_handle);
         } else {
             // This device doesn't support keys used in key combinations (e.g. a mouse).
             // When the server is the active input, we can ungrab the device,
