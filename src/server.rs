@@ -14,7 +14,7 @@ use crate::{rotation, x11clipboard};
 
 pub async fn run_server<O: output::OutputHandler>(
     listen_addr: &SocketAddr,
-    cert_verifier: Arc<approval::NikauCertVerification>,
+    cert_verifier: Arc<approval::NikauCertVerification<'static>>,
     config_dir: PathBuf,
     mut event_rx: mpsc::Receiver<Event>,
     fingerprint: Arc<Mutex<Option<String>>>,

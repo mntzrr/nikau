@@ -59,7 +59,7 @@ impl LocalClipboard {
 /// Returns an error on connection failure or other logic error, in which case a new connection can be tried.
 pub async fn run<O: output::OutputHandler>(
     server_addr: &SocketAddr,
-    cert_verifier: Arc<approval::NikauCertVerification>,
+    cert_verifier: Arc<approval::NikauCertVerification<'static>>,
     max_clipboard_size_bytes: u64,
     local_clipboard: &mut Option<LocalClipboard>,
     output_handler: &mut O,
@@ -99,7 +99,7 @@ impl Connection {
     /// Connects to the specified server, or returns an error if the connection fails.
     async fn new(
         server_addr: &SocketAddr,
-        cert_verifier: Arc<approval::NikauCertVerification>,
+        cert_verifier: Arc<approval::NikauCertVerification<'static>>,
         max_clipboard_size_bytes: u64,
     ) -> Result<(Self, Instant)> {
         let bind_addr: SocketAddr = "0.0.0.0:0".parse().expect("Failed to parse 0.0.0.0:0");

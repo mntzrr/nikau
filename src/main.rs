@@ -208,7 +208,7 @@ async fn server(
     keys_goto: Vec<String>,
     device_filters: Vec<Regex>,
     exit_secs: Option<u32>,
-    verifier: Arc<approval::NikauCertVerification>,
+    verifier: Arc<approval::NikauCertVerification<'static>>,
     fingerprint: Arc<Mutex<Option<String>>>,
     max_clipboard_size_bytes: u64,
 ) -> Result<()> {
@@ -289,7 +289,7 @@ async fn server(
 async fn client(
     config_dir: PathBuf,
     connect_addr: SocketAddr,
-    verifier: Arc<approval::NikauCertVerification>,
+    verifier: Arc<approval::NikauCertVerification<'static>>,
     max_clipboard_size_bytes: u64,
 ) -> Result<()> {
     // Try to set up virtual devices up-front - exit early if we aren't root

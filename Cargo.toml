@@ -25,11 +25,12 @@ nonblock = "0.2"
 notify = "6.0"
 pem = "3.0"
 postcard = { version = "1.0", features = ["use-std"] }
-quinn = { version = "0.10", default-features = false, features = ["tls-rustls", "runtime-tokio", "log"]}
-rcgen = "0.12"
+quinn = { version = "0.11" }
+rcgen = "0.13"
 regex = "1.10"
-rustls = { version = "0.21", features = ["dangerous_configuration"] } # dangerous_configuration: Required for custom ServerCertVerifier
-rustls-pemfile = "1.0"
+rustls = "0.23"
+rustls-pemfile = "2.0"
+rustls-pki-types = "1.7"
 serde = { version = "1.0", default-features = false }
 sha2 = "0.10"
 signal-hook = "0.3"
@@ -40,5 +41,5 @@ url = "2.4"
 usb-gadget = { version = "0.7", features = ["tokio"] }
 walkdir = "2.3"
 x11rb-async = { version = "0.13", features = ["xfixes"] }
-zip = { version = "1.1", default-features = false, features = ["zstd"] }
+zip = { version = "2.1", default-features = false, features = ["zstd"] }
 zstd = "0.13"

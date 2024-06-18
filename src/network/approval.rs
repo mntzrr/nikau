@@ -2,7 +2,7 @@ use std::io::{self, prelude::*};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use tracing::{debug, info, warn};
@@ -13,57 +13,61 @@ const ALPN_QUIC_HTTP: &[&[u8]] = &[b"hq-29"];
 const PROMPT_TIMEOUT_SECS: u64 = 60;
 
 pub fn rustls_client_config(
-    verifier: Arc<NikauCertVerification>,
-) -> Result<Arc<rustls::ClientConfig>> {
-    let mut rustls_config = rustls::ClientConfig::builder()
-        .with_safe_defaults()
-        .with_custom_certificate_verifier(verifier.clone())
+    verifier: Arc<NikauCertVerification<'static>>,
+) -> Result<Arc<dyn quinn::crypto::ClientConfig>> {
+    let mut rustls_config = quinn::rustls::ClientConfig::builder_with_provider(verifier.crypto_provider.clone())
+        .with_safe_default_protocol_versions()?
+        .dangerous().with_custom_certificate_verifier(verifier.clone())
         .with_client_auth_cert(
             vec![verifier.our_cert.clone()],
-            verifier.our_privkey.clone(),
+            verifier.our_privkey.clone_key(),
         )?;
     rustls_config.alpn_protocols = ALPN_QUIC_HTTP.iter().map(|&x| x.into()).collect();
-    Ok(Arc::new(rustls_config))
+    Ok(Arc::new(quinn::crypto::rustls::QuicClientConfig::try_from(rustls_config)?))
 }
 
 pub fn rustls_server_config(
-    verifier: Arc<NikauCertVerification>,
-) -> Result<Arc<rustls::ServerConfig>> {
-    let mut rustls_config = rustls::ServerConfig::builder()
-        .with_safe_defaults() // includes TLS1.3 required by QUIC
+    verifier: Arc<NikauCertVerification<'static>>,
+) -> Result<Arc<dyn quinn::crypto::ServerConfig>> {
+    let mut rustls_config = quinn::rustls::ServerConfig::builder_with_provider(verifier.crypto_provider.clone())
+        .with_safe_default_protocol_versions()?
         .with_client_cert_verifier(verifier.clone())
         .with_single_cert(
             vec![verifier.our_cert.clone()],
-            verifier.our_privkey.clone(),
+            verifier.our_privkey.clone_key(),
         )?;
     rustls_config.alpn_protocols = ALPN_QUIC_HTTP.iter().map(|&x| x.into()).collect();
     rustls_config.max_early_data_size = u32::MAX; // required by QUIC
-    Ok(Arc::new(rustls_config))
+    Ok(Arc::new(quinn::crypto::rustls::QuicServerConfig::try_from(rustls_config)?))
 }
 
-struct ApprovalState {
+#[derive(Debug)]
+struct ApprovalState<'a> {
     /// Previously-approved certs found on disk, updated internally when approval prompts are confirmed
-    known_certs: Vec<rustls::Certificate>,
+    known_certs: Vec<rustls_pki_types::CertificateDer<'a>>,
     /// Whether a cert prompt is currently pending. We only allow one prompt to be pending at a time.
     prompt_active: bool,
 }
 
-pub struct NikauCertVerification {
+#[derive(Debug)]
+pub struct NikauCertVerification<'a> {
     /// For storing certs to disk
     config_dir: PathBuf,
     /// Used for building rustls configs
-    our_cert: rustls::Certificate,
+    our_cert: rustls_pki_types::CertificateDer<'a>,
     /// Used for building rustls configs
-    our_privkey: rustls::PrivateKey,
+    our_privkey: rustls_pki_types::PrivateKeyDer<'a>,
     /// Pre-approved cert fingerprints provided via commandline argument
     approved_cert_fingerprints: Vec<String>,
     /// Mutable certificate approval state
-    approval_state: RwLock<ApprovalState>,
+    approval_state: RwLock<ApprovalState<'a>>,
     /// Storage for reporting the latest received fingerprint
     fingerprint: Arc<Mutex<Option<String>>>,
+    /// For rustls verify calls
+    crypto_provider: Arc<rustls::crypto::CryptoProvider>,
 }
 
-impl NikauCertVerification {
+impl<'a> NikauCertVerification<'a> {
     pub fn new(
         splash_label: &str,
         approved_cert_fingerprints: Vec<String>,
@@ -95,12 +99,13 @@ impl NikauCertVerification {
                 prompt_active: false,
             }),
             fingerprint,
+            crypto_provider: Arc::new(rustls::crypto::ring::default_provider()),
         }))
     }
 
     fn verify_cert(
         &self,
-        their_cert: &rustls::Certificate,
+        their_cert: &rustls_pki_types::CertificateDer<'_>,
         their_name: &str,
         we_are_server: bool,
     ) -> Result<String> {
@@ -123,7 +128,7 @@ impl NikauCertVerification {
                 // Don't save the cert to disk for --fingerprints.
                 // Saving to disk creates weird behavior if the user later changes the certs they approve.
                 // Maybe they don't WANT old certs to still be approved if the arg changes? Play it safe.
-                approval_state.known_certs.push(their_cert.clone());
+                approval_state.known_certs.push(their_cert.clone().into_owned());
                 return Ok(their_cert_fingerprint);
             } else if approval_state.prompt_active {
                 // Only one prompt at a time, reject other prompts. They will retry connecting anyway.
@@ -153,7 +158,7 @@ impl NikauCertVerification {
             }
             // Store the approved cert locally so that we don't e.g. reprompt on reconnect later on
             if let Ok(mut approval_state) = self.approval_state.write() {
-                approval_state.known_certs.push(their_cert.clone());
+                approval_state.known_certs.push(their_cert.clone().into_owned());
                 approval_state.prompt_active = false;
             } else {
                 bail!("Failed to lock known certs for approval");
@@ -179,36 +184,59 @@ impl NikauCertVerification {
 }
 
 /// Run by the client to verify servers
-impl rustls::client::ServerCertVerifier for NikauCertVerification {
+impl rustls::client::danger::ServerCertVerifier for NikauCertVerification<'_> {
     fn verify_server_cert(
         &self,
-        server_cert: &rustls::Certificate,
-        _intermediates: &[rustls::Certificate],
-        _server_name: &rustls::ServerName,
-        _scts: &mut dyn Iterator<Item = &[u8]>,
+        server_cert: &rustls_pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls_pki_types::CertificateDer],
+        _server_name: &rustls_pki_types::ServerName<'_>,
         _ocsp_response: &[u8],
-        _now: SystemTime,
-    ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
+        _now: rustls_pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
         if let Err(e) = self.verify_cert(server_cert, "Server", false) {
             Err(rustls::Error::General(e.to_string()))
         } else {
-            Ok(rustls::client::ServerCertVerified::assertion())
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
         }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls_pki_types::CertificateDer,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        // Default call used by WebPkiServerVerifier
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.crypto_provider.signature_verification_algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls_pki_types::CertificateDer,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        // Default call used by WebPkiServerVerifier
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.crypto_provider.signature_verification_algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.crypto_provider.signature_verification_algorithms.supported_schemes()
     }
 }
 
 /// Run by the server to verify clients
-impl rustls::server::ClientCertVerifier for NikauCertVerification {
-    fn client_auth_root_subjects(&self) -> &[rustls::DistinguishedName] {
+impl<'a> rustls::server::danger::ClientCertVerifier for NikauCertVerification<'a> {
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
         &[]
     }
 
     fn verify_client_cert(
         &self,
-        client_cert: &rustls::Certificate,
-        _intermediates: &[rustls::Certificate],
-        _now: SystemTime,
-    ) -> Result<rustls::server::ClientCertVerified, rustls::Error> {
+        client_cert: &rustls_pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls_pki_types::CertificateDer],
+        _now: rustls_pki_types::UnixTime,
+    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
         match self.verify_cert(client_cert, "Client", true) {
             Err(e) => Err(rustls::Error::General(e.to_string())),
             Ok(their_cert_fingerprint) => {
@@ -260,7 +288,7 @@ impl rustls::server::ClientCertVerifier for NikauCertVerification {
                         let _ = fingerprint.take();
                         Err(rustls::Error::General("Fingerprint is valid but an existing connection is still in progress, try again".to_string()))
                     } else {
-                        Ok(rustls::server::ClientCertVerified::assertion())
+                        Ok(rustls::server::danger::ClientCertVerified::assertion())
                     }
                 } else {
                     Err(rustls::Error::General(
@@ -270,9 +298,33 @@ impl rustls::server::ClientCertVerifier for NikauCertVerification {
             }
         }
     }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls_pki_types::CertificateDer,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        // Default call used by WebPkiServerVerifier
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.crypto_provider.signature_verification_algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls_pki_types::CertificateDer,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        // Default call used by WebPkiServerVerifier
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.crypto_provider.signature_verification_algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.crypto_provider.signature_verification_algorithms.supported_schemes()
+    }
 }
 
-fn prompt_unknown_cert(their_cert: &rustls::Certificate, we_are_server: bool) -> bool {
+fn prompt_unknown_cert(their_cert: &rustls_pki_types::CertificateDer, we_are_server: bool) -> bool {
     let their_cert_fingerprint = certs::fingerprint(their_cert);
     if atty::isnt(atty::Stream::Stdin) {
         warn!("Stdin is not a TTY, skipping user certificate approval prompt. Approve this cert by running the {} with '--fingerprints {}'", if we_are_server { "server" } else { "client" }, their_cert_fingerprint);

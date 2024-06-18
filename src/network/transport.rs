@@ -22,7 +22,7 @@ const TIMEOUT_MILLIS: u32 = 3000;
 
 pub fn build_client(
     bind_addr: &SocketAddr,
-    cert_verifier: Arc<approval::NikauCertVerification>,
+    cert_verifier: Arc<approval::NikauCertVerification<'static>>,
 ) -> Result<quinn::Endpoint> {
     let mut client_config = ClientConfig::new(approval::rustls_client_config(cert_verifier)?);
     client_config.transport_config(transport_config());
@@ -34,12 +34,11 @@ pub fn build_client(
 
 pub fn build_server(
     listen_addr: &SocketAddr,
-    cert_verifier: Arc<approval::NikauCertVerification>,
+    cert_verifier: Arc<approval::NikauCertVerification<'static>>,
 ) -> Result<quinn::Endpoint> {
     let mut server_config =
         ServerConfig::with_crypto(approval::rustls_server_config(cert_verifier)?);
     server_config
-        .use_retry(true)
         .transport_config(transport_config());
     Endpoint::server(server_config, *listen_addr)
         .with_context(|| format!("Failed to listen on {}", listen_addr))

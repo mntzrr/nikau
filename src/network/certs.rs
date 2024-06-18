@@ -7,7 +7,7 @@ use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
-pub fn load_known_certs(config_dir: &PathBuf) -> Result<Vec<rustls::Certificate>> {
+pub fn load_known_certs(config_dir: &PathBuf) -> Result<Vec<rustls_pki_types::CertificateDer<'static>>> {
     let mut certs = vec![];
     for path in fs::read_dir(init_known_certs_dir(config_dir)?)? {
         let path = path?;
@@ -15,7 +15,7 @@ pub fn load_known_certs(config_dir: &PathBuf) -> Result<Vec<rustls::Certificate>
         if !filetype.is_file() {
             continue;
         }
-        certs.push(load_cert(&path.path())?);
+        certs.push(load_cert(path.path())?);
     }
     Ok(certs)
 }
@@ -33,27 +33,25 @@ fn splash(label: &str, fingerprint: &str) {
     );
 }
 
-pub fn load_keypair(
+pub fn load_keypair<'a>(
     splash_label: &str,
     config_dir: &PathBuf,
-) -> Result<(rustls::Certificate, rustls::PrivateKey)> {
+) -> Result<(rustls_pki_types::CertificateDer<'a>, rustls_pki_types::PrivateKeyDer<'a>)> {
     let file_path = config_dir.join("private.pem");
     if file_path.is_file() {
         let mut reader =
             io::BufReader::new(fs::File::open(&file_path).with_context(|| {
                 format!("Failed to open keypair file: {}", file_path.display())
             })?);
-        let mut cert: Option<rustls::Certificate> = None;
-        let mut key: Option<rustls::PrivateKey> = None;
-        for item in rustls_pemfile::read_all(&mut reader)
-            .with_context(|| format!("Failed to read keypair file: {}", file_path.display()))?
-        {
-            match item {
+        let mut cert: Option<rustls_pki_types::CertificateDer> = None;
+        let mut key: Option<rustls_pki_types::PrivateKeyDer> = None;
+        for item in rustls_pemfile::read_all(&mut reader) {
+            match item.with_context(|| format!("Failed to read keypair file: {}", file_path.display()))? {
                 rustls_pemfile::Item::X509Certificate(filecert) => {
-                    cert = Some(rustls::Certificate(filecert));
+                    cert = Some(rustls_pki_types::CertificateDer::from(filecert));
                 }
-                rustls_pemfile::Item::PKCS8Key(filekey) => {
-                    key = Some(rustls::PrivateKey(filekey));
+                rustls_pemfile::Item::Pkcs8Key(filekey) => {
+                    key = Some(rustls_pki_types::PrivateKeyDer::from(filekey));
                 }
                 _ => {
                     // Avoid logging the content in case its a privkey
@@ -71,14 +69,10 @@ pub fn load_keypair(
     } else {
         let cert = rcgen::generate_simple_self_signed(vec![])
             .context("Failed to generate self-signed cert")?;
-        let rustls_cert = rustls::Certificate(cert.serialize_der()?);
+        let rustls_cert = rustls_pki_types::CertificateDer::from(cert.key_pair.serialize_der());
 
         // Just compress into a single write
-        let pem_content = format!(
-            "{}{}",
-            cert.serialize_pem()?,
-            cert.serialize_private_key_pem()
-        );
+        let pem_content = cert.key_pair.serialize_pem();
 
         info!(
             "Writing our cert to {}: {}",
@@ -103,7 +97,7 @@ pub fn load_keypair(
 
         Ok((
             rustls_cert,
-            rustls::PrivateKey(cert.serialize_private_key_der()),
+            rustls_pki_types::PrivateKeyDer::from(rustls_pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der())),
         ))
     }
 }
@@ -111,12 +105,12 @@ pub fn load_keypair(
 /// Returns the sha256 fingerprint of this certificate.
 /// We use this for cert filenames and for comparing certs in confirmation prompts.
 /// This should match the output of "openssl x509 -in <filename> -noout -sha256 -fingerprint"
-pub fn fingerprint(cert: &rustls::Certificate) -> String {
+pub fn fingerprint(cert: &rustls_pki_types::CertificateDer) -> String {
     format!("{:x}", Sha256::digest(cert))
 }
 
 pub fn write_approved_cert(
-    cert: &rustls::Certificate,
+    cert: &rustls_pki_types::CertificateDer,
     fingerprint: &str,
     config_dir: &PathBuf,
 ) -> Result<()> {
@@ -124,7 +118,7 @@ pub fn write_approved_cert(
         .context("Failed to init known_certs dir")?
         .join(format!("{}.pem", fingerprint));
     let content = pem::encode_config(
-        &pem::Pem::new("CERTIFICATE", cert.0.clone()),
+        &pem::Pem::new("CERTIFICATE", cert.as_ref()),
         pem::EncodeConfig::new().set_line_ending(pem::LineEnding::LF),
     );
     let mut outfile = fs::File::create(&file_path).with_context(|| {
@@ -149,16 +143,16 @@ pub fn write_approved_cert(
     Ok(())
 }
 
-fn load_cert(file_path: &PathBuf) -> Result<rustls::Certificate> {
+fn load_cert<'a>(file_path: PathBuf) -> Result<rustls_pki_types::CertificateDer<'a>> {
     let mut reader = io::BufReader::new(
-        fs::File::open(file_path)
+        fs::File::open(&file_path)
             .with_context(|| format!("Failed to open cert file: {}", file_path.display()))?,
     );
     if let Some(rustls_pemfile::Item::X509Certificate(filecert)) =
         rustls_pemfile::read_one(&mut reader)
             .with_context(|| format!("Failed to read cert file: {}", file_path.display()))?
     {
-        Ok(rustls::Certificate(filecert))
+        Ok(rustls_pki_types::CertificateDer::from(filecert))
     } else {
         bail!("Public certificate not found in {}", file_path.display());
     }
