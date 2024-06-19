@@ -12,18 +12,16 @@ use crate::msgs::{bulk, event};
 use crate::network::{approval, transport};
 use crate::{rotation, x11clipboard};
 
-pub async fn run_server<O: output::OutputHandler>(
-    listen_addr: &SocketAddr,
-    cert_verifier: Arc<approval::NikauCertVerification<'static>>,
+pub async fn run_server_events_loop<O: output::OutputHandler>(
     config_dir: PathBuf,
     mut event_rx: mpsc::Receiver<Event>,
-    fingerprint: Arc<Mutex<Option<String>>>,
     grab_tx: broadcast::Sender<GrabEvent>,
     output_handler: O,
     max_clipboard_size_bytes: u64,
     max_uncompressed_size_bytes: u64,
+    rotation_tx: mpsc::Sender<rotation::RotationEvent>,
+    mut rotation_rx: mpsc::Receiver<rotation::RotationEvent>,
 ) -> Result<()> {
-    let (rotation_tx, mut rotation_rx) = mpsc::channel::<rotation::RotationEvent>(32);
     let local_clipboard = match rotation::LocalClipboard::start(
         config_dir,
         rotation_tx.clone(),
@@ -40,8 +38,6 @@ pub async fn run_server<O: output::OutputHandler>(
     };
 
     let mut rotation = rotation::Rotation::new(grab_tx, output_handler, local_clipboard).await?;
-    let server_endpoint = transport::build_server(listen_addr, cert_verifier)?;
-
     loop {
         tokio::select! {
             // Listen and forward rotation events to rotation
@@ -75,55 +71,66 @@ pub async fn run_server<O: output::OutputHandler>(
                     }
                 }
             }
-            // Task launcher for new client connections
-            conn = server_endpoint.accept() => {
-                let conn = match conn {
-                    Some(c) => c,
-                    None => bail!("Server endpoint is closed, exiting server"),
-                };
-                let rotation_tx_cpy = rotation_tx.clone();
-                let fingerprint_cpy = fingerprint.clone();
-                // In theory, we could break off into a spawned process here, but let's try to avoid
-                // fingerprint mismatch issues by waiting to spawn until we've gotten the fingerprint.
-                match conn.await {
-                    Ok(conn) => {
-                        let remote_addr = conn.remote_address();
-                        // HACK: This is retrieving the fingerprint stored by approval.rs
-                        // See more about this in approval.rs.
-                        match fingerprint_cpy.lock() {
-                            Ok(mut opt) => {
-                                if let Some(fingerprint) = opt.take() {
-                                    debug!("Got fingerprint: {}", fingerprint);
-                                    // Now that we have extracted the client cert fingerprint, spawn.
-                                    task::spawn(async move {
-                                        if let Err(e) =
-                                            handle_connection(conn, fingerprint, rotation_tx_cpy.clone(), max_clipboard_size_bytes)
-                                            .await
-                                        {
-                                            // Always try to remove the client from rotation, even if it wasn't added yet.
-                                            if let Err(e) = rotation_tx_cpy
-                                                .send(rotation::RotationEvent::RemoveClient(remote_addr))
-                                                .await {
-                                                    error!("Failed to send remove client event: {:?}", e);
-                                                };
-                                            error!("Client connection error: {:?}", e);
-                                        }
-                                    });
-                                } else {
-                                    // In theory, this could happen if there was a race which approval.rs cleaned up.
-                                    // Drop the connection and make the client try again.
-                                    warn!("BUG: Fingerprint missing for new connection, dropping connection so that client can retry");
+        }
+    }
+}
+
+pub async fn run_server_connections_loop(
+    listen_addr: &SocketAddr,
+    cert_verifier: Arc<approval::NikauCertVerification<'static>>,
+    fingerprint: Arc<Mutex<Option<String>>>,
+    max_clipboard_size_bytes: u64,
+    rotation_tx: mpsc::Sender<rotation::RotationEvent>,
+) -> Result<()> {
+    let server_endpoint = transport::build_server(listen_addr, cert_verifier)?;
+    // Task launcher for new client connections
+    loop {
+        let conn = server_endpoint.accept().await;
+        let conn = match conn {
+            Some(c) => c,
+            None => bail!("Server endpoint is closed, exiting server"),
+        };
+        let rotation_tx_cpy = rotation_tx.clone();
+        let fingerprint_cpy = fingerprint.clone();
+        // In theory, we could break off into a spawned process here, but let's try to avoid
+        // fingerprint mismatch issues by waiting to spawn until we've gotten the fingerprint.
+        match conn.await {
+            Ok(conn) => {
+                let remote_addr = conn.remote_address();
+                // HACK: This is retrieving the fingerprint stored by approval.rs
+                // See more about this in approval.rs.
+                match fingerprint_cpy.lock() {
+                    Ok(mut opt) => {
+                        if let Some(fingerprint) = opt.take() {
+                            debug!("Got fingerprint: {}", fingerprint);
+                            // Now that we have extracted the client cert fingerprint, spawn.
+                            task::spawn(async move {
+                                if let Err(e) =
+                                    handle_connection(conn, fingerprint, rotation_tx_cpy.clone(), max_clipboard_size_bytes)
+                                    .await
+                                {
+                                    // Always try to remove the client from rotation, even if it wasn't added yet.
+                                    if let Err(e) = rotation_tx_cpy
+                                        .send(rotation::RotationEvent::RemoveClient(remote_addr))
+                                        .await {
+                                            error!("Failed to send remove client event: {:?}", e);
+                                        };
+                                    error!("Client connection error: {:?}", e);
                                 }
-                            },
-                            Err(e) => {
-                                error!("Failed to lock fingerprint for new connection: {}", e);
-                            },
-                        };
-                    }
+                            });
+                        } else {
+                            // In theory, this could happen if there was a race which approval.rs cleaned up.
+                            // Drop the connection and make the client try again.
+                            warn!("BUG: Fingerprint missing for new connection, dropping connection so that client can retry");
+                        }
+                    },
                     Err(e) => {
-                        error!("Client failed to connect: {}", e);
-                    }
-                }
+                        error!("Failed to lock fingerprint for new connection: {}", e);
+                    },
+                };
+            }
+            Err(e) => {
+                error!("Client failed to connect: {}", e);
             }
         }
     }

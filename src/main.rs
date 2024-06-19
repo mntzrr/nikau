@@ -14,7 +14,7 @@ use tracing::{error, info, warn};
 
 use nikau::device::{handles, input, output, shortcut, watch, Event};
 use nikau::network::approval;
-use nikau::{client, logging, server};
+use nikau::{client, logging, rotation, server};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -242,19 +242,30 @@ async fn server(
             )
     });
 
-    let server_handle = task::spawn(async move {
-        server::run_server(
-            &listen_addr,
-            verifier,
+    let (rotation_tx, rotation_rx) = mpsc::channel::<rotation::RotationEvent>(32);
+    let rotation_tx2 = rotation_tx.clone();
+    let server_events_handle = task::spawn(async move {
+        server::run_server_events_loop(
             config_dir,
             event_rx,
-            fingerprint,
             grab_tx2,
             output_handler,
             // Max compressed clipboard size over the wire
             max_clipboard_size_bytes,
             // Max uncompressed clipboard size, just in case
             10 * max_clipboard_size_bytes,
+            rotation_tx,
+            rotation_rx,
+        )
+        .await
+    });
+    let server_connections_handle = task::spawn(async move {
+        server::run_server_connections_loop(
+            &listen_addr,
+            verifier,
+            fingerprint,
+            max_clipboard_size_bytes,
+            rotation_tx2,
         )
         .await
     });
@@ -266,8 +277,11 @@ async fn server(
             watch_exit = watch_handle => {
                 watch_exit?.context("Failed to watch input events, exiting early")?
             },
-            server_exit = server_handle => {
-                server_exit?.context("Server failed, exiting early")?
+            server_events_exit = server_events_handle => {
+                server_events_exit?.context("Server events loop failed, exiting early")?
+            },
+            server_connections_exit = server_connections_handle => {
+                server_connections_exit?.context("Server connections loop failed, exiting early")?
             },
             _timeout = time::sleep(Duration::from_secs(exit_secs as u64)) => {
                 info!("Exiting automatically as requested (--exit-secs={})", exit_secs);
@@ -278,8 +292,11 @@ async fn server(
             watch_exit = watch_handle => {
                 watch_exit?.context("Failed to watch input events, exiting")?
             },
-            server_exit = server_handle => {
-                server_exit?.context("Server failed, exiting")?
+            server_events_exit = server_events_handle => {
+                server_events_exit?.context("Server events loop failed, exiting early")?
+            },
+            server_connections_exit = server_connections_handle => {
+                server_connections_exit?.context("Server connections loop failed, exiting early")?
             },
         }
     }
