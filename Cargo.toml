@@ -43,3 +43,6 @@ walkdir = "2.3"
 x11rb-async = { version = "0.13", features = ["xfixes"] }
 zip = { version = "2.1", default-features = false, features = ["zstd"] }
 zstd = "0.13"
+
+[dev-dependencies]
+tempfile = "3.10"

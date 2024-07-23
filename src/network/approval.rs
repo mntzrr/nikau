@@ -16,29 +16,35 @@ pub fn rustls_client_config(
     verifier: Arc<NikauCertVerification<'static>>,
 ) -> Result<Arc<dyn quinn::crypto::ClientConfig>> {
     let mut rustls_config = quinn::rustls::ClientConfig::builder_with_provider(verifier.crypto_provider.clone())
-        .with_safe_default_protocol_versions()?
+        .with_safe_default_protocol_versions().context("Failed to set client default protocol versions")?
         .dangerous().with_custom_certificate_verifier(verifier.clone())
         .with_client_auth_cert(
             vec![verifier.our_cert.clone()],
             verifier.our_privkey.clone_key(),
-        )?;
+        ).context("Failed to assign client cert and privkey")?;
     rustls_config.alpn_protocols = ALPN_QUIC_HTTP.iter().map(|&x| x.into()).collect();
-    Ok(Arc::new(quinn::crypto::rustls::QuicClientConfig::try_from(rustls_config)?))
+    Ok(Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(rustls_config)
+            .context("Failed to create QUIC client configuration")?
+    ))
 }
 
 pub fn rustls_server_config(
     verifier: Arc<NikauCertVerification<'static>>,
 ) -> Result<Arc<dyn quinn::crypto::ServerConfig>> {
     let mut rustls_config = quinn::rustls::ServerConfig::builder_with_provider(verifier.crypto_provider.clone())
-        .with_safe_default_protocol_versions()?
+        .with_safe_default_protocol_versions().context("Failed to set server default protocol versions")?
         .with_client_cert_verifier(verifier.clone())
         .with_single_cert(
             vec![verifier.our_cert.clone()],
             verifier.our_privkey.clone_key(),
-        )?;
+        ).context("Failed to assign server cert and privkey")?;
     rustls_config.alpn_protocols = ALPN_QUIC_HTTP.iter().map(|&x| x.into()).collect();
     rustls_config.max_early_data_size = u32::MAX; // required by QUIC
-    Ok(Arc::new(quinn::crypto::rustls::QuicServerConfig::try_from(rustls_config)?))
+    Ok(Arc::new(
+        quinn::crypto::rustls::QuicServerConfig::try_from(rustls_config)
+            .context("Failed to create QUIC server configuration")?
+    ))
 }
 
 #[derive(Debug)]
