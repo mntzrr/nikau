@@ -15,7 +15,7 @@ exclude = ["README.md", "Dockerfile", ".build.yml", "*.sh"]
 anyhow = "1.0"
 async-trait = "0.1"
 atty = "0.2"
-bit-vec = "0.6"
+bit-vec = "0.8"
 bytes = "1.4"
 clap = { version = "4.4", features = ["derive"] }
 evdev = { version = "0.12", features = ["tokio"] }
