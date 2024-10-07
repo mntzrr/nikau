@@ -20,12 +20,9 @@ pub struct ClipboardTypeWatcher {
 
 impl ClipboardTypeWatcher {
     pub async fn start(types_tx: watch::Sender<Vec<String>>) -> Result<()> {
-        let context = shared::XContext::new()
-            .await
-            .context("Failed to set up X11 API context")?;
-        let atoms = shared::Atoms::new(&context.conn).await?;
+        // Fail up-front if context can't be created at least once
+        let mut watcher = new_watcher().await?;
         task::spawn(async move {
-            let mut watcher = Self { context, atoms };
             loop {
                 match watcher.types_wait().await {
                     Ok(types) => {
@@ -52,7 +49,16 @@ impl ClipboardTypeWatcher {
                         }
                     }
                     Err(e) => {
-                        warn!("Failed to wait for new clipboard types: {}", e)
+                        warn!("Failed to wait for new clipboard types: {}", e);
+                        // This can happen if the context is lost (e.g. WM crash?). Try to create a new context.
+                        match new_watcher().await {
+                            Ok(w) => {
+                                watcher = w;
+                            }
+                            Err(e) => {
+                                warn!("Failed to init new watcher: {}", e);
+                            }
+                        }
                     }
                 }
             }
@@ -118,6 +124,14 @@ impl ClipboardTypeWatcher {
 
         Ok(buf)
     }
+}
+
+async fn new_watcher() -> Result<ClipboardTypeWatcher> {
+    let context = shared::XContext::new()
+        .await
+        .context("Failed to set up X11 API context")?;
+    let atoms = shared::Atoms::new(&context.conn).await?;
+    Ok(ClipboardTypeWatcher { context, atoms })
 }
 
 pub struct ClipboardReader {
