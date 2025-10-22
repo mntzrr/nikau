@@ -22,11 +22,11 @@ evdev = { version = "0.12", features = ["tokio"] }
 home = "0.5"
 libc = "0.2"
 nonblock = "0.2"
-notify = "7.0"
+notify = "8.2"
 pem = "3.0"
 postcard = { version = "1.0", features = ["use-std"] }
 quinn = { version = "0.11" }
-rcgen = "0.13"
+rcgen = "0.14"
 regex = "1.10"
 rustls = "0.23"
 rustls-pemfile = "2.0"
@@ -41,7 +41,7 @@ url = "2.4"
 usb-gadget = { version = "0.7", features = ["tokio"] }
 walkdir = "2.3"
 x11rb-async = { version = "0.13", features = ["xfixes"] }
-zip = { version = "2.1", default-features = false, features = ["zstd"] }
+zip = { version = "6.0", default-features = false, features = ["zstd"] }
 zstd = "0.13"
 
 [dev-dependencies]

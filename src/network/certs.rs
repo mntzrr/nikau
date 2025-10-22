@@ -102,14 +102,14 @@ fn write_new_keypair<'a>(
         .write_all(pair.cert.pem().as_bytes())
         .with_context(|| format!("Failed to write public key to file: {}", file_path.display()))?;
     outfile
-        .write_all(pair.key_pair.serialize_pem().as_bytes())
+        .write_all(pair.signing_key.serialize_pem().as_bytes())
         .with_context(|| format!("Failed to write private key to file: {}", file_path.display()))?;
 
     let rustls_cert = rustls_pki_types::CertificateDer::from(pair.cert.der().to_vec());
     splash(splash_label, &fingerprint(&rustls_cert));
     Ok((
         rustls_cert,
-        rustls_pki_types::PrivateKeyDer::from(rustls_pki_types::PrivatePkcs8KeyDer::from(pair.key_pair.serialize_der())),
+        rustls_pki_types::PrivateKeyDer::from(rustls_pki_types::PrivatePkcs8KeyDer::from(pair.signing_key.serialize_der())),
     ))
 }
 
