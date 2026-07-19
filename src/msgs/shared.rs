@@ -1,12 +1,12 @@
 use serde::{Deserialize, Serialize};
 
-/// The protocol version sent from the client to the server on the events stream.
+/// The protocol version exchanged between client and server on each stream.
 /// This is compared on initial connection between client and server.
 /// If the event/bulk definitions change, then this should change.
-pub const PROTOCOL_VERSION: u64 = 4;
+pub const PROTOCOL_VERSION: u64 = 5;
 
-/// An initial handshake message sent from the client to the server on the events stream.
-/// If the server doesn't support the provided version value, it can cut off the connection early.
+/// An initial handshake message exchanged between client and server on each stream.
+/// If the peer doesn't support the provided version value, it can cut off the connection early.
 /// The intent is for the structure of this message to never change.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct VersionBootstrapMessage {

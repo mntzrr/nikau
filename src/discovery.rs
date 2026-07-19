@@ -11,6 +11,13 @@ const SERVICE_TYPE: &str = "_nikau._udp.local.";
 /// Default time to wait for a server to be discovered on the LAN.
 const DEFAULT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// After the first server resolves, keep listening this long for additional servers
+/// so that "first wins" doesn't silently hide them.
+const EXTRA_RESOLVE_GRACE: Duration = Duration::from_millis(500);
+
+/// Error message when no server is discovered within the timeout.
+const DISCOVERY_TIMEOUT_HINT: &str = "Discovery timeout: no Nikau server found on the local network. Check that: the server is running, both machines are on the same subnet, and no firewall is blocking UDP port 5353 (mDNS). Alternatively, connect directly with 'nikau client <ip>'";
+
 /// Registers a Nikau server on the local network via mDNS.
 pub struct DiscoveryRegistration {
     daemon: ServiceDaemon,
@@ -18,8 +25,8 @@ pub struct DiscoveryRegistration {
 }
 
 impl DiscoveryRegistration {
-    /// Advertises a Nikau server listening on the given port.
-    pub fn register(port: u16) -> Result<Self> {
+    /// Advertises a Nikau server listening on the given address.
+    pub fn register(listen_addr: SocketAddr) -> Result<Self> {
         let hostname = get_hostname().context("Failed to get hostname")?;
         let instance_name = if hostname.is_empty() {
             "nikau".to_string()
@@ -27,13 +34,14 @@ impl DiscoveryRegistration {
             hostname
         };
         let host_name = format!("{}.local.", instance_name);
-        let ip = get_local_ip().context("Failed to determine local IP address")?;
+        let port = listen_addr.port();
+        let ips = advertise_ips(listen_addr.ip())?;
 
         let service_info = ServiceInfo::new(
             SERVICE_TYPE,
             &instance_name,
             &host_name,
-            ip,
+            &ips[..],
             port,
             None,
         )
@@ -46,8 +54,8 @@ impl DiscoveryRegistration {
             .context("Failed to register mDNS service")?;
 
         info!(
-            "Registered mDNS service: {} at {}:{}",
-            fullname, ip, port
+            "Registered mDNS service: {} at {:?}:{}",
+            fullname, ips, port
         );
 
         Ok(Self {
@@ -82,7 +90,7 @@ pub async fn discover_server(timeout: Option<Duration>) -> Result<SocketAddr> {
     loop {
         let remaining = deadline
             .checked_duration_since(Instant::now())
-            .ok_or_else(|| anyhow!("Discovery timeout"))?;
+            .ok_or_else(|| anyhow!("{}", DISCOVERY_TIMEOUT_HINT))?;
 
         let event = match tokio::time::timeout(remaining, receiver.recv_async()).await {
             Ok(Ok(event)) => event,
@@ -92,23 +100,43 @@ pub async fn discover_server(timeout: Option<Duration>) -> Result<SocketAddr> {
             }
             Err(_) => {
                 let _ = daemon.shutdown();
-                bail!("Discovery timeout");
+                bail!("{}", DISCOVERY_TIMEOUT_HINT);
             }
         };
 
         match event {
             ServiceEvent::ServiceResolved(resolved) => {
-                let port = resolved.get_port();
-                let addresses = resolved.get_addresses();
-                // Prefer IPv4 for compatibility, fall back to any address.
-                let ip = addresses
-                    .iter()
-                    .find(|ip| ip.is_ipv4())
-                    .or_else(|| addresses.iter().next())
-                    .ok_or_else(|| anyhow!("Resolved service has no addresses"))?;
-
-                let addr = SocketAddr::new(*ip, port);
+                let addr = match resolved_addr(&resolved) {
+                    Some(addr) => addr,
+                    None => {
+                        debug!("Resolved service has no addresses, continuing to browse");
+                        continue;
+                    }
+                };
                 info!("Discovered Nikau server: {}", addr);
+                // Keep listening briefly so that additional servers on the network
+                // don't get silently hidden by first-wins.
+                let mut extra: Vec<SocketAddr> = Vec::new();
+                while let Ok(Ok(event)) =
+                    tokio::time::timeout(EXTRA_RESOLVE_GRACE, receiver.recv_async()).await
+                {
+                    if let ServiceEvent::ServiceResolved(other) = event {
+                        if let Some(other_addr) = resolved_addr(&other) {
+                            if other_addr != addr && !extra.contains(&other_addr) {
+                                extra.push(other_addr);
+                            }
+                        }
+                    }
+                }
+                if !extra.is_empty() {
+                    let mut all = vec![addr.to_string()];
+                    all.extend(extra.iter().map(|a| a.to_string()));
+                    info!(
+                        "Multiple Nikau servers discovered: {}; connecting to the first: {}",
+                        all.join(", "),
+                        addr
+                    );
+                }
                 let _ = daemon.shutdown();
                 return Ok(addr);
             }
@@ -117,6 +145,76 @@ pub async fn discover_server(timeout: Option<Duration>) -> Result<SocketAddr> {
             }
         }
     }
+}
+
+/// Picks an address from a resolved service, preferring IPv4 for compatibility.
+fn resolved_addr(resolved: &ServiceInfo) -> Option<SocketAddr> {
+    let addresses = resolved.get_addresses();
+    addresses
+        .iter()
+        .find(|ip| ip.is_ipv4())
+        .or_else(|| addresses.iter().next())
+        .map(|ip| SocketAddr::new(*ip, resolved.get_port()))
+}
+
+/// Picks the addresses to advertise for a server listening on `listen_ip`.
+fn advertise_ips(listen_ip: IpAddr) -> Result<Vec<IpAddr>> {
+    if !listen_ip.is_unspecified() {
+        // A concrete --listen address was provided: advertise exactly that.
+        return Ok(vec![listen_ip]);
+    }
+    // Listening on the wildcard address: advertise every usable local IPv4 address.
+    let ips = local_ipv4_addrs().unwrap_or_else(|e| {
+        warn!(
+            "Failed to enumerate local IPv4 addresses ({}), falling back to route probe",
+            e
+        );
+        Vec::new()
+    });
+    if !ips.is_empty() {
+        return Ok(ips);
+    }
+    // Last resort: probe the outbound route for a primary address.
+    match get_local_ip() {
+        Ok(ip) => Ok(vec![ip]),
+        Err(e) => bail!(
+            "Failed to determine any local IP address to advertise: {}. Check that the network is up and that no firewall is blocking the route probe, or specify the address to advertise explicitly with '-l <ip>'",
+            e
+        ),
+    }
+}
+
+/// Enumerates this host's non-loopback, non-link-local IPv4 addresses.
+fn local_ipv4_addrs() -> Result<Vec<IpAddr>> {
+    let mut ips: Vec<IpAddr> = Vec::new();
+    unsafe {
+        let mut ifaddrs: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut ifaddrs) != 0 {
+            bail!("getifaddrs failed: {}", std::io::Error::last_os_error());
+        }
+        let mut current = ifaddrs;
+        while !current.is_null() {
+            let ifa = &*current;
+            if !ifa.ifa_addr.is_null()
+                && (*ifa.ifa_addr).sa_family == libc::AF_INET as libc::sa_family_t
+            {
+                let sin = &*(ifa.ifa_addr as *const libc::sockaddr_in);
+                // s_addr is a u32 in network byte order.
+                let ip = std::net::Ipv4Addr::from(sin.sin_addr.s_addr.to_be_bytes());
+                let ip = IpAddr::V4(ip);
+                if !ip.is_loopback()
+                    && !ip.is_unspecified()
+                    && !matches!(ip, IpAddr::V4(v4) if v4.is_link_local())
+                    && !ips.contains(&ip)
+                {
+                    ips.push(ip);
+                }
+            }
+            current = ifa.ifa_next;
+        }
+        libc::freeifaddrs(ifaddrs);
+    }
+    Ok(ips)
 }
 
 /// Returns the machine hostname.

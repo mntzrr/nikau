@@ -130,6 +130,16 @@ fn handle_signals(mut signals: Signals, out: mpsc::Sender<Event>) {
     }
 }
 
+/// Resolves when the process receives SIGINT (ctrl-c) or SIGTERM.
+async fn shutdown_signal() {
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("Failed to install SIGTERM handler");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = sigterm.recv() => {}
+    }
+}
+
 fn main() -> Result<()> {
     logging::init_logging();
     let cli = Cli::parse();
@@ -144,12 +154,18 @@ fn main() -> Result<()> {
 
     match cli.command {
         Commands::Server(args) => {
+            if args.port == 0 {
+                bail!("--port 0 (ephemeral port) is not supported: the mDNS advertisement must match the actual listen port");
+            }
             let fingerprint = Arc::new(Mutex::new(None));
             let verifier = approval::NikauCertVerification::new(
                 "server",
                 args.fingerprint.unwrap_or(vec![]),
                 &config_dir,
                 fingerprint.clone(),
+                // No interactive approval prompts when facing the public internet:
+                // unknown peers must be pre-approved via --fingerprints instead.
+                !args.www,
             )?;
             let mode = if args.www {
                 NetworkMode::Www
@@ -178,6 +194,9 @@ fn main() -> Result<()> {
             })?;
         }
         Commands::Client(args) => {
+            // When no host is given, the server address comes from mDNS discovery,
+            // which allows re-discovering it after repeated connection failures.
+            let from_discovery = args.host.is_none();
             let port = args.port.unwrap_or(1213);
             let connect_addr: SocketAddr = match &args.host {
                 Some(host) => {
@@ -210,6 +229,9 @@ fn main() -> Result<()> {
                 args.fingerprint.unwrap_or(vec![]),
                 &config_dir,
                 Arc::new(Mutex::new(None)),
+                // The client connects outbound to a server it chose, so interactive
+                // approval prompts stay enabled even in --www mode (unlike the server).
+                true,
             )?;
             let mode = if args.www {
                 NetworkMode::Www
@@ -227,6 +249,7 @@ fn main() -> Result<()> {
                     verifier,
                     max_clipboard_size_bytes,
                     mode,
+                    from_discovery,
                 )
                 .await
             })?;
@@ -317,7 +340,7 @@ async fn server(
     });
 
     // Advertise the server on the local network so that clients can discover it.
-    let _mdns_registration = match discovery::DiscoveryRegistration::register(listen_addr.port()) {
+    let _mdns_registration = match discovery::DiscoveryRegistration::register(listen_addr) {
         Ok(r) => Some(r),
         Err(e) => {
             warn!("Failed to register mDNS service for LAN discovery: {}", e);
@@ -341,6 +364,11 @@ async fn server(
             _timeout = time::sleep(Duration::from_secs(exit_secs as u64)) => {
                 info!("Exiting automatically as requested (--exit-secs={})", exit_secs);
             },
+            _signal = shutdown_signal() => {
+                // Dropping _mdns_registration here sends the mDNS goodbye.
+                info!("Shutting down...");
+                return Ok(());
+            },
         };
     } else {
         tokio::select! {
@@ -353,6 +381,11 @@ async fn server(
             server_connections_exit = server_connections_handle => {
                 server_connections_exit?.context("Server connections loop failed, exiting early")?
             },
+            _signal = shutdown_signal() => {
+                // Dropping _mdns_registration here sends the mDNS goodbye.
+                info!("Shutting down...");
+                return Ok(());
+            },
         }
     }
     Ok(())
@@ -364,6 +397,7 @@ async fn client(
     verifier: Arc<approval::NikauCertVerification<'static>>,
     max_clipboard_size_bytes: u64,
     mode: NetworkMode,
+    from_discovery: bool,
 ) -> Result<()> {
     // Try to set up virtual devices up-front - exit early if we aren't root
     let mut output_handler = output::uinput::VirtualUInputDevices::new()
@@ -376,32 +410,81 @@ async fn client(
         max_uncompressed_size_bytes,
     ).await;
 
+    let mut connect_addr = connect_addr;
+    let mut consecutive_failures = 0u32;
+    // Keep one set of signal handlers registered across reconnect attempts.
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+
     loop {
         info!("Connecting to server: {}", connect_addr);
-        if let Err(e) = client::run(
-            &connect_addr,
-            verifier.clone(),
-            max_clipboard_size_bytes,
-            &mut local_clipboard,
-            &mut output_handler,
-            mode,
-        )
-        .await
-        {
-            error!("Client error: {:?}", e);
-            // Clear any clipboard status that may have been accumulated while active
-            if let Some(lc) = &mut local_clipboard {
-                if let Err(e) = lc.clear_remote_clipboard() {
-                    warn!("Failed to clear remote clipboard: {}", e);
+        tokio::select! {
+            run_result = client::run(
+                &connect_addr,
+                verifier.clone(),
+                max_clipboard_size_bytes,
+                &mut local_clipboard,
+                &mut output_handler,
+                mode,
+            ) => {
+                // client::run only returns on failure (its loop never exits otherwise).
+                if let Err(e) = run_result {
+                    error!("Client error: {:?}", e);
                 }
-            }
-            // Release any keys still held on the virtual devices so they don't
-            // stay stuck while we're disconnected.
-            if let Err(e) = output_handler.release_all().await {
-                warn!("Failed to release held keys after connection loss: {:?}", e);
-            }
-            // Wait a bit before retrying. Often happens when waiting for server to approve the cert.
-            time::sleep(Duration::from_secs(5)).await
+                // Clear any clipboard status that may have been accumulated while active
+                if let Some(lc) = &mut local_clipboard {
+                    if let Err(e) = lc.clear_remote_clipboard() {
+                        warn!("Failed to clear remote clipboard: {}", e);
+                    }
+                }
+                // Release any keys still held on the virtual devices so they don't
+                // stay stuck while we're disconnected.
+                if let Err(e) = output_handler.release_all().await {
+                    warn!("Failed to release held keys after connection loss: {:?}", e);
+                }
+                consecutive_failures += 1;
+                if from_discovery && consecutive_failures >= 3 {
+                    // The discovered address may be stale (server restarted elsewhere,
+                    // DHCP lease change, ...): try discovering the server again.
+                    warn!(
+                        "{} consecutive connection failures, re-running mDNS discovery",
+                        consecutive_failures
+                    );
+                    match discovery::discover_server(None).await {
+                        Ok(new_addr) => {
+                            if new_addr != connect_addr {
+                                info!(
+                                    "Discovered server at new address: {} (was {})",
+                                    new_addr, connect_addr
+                                );
+                            }
+                            connect_addr = new_addr;
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Re-discovery failed, keeping previous address {}: {:?}",
+                                connect_addr, e
+                            );
+                        }
+                    }
+                    consecutive_failures = 0;
+                }
+                // Wait a bit before retrying. Often happens when waiting for server to approve the cert.
+                time::sleep(Duration::from_secs(5)).await
+            },
+            _ = &mut shutdown => {
+                // Same cleanup as the connection-loss path, then exit.
+                if let Some(lc) = &mut local_clipboard {
+                    if let Err(e) = lc.clear_remote_clipboard() {
+                        warn!("Failed to clear remote clipboard: {}", e);
+                    }
+                }
+                if let Err(e) = output_handler.release_all().await {
+                    warn!("Failed to release held keys after connection loss: {:?}", e);
+                }
+                info!("Shutting down...");
+                return Ok(());
+            },
         }
     }
 }

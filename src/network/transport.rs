@@ -21,6 +21,14 @@ const KEEPALIVE_MILLIS: u64 = 2000;
 /// Keep this very short so that connection problems get resolved relatively quickly.
 const TIMEOUT_MILLIS: u32 = 3000;
 
+/// WWW-mode idle timeout: internet paths can stall much longer than LAN ones,
+/// so the LAN-grade 3s timeout would sever otherwise-healthy connections.
+const WWW_TIMEOUT_MILLIS: u32 = 30_000;
+
+/// WWW-mode keepalive: frequent enough to hold NAT/firewall state open,
+/// but kept well shorter than WWW_TIMEOUT_MILLIS to avoid spurious timeouts.
+const WWW_KEEPALIVE_MILLIS: u64 = 10_000;
+
 /// Socket buffer size for the QUIC UDP socket. Larger buffers reduce the chance of
 /// kernel drops during event bursts.
 const SOCKET_BUF_SIZE: libc::c_int = 2 * 1024 * 1024;
@@ -239,8 +247,8 @@ fn transport_config(mode: NetworkMode) -> Arc<TransportConfig> {
             transport_config
                 //.max_concurrent_bidi_streams(2_u8.into()) // events + bulk
                 .max_concurrent_uni_streams(0_u8.into()) // we only use bidirectional streams
-                .keep_alive_interval(Some(Duration::from_millis(KEEPALIVE_MILLIS)))
-                .max_idle_timeout(Some(IdleTimeout::from(VarInt::from_u32(TIMEOUT_MILLIS))));
+                .keep_alive_interval(Some(Duration::from_millis(WWW_KEEPALIVE_MILLIS)))
+                .max_idle_timeout(Some(IdleTimeout::from(VarInt::from_u32(WWW_TIMEOUT_MILLIS))));
         }
     }
 
@@ -269,8 +277,8 @@ pub async fn recv_version(recv: &mut RecvStream, buf: &mut Vec<u8>) -> Result<()
     let resp = recv
         .read_chunk(1024, true)
         .await
-        .context("Failed reading protocol version from server")?
-        .context("Server closed connection")?;
+        .context("Failed reading protocol version (possible protocol version mismatch; run 'nikau -V' on both ends to compare)")?
+        .context("Peer closed connection during version exchange (possible protocol version mismatch; run 'nikau -V' on both ends to compare)")?;
     trace!(
         "Received {} byte version: {:X?}",
         resp.bytes.len(),
@@ -282,7 +290,7 @@ pub async fn recv_version(recv: &mut RecvStream, buf: &mut Vec<u8>) -> Result<()
     {
         let (versionmsg, resp_remainder) =
             postcard::take_from_bytes_cobs::<shared::VersionBootstrapMessage>(buf)
-                .map_err(|e| anyhow!("Failed to deserialize message: {:?}", e))?;
+                .map_err(|e| anyhow!("Failed to deserialize protocol version message (possible protocol version mismatch; run 'nikau -V' on both ends to compare): {:?}", e))?;
         version = versionmsg.version;
         // Remove this message from the front of buf.
         // resp_remainder is relative to buf, which may have had content before this call.

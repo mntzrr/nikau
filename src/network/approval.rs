@@ -69,6 +69,10 @@ pub struct NikauCertVerification<'a> {
     approval_state: RwLock<ApprovalState<'a>>,
     /// Storage for reporting the latest received fingerprint
     fingerprint: Arc<Mutex<Option<String>>>,
+    /// Whether unknown certs may be approved via an interactive prompt.
+    /// Disabled for the server in --www mode, where internet-facing peers must
+    /// be pre-approved instead of prompting on the console.
+    allow_interactive_prompts: bool,
     /// For rustls verify calls
     crypto_provider: Arc<rustls::crypto::CryptoProvider>,
 }
@@ -79,6 +83,7 @@ impl<'a> NikauCertVerification<'a> {
         approved_cert_fingerprints: Vec<String>,
         config_dir: &PathBuf,
         fingerprint: Arc<Mutex<Option<String>>>,
+        allow_interactive_prompts: bool,
     ) -> Result<Arc<Self>> {
         let (our_cert, our_privkey) = certs::load_keypair(splash_label, config_dir)
             .with_context(|| format!("Failed to load {} keypair", splash_label))?;
@@ -105,6 +110,7 @@ impl<'a> NikauCertVerification<'a> {
                 prompt_active: false,
             }),
             fingerprint,
+            allow_interactive_prompts,
             crypto_provider: Arc::new(rustls::crypto::ring::default_provider()),
         }))
     }
@@ -136,6 +142,14 @@ impl<'a> NikauCertVerification<'a> {
                 // Maybe they don't WANT old certs to still be approved if the arg changes? Play it safe.
                 approval_state.known_certs.push(their_cert.clone().into_owned());
                 return Ok(their_cert_fingerprint);
+            } else if !self.allow_interactive_prompts {
+                // Interactive prompts are disabled (--www): unknown peers must be
+                // pre-approved via known_certs or --fingerprints.
+                bail!(
+                    "{} cert rejected: interactive approval disabled (--www); pre-approve it with '--fingerprints {}'",
+                    their_name,
+                    their_cert_fingerprint
+                );
             } else if approval_state.prompt_active {
                 // Only one prompt at a time, reject other prompts. They will retry connecting anyway.
                 bail!(

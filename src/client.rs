@@ -79,23 +79,27 @@ impl Connection {
                 .map_or("<unknown endpoint>".to_string(), |s| s.to_string())
         );
         let connect_time = Instant::now();
-        let (mut events_send, events_recv) = conn
+        let (mut events_send, mut events_recv) = conn
             .open_bi()
             .await
             .context("Failed to initialize events stream")?;
 
-        // Send version to server, who will close the connection if they can't support it.
+        // Exchange versions with the server; either side closes the connection
+        // if it can't support the other's version.
+        let mut event_bytes = Vec::with_capacity(1024);
         transport::send_version(&mut events_send).await?;
+        transport::recv_version(&mut events_recv, &mut event_bytes).await?;
 
-        let (mut bulk_send, bulk_recv) = conn
+        let (mut bulk_send, mut bulk_recv) = conn
             .open_bi()
             .await
             .context("Failed to initialize bulk stream")?;
 
-        // Send version to server again via the bulk stream.
+        // Exchange versions again via the bulk stream.
         // This is required in order to initialize the bulk stream,
         // otherwise the server times out waiting for the stream to open.
         transport::send_version(&mut bulk_send).await?;
+        transport::recv_version(&mut bulk_recv, &mut event_bytes).await?;
 
         Ok((
             Self {
@@ -105,7 +109,7 @@ impl Connection {
                 bulk_recv,
                 max_clipboard_size_bytes,
                 active: false,
-                event_bytes: Vec::with_capacity(1024),
+                event_bytes,
                 bulk_recv_bytes: Vec::with_capacity(65536),
                 incoming_clipboard_data: None,
                 waiting_clipboard_fetch: None,

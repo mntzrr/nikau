@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use tokio::sync::{mpsc, watch};
@@ -79,6 +80,13 @@ pub async fn run_server_connections_loop(
 ) -> Result<()> {
     let server_endpoint = transport::build_server(listen_addr, cert_verifier, mode)
         .context("Failed to set up server endpoint")?;
+    // How long a single connection handshake may take before it is dropped.
+    // Local mode must outlast the interactive approval prompt (60s), which runs
+    // inside the handshake. Www mode never prompts, so it can be much stricter.
+    let handshake_timeout = match mode {
+        transport::NetworkMode::Local => Duration::from_secs(75),
+        transport::NetworkMode::Www => Duration::from_secs(15),
+    };
     // Task launcher for new client connections
     loop {
         let conn = server_endpoint.accept().await;
@@ -86,49 +94,78 @@ pub async fn run_server_connections_loop(
             Some(c) => c,
             None => bail!("Server endpoint is closed, exiting server"),
         };
-        let rotation_tx_cpy = rotation_tx.clone();
-        let fingerprint_cpy = fingerprint.clone();
-        // In theory, we could break off into a spawned process here, but let's try to avoid
-        // fingerprint mismatch issues by waiting to spawn until we've gotten the fingerprint.
-        match conn.await {
-            Ok(conn) => {
-                let remote_addr = conn.remote_address();
-                // HACK: This is retrieving the fingerprint stored by approval.rs
-                // See more about this in approval.rs.
-                match fingerprint_cpy.lock() {
-                    Ok(mut opt) => {
-                        if let Some(fingerprint) = opt.take() {
-                            debug!("Got fingerprint: {}", fingerprint);
-                            // Now that we have extracted the client cert fingerprint, spawn.
-                            task::spawn(async move {
-                                if let Err(e) =
-                                    handle_connection(conn, fingerprint, rotation_tx_cpy.clone(), max_clipboard_size_bytes)
-                                    .await
-                                {
-                                    // Always try to remove the client from rotation, even if it wasn't added yet.
-                                    if let Err(e) = rotation_tx_cpy
-                                        .send(rotation::RotationEvent::RemoveClient(remote_addr))
-                                        .await {
-                                            error!("Failed to send remove client event: {:?}", e);
-                                        };
-                                    error!("Client connection error: {:?}", e);
-                                }
-                            });
-                        } else {
-                            // In theory, this could happen if there was a race which approval.rs cleaned up.
-                            // Drop the connection and make the client try again.
-                            warn!("BUG: Fingerprint missing for new connection, dropping connection so that client can retry");
-                        }
-                    },
-                    Err(e) => {
-                        error!("Failed to lock fingerprint for new connection: {}", e);
-                    },
-                };
+        let remote_addr = conn.remote_address();
+        if mode == transport::NetworkMode::Www && !conn.remote_address_validated() {
+            // On the public internet, require the client to validate its source
+            // address via a QUIC retry packet before we spend resources on a
+            // TLS handshake (spoofed-source amplification/DoS mitigation).
+            // The client will come back with a validated address.
+            if let Err(e) = conn.retry() {
+                error!("Failed to request address validation from {}: {}", remote_addr, e);
             }
+            continue;
+        }
+        let connecting = match conn.accept() {
+            Ok(connecting) => connecting,
             Err(e) => {
                 error!("Client failed to connect: {}", e);
+                continue;
             }
-        }
+        };
+        let rotation_tx_cpy = rotation_tx.clone();
+        let fingerprint_cpy = fingerprint.clone();
+        // Complete the handshake in a spawned task so that a slow or stuck peer
+        // cannot block the accept loop for other clients. We still wait to spawn
+        // the connection task until we've gotten the fingerprint, to avoid
+        // fingerprint mismatch issues.
+        task::spawn(async move {
+            let conn = match tokio::time::timeout(handshake_timeout, connecting).await {
+                Ok(Ok(conn)) => conn,
+                Ok(Err(e)) => {
+                    error!("Client failed to connect: {}", e);
+                    return;
+                }
+                Err(_) => {
+                    warn!(
+                        "Dropping connection from {}: handshake timed out after {}s",
+                        remote_addr,
+                        handshake_timeout.as_secs()
+                    );
+                    return;
+                }
+            };
+            // HACK: This is retrieving the fingerprint stored by approval.rs
+            // See more about this in approval.rs.
+            match fingerprint_cpy.lock() {
+                Ok(mut opt) => {
+                    if let Some(fingerprint) = opt.take() {
+                        debug!("Got fingerprint: {}", fingerprint);
+                        // Now that we have extracted the client cert fingerprint, spawn.
+                        task::spawn(async move {
+                            if let Err(e) =
+                                handle_connection(conn, fingerprint, rotation_tx_cpy.clone(), max_clipboard_size_bytes)
+                                .await
+                            {
+                                // Always try to remove the client from rotation, even if it wasn't added yet.
+                                if let Err(e) = rotation_tx_cpy
+                                    .send(rotation::RotationEvent::RemoveClient(remote_addr))
+                                    .await {
+                                        error!("Failed to send remove client event: {:?}", e);
+                                    };
+                                error!("Client connection error: {:?}", e);
+                            }
+                        });
+                    } else {
+                        // In theory, this could happen if there was a race which approval.rs cleaned up.
+                        // Drop the connection and make the client try again.
+                        warn!("BUG: Fingerprint missing for new connection, dropping connection so that client can retry");
+                    }
+                },
+                Err(e) => {
+                    error!("Failed to lock fingerprint for new connection: {}", e);
+                },
+            };
+        });
     }
 }
 
@@ -138,7 +175,7 @@ async fn handle_connection(
     rotation_tx: mpsc::Sender<rotation::RotationEvent>,
     max_clipboard_size_bytes: u64,
 ) -> Result<()> {
-    let (events_send, mut events_recv) = conn
+    let (mut events_send, mut events_recv) = conn
         .accept_bi()
         .await
         .context("Failed to initialize events stream")?;
@@ -147,9 +184,11 @@ async fn handle_connection(
     // Future versions could follow the version message with more data. We ignore/discard it here.
     let mut event_bytes = Vec::with_capacity(1024);
     transport::recv_version(&mut events_recv, &mut event_bytes).await?;
+    // Reply with our own version so that the client can diagnose a mismatch too.
+    transport::send_version(&mut events_send).await?;
 
     // Start second stream for bulk messages
-    let (bulk_send, mut bulk_recv) = conn
+    let (mut bulk_send, mut bulk_recv) = conn
         .accept_bi()
         .await
         .context("Failed to initialize bulk stream")?;
@@ -158,6 +197,7 @@ async fn handle_connection(
     // Sending some data is required to initialize the bulk stream, so let's just repeat ourselves.
     // Maybe we'll want to have different per-stream versions someday? Probably not.
     transport::recv_version(&mut bulk_recv, &mut event_bytes).await?;
+    transport::send_version(&mut bulk_send).await?;
 
     // Add client to the rotation after a successful init
     rotation_tx
