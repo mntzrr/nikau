@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use evdev::{Device, EventStream, KeyCode};
-use tokio::sync::broadcast;
+use tokio::sync::watch;
 use tokio::task;
 use tracing::debug;
 
@@ -19,7 +19,7 @@ pub trait DeviceHandler: Send + 'static {
     fn handle_device_stream(
         &mut self,
         events: EventStream,
-        grab_rx: Option<broadcast::Receiver<device::GrabEvent>>,
+        grab_rx: Option<watch::Receiver<device::GrabEvent>>,
         device_info: util::DeviceInfo,
     ) -> Result<DeviceHandle>;
 }
@@ -38,7 +38,7 @@ pub struct DeviceHandles<H: DeviceHandler> {
     handler: H,
 
     /// Method for subscribing devices to grab events
-    grab_tx: broadcast::Sender<device::GrabEvent>,
+    grab_tx: watch::Sender<device::GrabEvent>,
 
     /// All distinct keys used in client switch key combos, for internal accounting.
     all_combo_keys: HashSet<KeyCode>,
@@ -47,7 +47,7 @@ pub struct DeviceHandles<H: DeviceHandler> {
 impl<H: DeviceHandler> DeviceHandles<H> {
     pub fn new(
         handler: H,
-        grab_tx: broadcast::Sender<device::GrabEvent>,
+        grab_tx: watch::Sender<device::GrabEvent>,
         all_combo_keys: HashSet<KeyCode>,
     ) -> DeviceHandles<H> {
         DeviceHandles {

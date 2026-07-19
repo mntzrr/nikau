@@ -8,7 +8,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use regex::Regex;
 use signal_hook::{consts::signal, iterator::Signals};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{mpsc, watch as watchchan};
 use tokio::{runtime, task, time};
 use tracing::{error, info, warn};
 
@@ -256,7 +256,7 @@ async fn server(
     let signals = Signals::new([signal::SIGUSR1, signal::SIGUSR2])?;
     std::thread::spawn(|| handle_signals(signals, event_tx2));
 
-    let (grab_tx, _grab_rx) = broadcast::channel(1);
+    let (grab_tx, _grab_rx) = watchchan::channel(nikau::device::GrabEvent::Ungrab);
     let grab_tx2 = grab_tx.clone();
 
     let key_combos = shortcut::parse_key_combos(keys_next, keys_prev, keys_goto)?;

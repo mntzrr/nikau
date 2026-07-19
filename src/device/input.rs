@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Result};
 use evdev::{EventStream, EventType, KeyCode};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{mpsc, watch};
 use tokio::task;
 use tokio::time;
 use tracing::{debug, info, trace, warn};
@@ -11,6 +11,9 @@ use tracing::{debug, info, trace, warn};
 use crate::device::handles::{DeviceHandle, DeviceHandler};
 use crate::device::{shortcut, util, Event, GrabEvent, InputBatch};
 use crate::msgs::event;
+
+/// How long to wait before retrying a failed device grab/ungrab.
+const GRAB_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
 pub struct InputHandler {
     config: HandlerConfig,
@@ -79,7 +82,7 @@ impl DeviceHandler for InputHandler {
     fn handle_device_stream(
         &mut self,
         mut stream: EventStream,
-        grab_rx: Option<broadcast::Receiver<GrabEvent>>,
+        grab_rx: Option<watch::Receiver<GrabEvent>>,
         mut device_info: util::DeviceInfo,
     ) -> Result<DeviceHandle> {
         let config = self.config.clone();
@@ -97,10 +100,11 @@ impl DeviceHandler for InputHandler {
                 // server) may hold the grab temporarily, so keep retrying.
                 while !handle_grab_event(&mut stream, &mut device_info, GrabEvent::Grab) {
                     warn!(
-                        "Failed to grab {:?}, retrying in 5s",
-                        stream.device().name().unwrap_or("(Unnamed device)")
+                        "Failed to grab {:?}, retrying in {:?}",
+                        stream.device().name().unwrap_or("(Unnamed device)"),
+                        GRAB_RETRY_INTERVAL
                     );
-                    time::sleep(Duration::from_secs(5)).await;
+                    time::sleep(GRAB_RETRY_INTERVAL).await;
                 }
                 read_device_events(&mut stream, config, device_info).await
             })
@@ -146,11 +150,25 @@ async fn read_device_events(
 async fn read_device_or_grab_events(
     stream: &mut EventStream,
     mut handler_config: HandlerConfig,
-    mut grab_rx: broadcast::Receiver<GrabEvent>,
+    mut grab_rx: watch::Receiver<GrabEvent>,
     mut device_info: util::DeviceInfo,
 ) {
     let mut input_events_batch = Vec::new();
     let mut combo_events_batch = Vec::new();
+    // Apply the current grab state right away: this device may have been (re)added
+    // while a client is already active, so we can't wait for the next switch.
+    // If the (un)grab fails, keep retrying in the background instead of giving up
+    // on the device: without the grab, input leaks to the local system while also
+    // being routed onwards by nikau.
+    let mut retry_interval = time::interval(GRAB_RETRY_INTERVAL);
+    let mut pending_grab = {
+        let current = *grab_rx.borrow_and_update();
+        if handle_grab_event(stream, &mut device_info, current) {
+            None
+        } else {
+            Some(current)
+        }
+    };
     loop {
         tokio::select! {
             event = stream.next_event() => {
@@ -170,22 +188,34 @@ async fn read_device_or_grab_events(
                     }
                 }
             }
-            grab = grab_rx.recv() => {
-                match grab {
-                    Ok(grab) => {
-                        if !handle_grab_event(stream, &mut device_info, grab) {
-                            return
-                        }
-                    }
-                    Err(e) => {
-                        // Shouldn't happen, but don't want to loop forever if it does
-                        warn!(
-                            "Error on grab broadcast for {:?}, removing device: {}",
-                            stream.device().name(),
-                            e
-                        );
-                        return
-                    }
+            grab = grab_rx.changed() => {
+                if let Err(e) = grab {
+                    // Sender was dropped, shouldn't happen: exit to avoid looping forever.
+                    warn!(
+                        "Error on grab watch for {:?}, removing device: {}",
+                        stream.device().name(),
+                        e
+                    );
+                    return
+                }
+                let current = *grab_rx.borrow_and_update();
+                pending_grab = if handle_grab_event(stream, &mut device_info, current) {
+                    None
+                } else {
+                    Some(current)
+                };
+            }
+            _ = retry_interval.tick(), if pending_grab.is_some() => {
+                let current = pending_grab.unwrap();
+                if handle_grab_event(stream, &mut device_info, current) {
+                    pending_grab = None;
+                } else {
+                    warn!(
+                        "Retrying {:?} for {:?} in {:?}",
+                        current,
+                        stream.device().name(),
+                        GRAB_RETRY_INTERVAL
+                    );
                 }
             }
         }

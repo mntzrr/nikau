@@ -7,7 +7,7 @@ pub mod watch;
 
 use crate::msgs::event;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub enum GrabEvent {
     Grab,
     Ungrab,

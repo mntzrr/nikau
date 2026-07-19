@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, bail, Context, Result};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{mpsc, watch};
 use tokio::task;
 use tracing::{debug, error, trace, warn};
 
@@ -17,7 +17,7 @@ use crate::rotation;
 pub async fn run_server_events_loop<O: output::OutputHandler>(
     config_dir: PathBuf,
     mut event_rx: mpsc::Receiver<Event>,
-    grab_tx: broadcast::Sender<GrabEvent>,
+    grab_tx: watch::Sender<GrabEvent>,
     output_handler: O,
     max_clipboard_size_bytes: u64,
     max_uncompressed_size_bytes: u64,

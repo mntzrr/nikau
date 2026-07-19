@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use quinn::SendStream;
 use serde::Serialize;
-use tokio::sync::{broadcast, oneshot};
+use tokio::sync::{oneshot, watch};
 use tracing::{debug, info, trace, warn};
 
 use crate::clipboard::{data, server};
@@ -127,7 +127,7 @@ pub struct ClipboardSendContentArgs {
 }
 
 pub struct Rotation<O: device::output::OutputHandler> {
-    grab_tx: broadcast::Sender<device::GrabEvent>,
+    grab_tx: watch::Sender<device::GrabEvent>,
     output_handler: O,
     clients: Vec<ClientInfo>,
     /// Use the endpoint, not the fingerprint, to uniquely identify clients.
@@ -146,7 +146,7 @@ pub struct Rotation<O: device::output::OutputHandler> {
 
 impl<O: device::output::OutputHandler> Rotation<O> {
     pub async fn new(
-        grab_tx: broadcast::Sender<device::GrabEvent>,
+        grab_tx: watch::Sender<device::GrabEvent>,
         output_handler: O,
         local_clipboard: Option<server::LocalClipboard>,
     ) -> Result<Self> {
