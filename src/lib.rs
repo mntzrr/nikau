@@ -1,6 +1,7 @@
 pub mod client;
 pub mod clipboard;
 pub mod device;
+pub mod discovery;
 pub mod logging;
 pub mod msgs;
 pub mod network;

@@ -22,6 +22,7 @@ evdev = { version = "0.13", features = ["tokio"] }
 hex = "0.4"
 home = "0.5"
 libc = "0.2"
+mdns-sd = "0.11"
 nonblock = "0.2"
 notify = "8.2"
 pem = "3.0"

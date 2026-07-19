@@ -14,7 +14,7 @@ use tracing::{error, info, warn};
 
 use nikau::device::{handles, input, output, shortcut, watch, Event};
 use nikau::network::{approval, transport::NetworkMode};
-use nikau::{client, clipboard, logging, rotation, server};
+use nikau::{client, clipboard, discovery, logging, rotation, server};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -86,8 +86,8 @@ struct ServerArgs {
 
 #[derive(Args)]
 struct ClientArgs {
-    /// Server hostname or IP
-    host: String,
+    /// Server hostname or IP. If omitted, the server is discovered on the local network via mDNS.
+    host: Option<String>,
 
     /// Server port
     #[arg(short = 'p', long, default_value_t = 1213, value_name = "port")]
@@ -173,18 +173,27 @@ fn main() -> Result<()> {
             })?;
         }
         Commands::Client(args) => {
-            let connect_addr: SocketAddr = if let Ok(host_ip) = args.host.parse::<IpAddr>() {
-                // It's an IP.
-                SocketAddr::new(host_ip, args.port)
-            } else {
-                // Its a hostname? Try resolving it.
-                let mut socket_addrs = format!("{}:{}", args.host, args.port)
-                    .to_socket_addrs()
-                    .map_err(|e| anyhow!("Failed to resolve --host={}: {:?}", args.host, e))?;
-                if let Some(first) = socket_addrs.next() {
-                    first
-                } else {
-                    bail!("Provided --host={} didn't resolve to an IP", args.host);
+            let connect_addr: SocketAddr = match &args.host {
+                Some(host) => {
+                    if let Ok(host_ip) = host.parse::<IpAddr>() {
+                        // It's an IP.
+                        SocketAddr::new(host_ip, args.port)
+                    } else {
+                        // Its a hostname? Try resolving it.
+                        let mut socket_addrs = format!("{}:{}", host, args.port)
+                            .to_socket_addrs()
+                            .map_err(|e| anyhow!("Failed to resolve --host={}: {:?}", host, e))?;
+                        if let Some(first) = socket_addrs.next() {
+                            first
+                        } else {
+                            bail!("Provided --host={} didn't resolve to an IP", host);
+                        }
+                    }
+                }
+                None => {
+                    // Discover the server on the local network via mDNS.
+                    info!("No server host provided, discovering via mDNS...");
+                    rt.block_on(async { discovery::discover_server(None).await })?
                 }
             };
             let verifier = approval::NikauCertVerification::new(
@@ -293,6 +302,15 @@ async fn server(
         )
         .await
     });
+
+    // Advertise the server on the local network so that clients can discover it.
+    let _mdns_registration = match discovery::DiscoveryRegistration::register(listen_addr.port()) {
+        Ok(r) => Some(r),
+        Err(e) => {
+            warn!("Failed to register mDNS service for LAN discovery: {}", e);
+            None
+        }
+    };
 
     info!("Listening for clients: {}", listen_addr);
     if let Some(exit_secs) = exit_secs {
