@@ -147,14 +147,34 @@ pub async fn discover_server(timeout: Option<Duration>) -> Result<SocketAddr> {
     }
 }
 
-/// Picks an address from a resolved service, preferring IPv4 for compatibility.
+/// Picks an address from a resolved service. A server may advertise several
+/// addresses (LAN, docker bridges, VPN, ...), so prefer the one sharing the
+/// longest bit prefix with one of our own interface addresses (i.e. most
+/// likely on our subnet), falling back to any IPv4 address, then any address.
 fn resolved_addr(resolved: &ServiceInfo) -> Option<SocketAddr> {
     let addresses = resolved.get_addresses();
-    addresses
+    let local_ips = local_ipv4_addrs().unwrap_or_default();
+    let best = addresses
         .iter()
-        .find(|ip| ip.is_ipv4())
-        .or_else(|| addresses.iter().next())
-        .map(|ip| SocketAddr::new(*ip, resolved.get_port()))
+        .filter(|ip| ip.is_ipv4())
+        .max_by_key(|ip| {
+            local_ips
+                .iter()
+                .map(|local| common_prefix_len(ip, local))
+                .max()
+                .unwrap_or(0)
+        })
+        .or_else(|| addresses.iter().next());
+    best.map(|ip| SocketAddr::new(*ip, resolved.get_port()))
+}
+
+/// Length of the common leading bit prefix of two IP addresses (0 across families).
+fn common_prefix_len(a: &IpAddr, b: &IpAddr) -> u32 {
+    match (a, b) {
+        (IpAddr::V4(a), IpAddr::V4(b)) => (a.to_bits() ^ b.to_bits()).leading_zeros(),
+        (IpAddr::V6(a), IpAddr::V6(b)) => (a.to_bits() ^ b.to_bits()).leading_zeros(),
+        _ => 0,
+    }
 }
 
 /// Picks the addresses to advertise for a server listening on `listen_ip`.
@@ -199,8 +219,9 @@ fn local_ipv4_addrs() -> Result<Vec<IpAddr>> {
                 && (*ifa.ifa_addr).sa_family == libc::AF_INET as libc::sa_family_t
             {
                 let sin = &*(ifa.ifa_addr as *const libc::sockaddr_in);
-                // s_addr is a u32 in network byte order.
-                let ip = std::net::Ipv4Addr::from(sin.sin_addr.s_addr.to_be_bytes());
+                // s_addr is stored in network byte order; to_ne_bytes() preserves
+                // the in-memory octet order on any host endianness.
+                let ip = std::net::Ipv4Addr::from(sin.sin_addr.s_addr.to_ne_bytes());
                 let ip = IpAddr::V4(ip);
                 if !ip.is_loopback()
                     && !ip.is_unspecified()
@@ -233,4 +254,39 @@ fn get_local_ip() -> Result<IpAddr> {
     let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
     socket.connect("8.8.8.8:80")?;
     Ok(socket.local_addr()?.ip())
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefix_len_prefers_same_subnet() {
+        let server: IpAddr = "192.168.1.187".parse().unwrap();
+        let same_lan: IpAddr = "192.168.1.23".parse().unwrap();
+        let docker: IpAddr = "172.17.0.1".parse().unwrap();
+        assert_eq!(common_prefix_len(&server, &same_lan), 24);
+        assert!(common_prefix_len(&server, &docker) < 24);
+        // Cross-family is always 0
+        let v6: IpAddr = "fe80::1".parse().unwrap();
+        assert_eq!(common_prefix_len(&server, &v6), 0);
+    }
+
+    #[test]
+    fn enumerated_addrs_are_usable_and_not_byte_swapped() {
+        let ips = local_ipv4_addrs().expect("failed to enumerate interfaces");
+        println!("local ipv4 addrs: {:?}", ips);
+        assert!(!ips.is_empty(), "expected at least one usable IPv4 address");
+        for ip in &ips {
+            assert!(ip.is_ipv4());
+            assert!(!ip.is_loopback(), "loopback leaked into advertisement list");
+            assert!(!ip.is_unspecified());
+            if let IpAddr::V4(v4) = ip {
+                assert!(!v4.is_link_local(), "link-local leaked into advertisement list");
+                // Byte-reversal guard: 1.0.0.127 is 127.0.0.1 with swapped octets
+                assert_ne!(v4.octets()[0], 1, "suspicious byte-swapped address: {}", v4);
+            }
+        }
+    }
 }
