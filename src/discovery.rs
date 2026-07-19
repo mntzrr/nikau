@@ -86,19 +86,40 @@ pub async fn discover_server(timeout: Option<Duration>) -> Result<SocketAddr> {
         .context("Failed to browse for Nikau servers")?;
 
     let deadline = Instant::now() + timeout;
+    // Addresses of the first-discovered server instance, merged across resolve
+    // events: mDNS delivers a service's addresses incrementally, so the first
+    // event rarely carries them all. Only after a grace period do we pick one.
+    let mut first_instance: Option<String> = None;
+    let mut grace_deadline: Option<Instant> = None;
+    let mut instance_port = 0u16;
+    let mut instance_addrs: Vec<IpAddr> = Vec::new();
+    let mut other_servers: Vec<String> = Vec::new();
 
     loop {
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .ok_or_else(|| anyhow!("{}", DISCOVERY_TIMEOUT_HINT))?;
+        // Once the first instance has resolved, only wait out the grace period
+        // for the rest of its addresses (and other servers) to arrive.
+        let wait = match grace_deadline {
+            Some(grace) => match grace.checked_duration_since(Instant::now()) {
+                Some(grace_remaining) => grace_remaining,
+                None => break,
+            },
+            None => remaining,
+        };
 
-        let event = match tokio::time::timeout(remaining, receiver.recv_async()).await {
+        let event = match tokio::time::timeout(wait, receiver.recv_async()).await {
             Ok(Ok(event)) => event,
             Ok(Err(e)) => {
                 let _ = daemon.shutdown();
                 bail!("mDNS browse error: {}", e);
             }
             Err(_) => {
+                if grace_deadline.is_some() {
+                    // Grace period expired with no more events
+                    break;
+                }
                 let _ = daemon.shutdown();
                 bail!("{}", DISCOVERY_TIMEOUT_HINT);
             }
@@ -106,55 +127,65 @@ pub async fn discover_server(timeout: Option<Duration>) -> Result<SocketAddr> {
 
         match event {
             ServiceEvent::ServiceResolved(resolved) => {
-                let addr = match resolved_addr(&resolved) {
-                    Some(addr) => addr,
+                let fullname = resolved.get_fullname().to_string();
+                match &first_instance {
                     None => {
-                        debug!("Resolved service has no addresses, continuing to browse");
-                        continue;
-                    }
-                };
-                info!("Discovered Nikau server: {}", addr);
-                // Keep listening briefly so that additional servers on the network
-                // don't get silently hidden by first-wins.
-                let mut extra: Vec<SocketAddr> = Vec::new();
-                while let Ok(Ok(event)) =
-                    tokio::time::timeout(EXTRA_RESOLVE_GRACE, receiver.recv_async()).await
-                {
-                    if let ServiceEvent::ServiceResolved(other) = event {
-                        if let Some(other_addr) = resolved_addr(&other) {
-                            if other_addr != addr && !extra.contains(&other_addr) {
-                                extra.push(other_addr);
+                        info!("Discovered Nikau server: {}", fullname);
+                        first_instance = Some(fullname);
+                        grace_deadline = Some(Instant::now() + EXTRA_RESOLVE_GRACE);
+                        instance_port = resolved.get_port();
+                        for ip in resolved.get_addresses().iter() {
+                            if !instance_addrs.contains(ip) {
+                                instance_addrs.push(*ip);
                             }
                         }
                     }
+                    Some(current) if *current == fullname => {
+                        // More addresses for the same server arrived
+                        for ip in resolved.get_addresses().iter() {
+                            if !instance_addrs.contains(ip) {
+                                instance_addrs.push(*ip);
+                            }
+                        }
+                    }
+                    Some(_) => {
+                        if !other_servers.contains(&fullname) {
+                            other_servers.push(fullname);
+                        }
+                    }
                 }
-                if !extra.is_empty() {
-                    let mut all = vec![addr.to_string()];
-                    all.extend(extra.iter().map(|a| a.to_string()));
-                    info!(
-                        "Multiple Nikau servers discovered: {}; connecting to the first: {}",
-                        all.join(", "),
-                        addr
-                    );
-                }
-                let _ = daemon.shutdown();
-                return Ok(addr);
             }
             other => {
                 debug!("mDNS event: {:?}", other);
             }
         }
     }
+
+    if !other_servers.is_empty() {
+        info!(
+            "Multiple Nikau servers discovered: {}; connecting to: {}",
+            other_servers.join(", "),
+            first_instance.as_deref().unwrap_or("<unknown>")
+        );
+    }
+    let addr = pick_addr(&instance_addrs, instance_port)
+        .ok_or_else(|| anyhow!("Discovered server has no addresses"))?;
+    info!(
+        "Discovered {} address(es) for server, connecting to: {}",
+        instance_addrs.len(),
+        addr
+    );
+    let _ = daemon.shutdown();
+    Ok(addr)
 }
 
-/// Picks an address from a resolved service. A server may advertise several
-/// addresses (LAN, docker bridges, VPN, ...), so prefer the one sharing the
-/// longest bit prefix with one of our own interface addresses (i.e. most
-/// likely on our subnet), falling back to any IPv4 address, then any address.
-fn resolved_addr(resolved: &ServiceInfo) -> Option<SocketAddr> {
-    let addresses = resolved.get_addresses();
+/// Picks an address to connect to. A server may advertise several addresses
+/// (LAN, docker bridges, VPN, ...), so prefer the one sharing the longest bit
+/// prefix with one of our own interface addresses (i.e. most likely on our
+/// subnet), falling back to any IPv4 address, then any address.
+fn pick_addr(addrs: &[IpAddr], port: u16) -> Option<SocketAddr> {
     let local_ips = local_ipv4_addrs().unwrap_or_default();
-    let best = addresses
+    addrs
         .iter()
         .filter(|ip| ip.is_ipv4())
         .max_by_key(|ip| {
@@ -164,8 +195,8 @@ fn resolved_addr(resolved: &ServiceInfo) -> Option<SocketAddr> {
                 .max()
                 .unwrap_or(0)
         })
-        .or_else(|| addresses.iter().next());
-    best.map(|ip| SocketAddr::new(*ip, resolved.get_port()))
+        .or_else(|| addrs.iter().next())
+        .map(|ip| SocketAddr::new(*ip, port))
 }
 
 /// Length of the common leading bit prefix of two IP addresses (0 across families).
@@ -204,9 +235,23 @@ fn advertise_ips(listen_ip: IpAddr) -> Result<Vec<IpAddr>> {
     }
 }
 
-/// Enumerates this host's non-loopback, non-link-local IPv4 addresses.
+/// Interface name prefixes for virtual overlay links (docker/VM bridges, VPN
+/// tunnels). LAN peers can't reach these addresses — and docker bridges have
+/// the SAME default IPs on every host, which poisons subnet prefix matching.
+const VIRTUAL_IFACE_PREFIXES: &[&str] = &[
+    "docker", "br-", "veth", "virbr", "vnet", "tun", "tap", "wg", "tailscale", "zt", "mullvad",
+];
+
+fn is_virtual_iface(name: &str) -> bool {
+    VIRTUAL_IFACE_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+}
+
+/// Enumerates this host's non-loopback, non-link-local IPv4 addresses,
+/// preferring physical/primary interfaces over virtual overlay ones.
 fn local_ipv4_addrs() -> Result<Vec<IpAddr>> {
-    let mut ips: Vec<IpAddr> = Vec::new();
+    let mut ips: Vec<(String, IpAddr)> = Vec::new();
     unsafe {
         let mut ifaddrs: *mut libc::ifaddrs = std::ptr::null_mut();
         if libc::getifaddrs(&mut ifaddrs) != 0 {
@@ -218,6 +263,13 @@ fn local_ipv4_addrs() -> Result<Vec<IpAddr>> {
             if !ifa.ifa_addr.is_null()
                 && (*ifa.ifa_addr).sa_family == libc::AF_INET as libc::sa_family_t
             {
+                let name = if ifa.ifa_name.is_null() {
+                    String::new()
+                } else {
+                    std::ffi::CStr::from_ptr(ifa.ifa_name)
+                        .to_string_lossy()
+                        .to_string()
+                };
                 let sin = &*(ifa.ifa_addr as *const libc::sockaddr_in);
                 // s_addr is stored in network byte order; to_ne_bytes() preserves
                 // the in-memory octet order on any host endianness.
@@ -226,16 +278,26 @@ fn local_ipv4_addrs() -> Result<Vec<IpAddr>> {
                 if !ip.is_loopback()
                     && !ip.is_unspecified()
                     && !matches!(ip, IpAddr::V4(v4) if v4.is_link_local())
-                    && !ips.contains(&ip)
+                    && !ips.iter().any(|(_, existing)| *existing == ip)
                 {
-                    ips.push(ip);
+                    ips.push((name, ip));
                 }
             }
             current = ifa.ifa_next;
         }
         libc::freeifaddrs(ifaddrs);
     }
-    Ok(ips)
+    // Drop virtual overlay interfaces; if that would leave nothing (e.g. the
+    // machine's only link really is a bridge/VPN), keep the unfiltered list.
+    let physical: Vec<IpAddr> = ips
+        .iter()
+        .filter(|(name, _)| !is_virtual_iface(name))
+        .map(|(_, ip)| *ip)
+        .collect();
+    if !physical.is_empty() {
+        return Ok(physical);
+    }
+    Ok(ips.into_iter().map(|(_, ip)| ip).collect())
 }
 
 /// Returns the machine hostname.
@@ -274,6 +336,16 @@ mod tests {
     }
 
     #[test]
+    fn virtual_ifaces_are_detected() {
+        for name in ["docker0", "br-9f1c2e", "veth1234", "virbr0", "tun0", "wg0", "tailscale0", "mullvad"] {
+            assert!(is_virtual_iface(name), "{} should be treated as virtual", name);
+        }
+        for name in ["eth0", "enp3s0", "wlan0", "wlp2s0", "eno1"] {
+            assert!(!is_virtual_iface(name), "{} should be treated as physical", name);
+        }
+    }
+
+    #[test]
     fn enumerated_addrs_are_usable_and_not_byte_swapped() {
         let ips = local_ipv4_addrs().expect("failed to enumerate interfaces");
         println!("local ipv4 addrs: {:?}", ips);
@@ -286,6 +358,12 @@ mod tests {
                 assert!(!v4.is_link_local(), "link-local leaked into advertisement list");
                 // Byte-reversal guard: 1.0.0.127 is 127.0.0.1 with swapped octets
                 assert_ne!(v4.octets()[0], 1, "suspicious byte-swapped address: {}", v4);
+                // Docker's default bridges have the same address on every host;
+                // advertising them makes discovery picks useless.
+                assert!(
+                    !v4.octets().starts_with(&[172, 17]) && !v4.octets().starts_with(&[172, 18]),
+                    "docker bridge leaked into advertisement list: {}", v4
+                );
             }
         }
     }
