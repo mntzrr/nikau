@@ -218,7 +218,7 @@ async fn server(
 - The server may need to be run as root with 'sudo -E nikau server ...' to allow creating virtual devices.
 - Enable uinput and/or evdev in the kernel, check for /dev/uinput and /dev/input/")?;
 
-    let (event_tx, event_rx): (mpsc::Sender<Event>, mpsc::Receiver<Event>) = mpsc::channel(32);
+    let (event_tx, event_rx): (mpsc::Sender<Event>, mpsc::Receiver<Event>) = mpsc::channel(256);
 
     let event_tx2 = event_tx.clone();
     let signals = Signals::new([signal::SIGUSR1, signal::SIGUSR2])?;
@@ -242,7 +242,7 @@ async fn server(
             )
     });
 
-    let (rotation_tx, rotation_rx) = mpsc::channel::<rotation::RotationEvent>(32);
+    let (rotation_tx, rotation_rx) = mpsc::channel::<rotation::RotationEvent>(256);
     let rotation_tx2 = rotation_tx.clone();
     let server_events_handle = task::spawn(async move {
         server::run_server_events_loop(

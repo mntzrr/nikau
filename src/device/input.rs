@@ -186,10 +186,10 @@ async fn handle_input_event(
     input_events_batch: &mut Vec<event::InputEvent>,
     combo_events_batch: &mut Vec<Event>,
 ) {
-    // 100 limit: Just in case, avoid the risk of collecting queued events forever.
+    // 32 limit: Just in case, avoid the risk of collecting queued events forever.
     //            In practice we should only be collecting 2-3 events between syncs.
     if event.event_type() == EventType::SYNCHRONIZATION
-        || (input_events_batch.len() + combo_events_batch.len()) >= 100
+        || (input_events_batch.len() + combo_events_batch.len()) >= 32
     {
         // Flush events to be handled by the client as a group
         if !input_events_batch.is_empty() {

@@ -1,13 +1,14 @@
 use std::net::SocketAddr;
+use std::os::fd::FromRawFd;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use quinn::{
-    ClientConfig, Endpoint, IdleTimeout, RecvStream, SendStream, ServerConfig, TransportConfig,
-    VarInt,
+    congestion::BbrConfig, AckFrequencyConfig, ClientConfig, Endpoint, EndpointConfig, IdleTimeout,
+    RecvStream, SendStream, ServerConfig, TransportConfig, VarInt,
 };
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 use crate::msgs::shared;
 use crate::network::approval;
@@ -20,14 +21,32 @@ const KEEPALIVE_MILLIS: u64 = 2000;
 /// Keep this very short so that connection problems get resolved relatively quickly.
 const TIMEOUT_MILLIS: u32 = 3000;
 
+/// Socket buffer size for the QUIC UDP socket. Larger buffers reduce the chance of
+/// kernel drops during event bursts.
+const SOCKET_BUF_SIZE: libc::c_int = 2 * 1024 * 1024;
+
+/// Linux socket priority for interactive/low-latency traffic.
+const SOCKET_PRIORITY: libc::c_int = 6;
+
+/// DSCP EF (Expedited Forwarding) TOS value, for low-latency forwarding.
+const SOCKET_TOS: libc::c_int = 0xb8;
+
 pub fn build_client(
     bind_addr: &SocketAddr,
     cert_verifier: Arc<approval::NikauCertVerification<'static>>,
 ) -> Result<quinn::Endpoint> {
+    let socket = create_socket(*bind_addr, false)
+        .context("Failed to create client UDP socket")?;
+    let runtime = quinn::default_runtime()
+        .ok_or_else(|| anyhow::anyhow!("no async runtime found"))?;
+
     let mut client_config = ClientConfig::new(approval::rustls_client_config(cert_verifier)?);
     client_config.transport_config(transport_config());
 
-    let mut client_endpoint = Endpoint::client(*bind_addr)?;
+    let mut client_endpoint =
+        Endpoint::new(EndpointConfig::default(), None, socket, runtime).with_context(|| {
+            format!("Failed to bind client endpoint to {}", bind_addr)
+        })?;
     client_endpoint.set_default_client_config(client_config);
     Ok(client_endpoint)
 }
@@ -36,21 +55,175 @@ pub fn build_server(
     listen_addr: &SocketAddr,
     cert_verifier: Arc<approval::NikauCertVerification<'static>>,
 ) -> Result<quinn::Endpoint> {
+    let socket = create_socket(*listen_addr, true)
+        .context("Failed to create server UDP socket")?;
+    let runtime = quinn::default_runtime()
+        .ok_or_else(|| anyhow::anyhow!("no async runtime found"))?;
+
     let mut server_config =
         ServerConfig::with_crypto(approval::rustls_server_config(cert_verifier)?);
-    server_config
-        .transport_config(transport_config());
-    Endpoint::server(server_config, *listen_addr)
-        .with_context(|| format!("Failed to listen on {}", listen_addr))
+    server_config.transport_config(transport_config());
+
+    Endpoint::new(
+        EndpointConfig::default(),
+        Some(server_config),
+        socket,
+        runtime,
+    )
+    .with_context(|| format!("Failed to listen on {}", listen_addr))
+}
+
+fn create_socket(bind_addr: SocketAddr, is_server: bool) -> Result<std::net::UdpSocket> {
+    let domain = if bind_addr.is_ipv6() {
+        libc::AF_INET6
+    } else {
+        libc::AF_INET
+    };
+    let fd = unsafe { libc::socket(domain, libc::SOCK_DGRAM, 0) };
+    if fd < 0 {
+        bail!("Failed to create UDP socket: {}", std::io::Error::last_os_error());
+    }
+
+    // Helper that closes the fd on error paths before we wrap it in UdpSocket.
+    let close_fd = || unsafe { libc::close(fd) };
+
+    let apply_socket_opts = || -> Result<()> {
+        if is_server {
+            let one: libc::c_int = 1;
+            setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, &one)?;
+        }
+
+        setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            &SOCKET_BUF_SIZE,
+        )?;
+        setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &SOCKET_BUF_SIZE,
+        )?;
+
+        #[cfg(target_os = "linux")]
+        {
+            setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_PRIORITY,
+                &SOCKET_PRIORITY,
+            )?;
+
+            let (level, opt) = if bind_addr.is_ipv6() {
+                (libc::IPPROTO_IPV6, libc::IPV6_TCLASS)
+            } else {
+                (libc::IPPROTO_IP, libc::IP_TOS)
+            };
+            setsockopt(fd, level, opt, &SOCKET_TOS)?;
+        }
+        Ok(())
+    };
+
+    if let Err(e) = apply_socket_opts() {
+        close_fd();
+        return Err(e);
+    }
+
+    // Bind using libc so that we keep control of the fd until the UdpSocket takes ownership.
+    let bind_ret = match bind_addr {
+        SocketAddr::V4(v4) => {
+            let sa = libc::sockaddr_in {
+                sin_family: libc::AF_INET as libc::sa_family_t,
+                sin_port: v4.port().to_be(),
+                sin_addr: libc::in_addr {
+                    s_addr: u32::from_be_bytes(v4.ip().octets()),
+                },
+                sin_zero: [0; 8],
+            };
+            unsafe {
+                libc::bind(
+                    fd,
+                    &sa as *const _ as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                )
+            }
+        }
+        SocketAddr::V6(v6) => {
+            let sa = libc::sockaddr_in6 {
+                sin6_family: libc::AF_INET6 as libc::sa_family_t,
+                sin6_port: v6.port().to_be(),
+                sin6_flowinfo: v6.flowinfo(),
+                sin6_addr: libc::in6_addr {
+                    s6_addr: v6.ip().octets(),
+                },
+                sin6_scope_id: v6.scope_id(),
+            };
+            unsafe {
+                libc::bind(
+                    fd,
+                    &sa as *const _ as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                )
+            }
+        }
+    };
+    if bind_ret != 0 {
+        close_fd();
+        bail!(
+            "Failed to bind UDP socket to {}: {}",
+            bind_addr,
+            std::io::Error::last_os_error()
+        );
+    }
+
+    // Now hand ownership to std::net::UdpSocket.
+    Ok(unsafe { std::net::UdpSocket::from_raw_fd(fd) })
+}
+
+fn setsockopt<T>(
+    fd: libc::c_int,
+    level: libc::c_int,
+    opt: libc::c_int,
+    value: &T,
+) -> Result<()> {
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            level,
+            opt,
+            value as *const _ as *const libc::c_void,
+            std::mem::size_of::<T>() as libc::socklen_t,
+        )
+    };
+    if ret != 0 {
+        let err = std::io::Error::last_os_error();
+        warn!("setsockopt(level={}, opt={}) failed: {}", level, opt, err);
+    }
+    Ok(())
 }
 
 fn transport_config() -> Arc<TransportConfig> {
     let mut transport_config = TransportConfig::default();
+
+    // Ask the peer to acknowledge every ack-eliciting packet with minimal delay.
+    // This is a small increase in ACK traffic but significantly speeds up loss
+    // detection on low-RTT local networks.
+    let mut ack_config = AckFrequencyConfig::default();
+    ack_config.ack_eliciting_threshold(VarInt::from_u32(0));
+    ack_config.max_ack_delay(Some(Duration::from_micros(100)));
+    ack_config.reordering_threshold(VarInt::from_u32(0));
+
     transport_config
         //.max_concurrent_bidi_streams(2_u8.into()) // events + bulk
         .max_concurrent_uni_streams(0_u8.into()) // we only use bidirectional streams
         .keep_alive_interval(Some(Duration::from_millis(KEEPALIVE_MILLIS)))
-        .max_idle_timeout(Some(IdleTimeout::from(VarInt::from_u32(TIMEOUT_MILLIS))));
+        .max_idle_timeout(Some(IdleTimeout::from(VarInt::from_u32(TIMEOUT_MILLIS))))
+        // Local-network tuning: assume ~1 ms RTT rather than the default 333 ms.
+        .initial_rtt(Duration::from_millis(1))
+        // BBR reacts faster and keeps smaller queues than Cubic on low-loss local links.
+        .congestion_controller_factory(Arc::new(BbrConfig::default()))
+        .ack_frequency_config(Some(ack_config));
     Arc::new(transport_config)
 }
 
