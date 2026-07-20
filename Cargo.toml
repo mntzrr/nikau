@@ -41,7 +41,6 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2.4"
-usb-gadget = { version = "1.1", features = ["tokio"] }
 walkdir = "2.3"
 x11rb-async = { version = "0.13", features = ["xfixes"] }
 zip = { version = "8.5", default-features = false, features = ["zstd"] }
