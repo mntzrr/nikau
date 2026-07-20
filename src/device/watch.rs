@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use evdev::{Device, EventType, KeyCode};
@@ -81,7 +82,7 @@ async fn handle_device_event<H: handles::DeviceHandler>(
             if !compatible_path(&event.path) {
                 return;
             }
-            match Device::open(&event.path) {
+            match open_device_with_retry(&event.path).await {
                 Ok(device) => {
                     let device_info = util::DeviceInfo::new(&device, false);
                     if !compatible_device(&device, &event.path, &device_info) {
@@ -114,6 +115,27 @@ async fn handle_device_event<H: handles::DeviceHandler>(
                 info!("Removing device: {}", event.path.to_string_lossy());
                 device_handle.handle.abort();
             }
+        }
+    }
+}
+
+/// Opens a newly-appeared device node, tolerating the window between the
+/// kernel creating the node (root:root 0600) and udev applying group/mode
+/// permissions (root:input 0660). Without this, devices appearing while we
+/// run — hot-plugged keyboards, but also the virtual devices of any nikau
+/// instance (including our own) — are skipped with a spurious Permission
+/// denied and, in the hot-plug case, never picked up at all.
+async fn open_device_with_retry(path: &Path) -> std::io::Result<Device> {
+    const MAX_ATTEMPTS: u32 = 20;
+    const RETRY_DELAY: Duration = Duration::from_millis(50);
+    let mut attempt = 0;
+    loop {
+        match Device::open(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && attempt < MAX_ATTEMPTS => {
+                attempt += 1;
+                tokio::time::sleep(RETRY_DELAY).await;
+            }
+            result => return result,
         }
     }
 }
