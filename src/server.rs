@@ -212,7 +212,7 @@ async fn handle_connection(
         .await?;
 
     let mut bulk_bytes = Vec::with_capacity(65536);
-    let mut incoming_clipboard_data: Option<(ClipboardData, Option<SocketAddr>)> =
+    let mut incoming_clipboard_data: Option<(ClipboardData, Option<SocketAddr>, u64)> =
         None;
     loop {
         tokio::select! {
@@ -230,7 +230,7 @@ async fn handle_connection(
                     .context("Lost client bulk connection")?
                     .context("Client closed bulk connection")?;
                 trace!("Received {} bytes from bulk stream: {:X?}", resp.bytes.len(), &*resp.bytes);
-                if let Some((c, request_client)) = &mut incoming_clipboard_data {
+                if let Some((c, request_client, request_id)) = &mut incoming_clipboard_data {
                     if c.remaining_bytes >= resp.bytes.len() {
                         // Chunk is all clipboard data.
                         c.bytes.extend_from_slice(&resp.bytes);
@@ -247,6 +247,7 @@ async fn handle_connection(
                         rotation_tx.send(rotation::RotationEvent::ClipboardSendContent(rotation::ClipboardSendContentArgs{
                             data_source: conn.remote_address(),
                             request_client: *request_client,
+                            request_id: *request_id,
                             data: incoming_clipboard_data.take().unwrap().0
                         })).await?;
                     }
@@ -329,7 +330,7 @@ async fn handle_bulk_messages(
     rotation_tx: &mpsc::Sender<rotation::RotationEvent>,
     bytes: &mut Vec<u8>,
     max_clipboard_size_bytes: u64,
-) -> Result<Option<(ClipboardData, Option<SocketAddr>)>> {
+) -> Result<Option<(ClipboardData, Option<SocketAddr>, u64)>> {
     let mut offset = 0;
     let bytes_len = bytes.len();
     while offset < bytes_len {
@@ -362,6 +363,7 @@ async fn handle_bulk_messages(
                                 c.max_size_bytes,
                                 max_clipboard_size_bytes,
                             ),
+                            request_id: Some(c.request_id),
                         },
                     ))
                     .await?;
@@ -385,6 +387,7 @@ async fn handle_bulk_messages(
                             rotation::ClipboardSendContentArgs {
                                 data_source: source,
                                 request_client: c.request_client,
+                                request_id: c.request_id,
                                 data: ClipboardData {
                                     requested_type: c.requested_type.to_string(),
                                     data_type: c.data_type.map(|t| t.to_string()),
@@ -408,6 +411,7 @@ async fn handle_bulk_messages(
                             remaining_bytes: c.content_len_bytes as usize - resp_remainder.len(),
                         },
                         c.request_client,
+                        c.request_id,
                     );
                     // All bytes were consumed (into the pending clipboard data).
                     bytes.clear();

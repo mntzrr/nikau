@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -45,12 +46,17 @@ struct Connection {
     /// Reusable buffer for receiving bulk data (clipboards).
     bulk_recv_bytes: Vec<u8>,
 
-    /// Accumulator of raw clipboard data streamed from the server.
+    /// Accumulator of raw clipboard data streamed from the server, plus the fetch
+    /// it answers (None when the header's request_id was unknown: the payload is
+    /// still swallowed to keep stream framing, but never delivered to a fetch).
     /// Cleared when the clipboard data has all been received.
-    incoming_clipboard_data: Option<data::ClipboardData>,
+    incoming_clipboard_data: Option<(data::ClipboardData, Option<data::ClipboardFetch>)>,
 
-    /// Pending fetch request for this connection, if any.
-    waiting_clipboard_fetch: Option<data::ClipboardFetch>,
+    /// Pending fetch requests for this connection, keyed by request id.
+    pending_fetches: HashMap<u64, data::ClipboardFetch>,
+    /// Next fetch request id. Wrapping is fine: ids only need to correlate a
+    /// reply with its request, not resist adversaries.
+    next_fetch_id: u64,
 }
 
 impl Connection {
@@ -112,7 +118,8 @@ impl Connection {
                 event_bytes,
                 bulk_recv_bytes: Vec::with_capacity(65536),
                 incoming_clipboard_data: None,
-                waiting_clipboard_fetch: None,
+                pending_fetches: HashMap::new(),
+                next_fetch_id: 0,
             },
             connect_time,
         ))
@@ -131,9 +138,12 @@ impl Connection {
                 local_fetch_request = local_clipboard.clipboard_fetch_rx.recv() => {
                     // Send fetch request to server, keep request and its nested oneshot for handling the response
                     if let Some(local_fetch_request) = local_fetch_request {
+                        let request_id = self.next_fetch_id;
+                        self.next_fetch_id = self.next_fetch_id.wrapping_add(1);
                         let msg = bulk::ClientBulk::ClipboardRequest(bulk::ClientClipboardRequest{
                             requested_type: &local_fetch_request.requested_type,
                             max_size_bytes: self.max_clipboard_size_bytes as u64,
+                            request_id,
                         });
                         let serializedmsg = postcard::to_stdvec_cobs(&msg)
                             .map_err(|e| anyhow!("Failed to serialize clipboard request message: {:?}", e))?;
@@ -142,9 +152,9 @@ impl Connection {
                             serializedmsg.len(),
                             &serializedmsg
                         );
-                        if let Some(old_fetch_request) = &self.waiting_clipboard_fetch.replace(local_fetch_request) {
-                            warn!("Overwriting prior fetch request for type={}", old_fetch_request.requested_type);
-                        }
+                        // Drop fetches whose requester already timed out, then track this one.
+                        self.pending_fetches.retain(|_, f| !f.fetch_result_tx.is_closed());
+                        self.pending_fetches.insert(request_id, local_fetch_request);
                         self.bulk_send.write_all(&serializedmsg)
                             .await
                             .context("Failed to send clipboard request message")?;
@@ -318,7 +328,7 @@ impl Connection {
         local_clipboard: Option<&mut client::LocalClipboard>,
         resp_bytes: Bytes,
     ) -> Result<()> {
-        if let Some(c) = &mut self.incoming_clipboard_data {
+        if let Some((c, _fetch)) = &mut self.incoming_clipboard_data {
             // Clipboard data streaming is in progress. The message should be raw clipboard data.
             if c.remaining_bytes >= resp_bytes.len() {
                 // This chunk should entirely be raw clipboard data.
@@ -337,18 +347,17 @@ impl Connection {
             if c.remaining_bytes == 0 {
                 // Raw clipboard data has all been accumulated, send it to the pending fetch.
                 // Pass ownership of the data to the writer and clear local state.
-                if let Some(waiting_clipboard_fetch) = self.waiting_clipboard_fetch.take() {
-                    let d = self
-                        .incoming_clipboard_data
-                        .take()
-                        .expect("Just checked data was present");
+                let (d, fetch) = self
+                    .incoming_clipboard_data
+                    .take()
+                    .expect("Just checked data was present");
+                if let Some(waiting_clipboard_fetch) = fetch {
                     if let Err(_d_again) = waiting_clipboard_fetch.fetch_result_tx.send(d) {
-                        warn!("Discarding clipboard data from server: no pending clipboard request (timed out?)");
+                        warn!("Discarding clipboard data from server: the requesting paste already timed out");
                     }
-                } else {
-                    warn!("Discarding unexpected clipboard data from server: no clipboard request is pending");
-                    self.incoming_clipboard_data = None;
                 }
+                // fetch=None: unknown request_id (debug-logged when the header arrived);
+                // the payload was only swallowed to keep the stream framed.
             }
 
             if !self.bulk_recv_bytes.is_empty() {
@@ -374,7 +383,7 @@ impl Connection {
     async fn handle_bulk_messages(
         &mut self,
         mut local_clipboard: Option<&mut client::LocalClipboard>,
-    ) -> Result<Option<data::ClipboardData>> {
+    ) -> Result<Option<(data::ClipboardData, Option<data::ClipboardFetch>)>> {
         let mut offset = 0;
         let bytes_len = self.bulk_recv_bytes.len();
         while offset < bytes_len {
@@ -404,14 +413,21 @@ impl Connection {
                         }
                     };
                     // Read the clipboard data from the local application.
-                    // On read failure, reply with an empty header so that the requester just sets nothing.
-                    let (local_clipboard_data, data_type) = match local_clipboard
-                        .read(c.requested_type, c.max_size_bytes, c.request_client)
-                        .await
+                    // On read failure or timeout, reply with an empty header so that the requester just sets nothing.
+                    // The read must always answer within the 5s fetch timeout on the requester side.
+                    let (local_clipboard_data, data_type) = match tokio::time::timeout(
+                        Duration::from_secs(4),
+                        local_clipboard.read(c.requested_type, c.max_size_bytes, c.request_client),
+                    )
+                    .await
                     {
-                        Ok(result) => result,
-                        Err(e) => {
+                        Ok(Ok(result)) => result,
+                        Ok(Err(e)) => {
                             warn!("Failed to read local clipboard of type {}: {:?}", c.requested_type, e);
+                            (Vec::new(), None)
+                        }
+                        Err(_) => {
+                            warn!("Timed out after 4s reading local clipboard of type {}", c.requested_type);
                             (Vec::new(), None)
                         }
                     };
@@ -420,6 +436,7 @@ impl Connection {
                         data_type: data_type.as_ref().map(|t| t.as_str()),
                         content_len_bytes: local_clipboard_data.len() as u64,
                         request_client: c.request_client,
+                        request_id: c.request_id,
                     });
                     let serializedmsg = postcard::to_stdvec_cobs(&msg).map_err(|e| {
                         anyhow!("Failed to serialize clipboard types message: {:?}", e)
@@ -449,10 +466,18 @@ impl Connection {
                             c.content_len_bytes,
                             self.max_clipboard_size_bytes
                         );
-                    } else if c.content_len_bytes as usize <= resp_remainder.len() {
+                    }
+                    // Correlate the response with its request. A response with an unknown
+                    // id (e.g. its fetch already timed out) is still consumed to keep the
+                    // stream framed, but is never delivered to a different fetch.
+                    let fetch = self.pending_fetches.remove(&c.request_id);
+                    if fetch.is_none() {
+                        debug!("Discarding clipboard data for unknown request_id={}", c.request_id);
+                    }
+                    if c.content_len_bytes as usize <= resp_remainder.len() {
                         // The clipboard content fits fully within resp_remainder, send it to the pending fetch.
                         // Mark content as consumed and continue looping in case another message follows.
-                        if let Some(waiting_clipboard_fetch) = self.waiting_clipboard_fetch.take() {
+                        if let Some(waiting_clipboard_fetch) = fetch {
                             let mut bytes = Vec::with_capacity(c.content_len_bytes as usize);
                             bytes
                                 .extend_from_slice(&resp_remainder[..c.content_len_bytes as usize]);
@@ -463,10 +488,8 @@ impl Connection {
                                 remaining_bytes: 0,
                             };
                             if let Err(_d_again) = waiting_clipboard_fetch.fetch_result_tx.send(d) {
-                                warn!("Discarding clipboard data from server: no pending clipboard request (previous request timed out?)");
+                                warn!("Discarding clipboard data from server: the requesting paste already timed out");
                             }
-                        } else {
-                            warn!("Ignoring unexpected clipboard data from server: no clipboard request is pending");
                         }
                         offset += c.content_len_bytes as usize;
                     } else {
@@ -482,7 +505,7 @@ impl Connection {
                         };
                         // All bytes were consumed (into the pending clipboard data).
                         self.bulk_recv_bytes.clear();
-                        return Ok(Some(d));
+                        return Ok(Some((d, fetch)));
                     }
                 }
             }

@@ -122,6 +122,8 @@ impl LocalClipboard {
                                 request_source: rotation::ClipboardRequestSource::Local(fetch_request.fetch_result_tx),
                                 requested_type: fetch_request.requested_type,
                                 max_size_bytes: max_clipboard_size_bytes,
+                                // The server assigns an id while routing the request.
+                                request_id: None,
                             });
                             if let Err(e) = rotation_tx.send(event).await {
                                 error!("Failed to queue local clipboard request event: {:?}", e);

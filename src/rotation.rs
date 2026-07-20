@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
@@ -94,6 +95,10 @@ pub struct ClipboardRequestContentArgs {
     pub request_source: ClipboardRequestSource,
     pub requested_type: String,
     pub max_size_bytes: u64,
+    /// The request id assigned by the originator.
+    /// None when the request originates locally on the server (an id is assigned
+    /// during routing); Some(id) when forwarded from a client's request.
+    pub request_id: Option<u64>,
 }
 
 /// Pointer to where clipboard data should be sent once it's been fetched
@@ -123,6 +128,8 @@ pub struct ClipboardSendContentArgs {
     pub data_source: SocketAddr,
     /// Copied from the ServerClipboardRequest, indicates where the clipboard data should be sent
     pub request_client: Option<SocketAddr>,
+    /// Copied from the ClientClipboardHeader, correlates the content with its request
+    pub request_id: u64,
     pub data: data::ClipboardData,
 }
 
@@ -139,8 +146,11 @@ pub struct Rotation<O: device::output::OutputHandler> {
     clipboard_target: Option<ClipboardTarget>,
     /// Access to the local system clipboard on the server.
     local_clipboard: Option<server::LocalClipboard>,
-    /// Pending fetch request for the local server clipboard.
-    waiting_clipboard_tx: Option<oneshot::Sender<data::ClipboardData>>,
+    /// Pending clipboard fetches for the local server machine, keyed by request id.
+    pending_clipboard_requests: HashMap<u64, oneshot::Sender<data::ClipboardData>>,
+    /// Next server-originated clipboard request id. Wrapping is fine: ids only
+    /// need to correlate a reply with its request, not resist adversaries.
+    next_clipboard_request_id: u64,
 }
 
 impl<O: device::output::OutputHandler> Rotation<O> {
@@ -157,7 +167,8 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             removed_current_client: None,
             clipboard_target: None,
             local_clipboard,
-            waiting_clipboard_tx: None,
+            pending_clipboard_requests: HashMap::new(),
+            next_clipboard_request_id: 0,
         })
     }
 
@@ -189,6 +200,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                         args.request_source,
                         &args.requested_type,
                         args.max_size_bytes,
+                        args.request_id,
                     )
                     .await
                 {
@@ -200,6 +212,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                     .clipboard_send_content_from_client(
                         args.data_source,
                         args.request_client,
+                        args.request_id,
                         args.data,
                     )
                     .await
@@ -412,6 +425,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         request_source: ClipboardRequestSource,
         requested_type: &str,
         max_size_bytes: u64,
+        request_id: Option<u64>,
     ) -> Result<()> {
         debug!("Handling clipboard content request from source={} with max_size_bytes={} for requested type {}: have {:?}", request_source, max_size_bytes, requested_type, self.clipboard_target);
 
@@ -436,35 +450,77 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         }
 
         // Figure out where the requested clipboard can be found
-        if let Some(clipboard_source) = &target.source.clone() {
-            // A client has the clipboard: route request to them
-            let msg = bulk::ServerBulk::ClipboardRequest(bulk::ServerClipboardRequest {
-                requested_type,
-                max_size_bytes,
-                request_client: if let ClipboardRequestSource::Remote(client) = &request_source {
-                    Some(*client)
-                } else {
-                    None
-                },
-            });
+        if let Some(clipboard_source) = target.source.clone() {
+            // A client has the clipboard: route request to them.
+            // Request ids correlate a response with its request. A plain
+            // per-originator counter is enough: the goal is
+            // accidental-misdelivery protection, not adversarial resistance.
+            let (msg, local_request_id, on_behalf_of) = match request_source {
+                ClipboardRequestSource::Local(waiting_clipboard_tx) => {
+                    // Clipboard request is from the server itself.
+                    // Keep the oneshot for replying later, keyed by a fresh request id.
+                    let request_id = self.next_clipboard_request_id;
+                    self.next_clipboard_request_id =
+                        self.next_clipboard_request_id.wrapping_add(1);
+                    // Drop entries whose requester already gave up (timed out).
+                    self.pending_clipboard_requests
+                        .retain(|_, tx| !tx.is_closed());
+                    self.pending_clipboard_requests
+                        .insert(request_id, waiting_clipboard_tx);
+                    let msg = bulk::ServerBulk::ClipboardRequest(bulk::ServerClipboardRequest {
+                        requested_type,
+                        max_size_bytes,
+                        request_client: None,
+                        request_id,
+                    });
+                    (msg, Some(request_id), None)
+                }
+                ClipboardRequestSource::Remote(client) => {
+                    // Clipboard request is from a client: forward its request id.
+                    let request_id = match request_id {
+                        Some(id) => id,
+                        None => {
+                            warn!("Clipboard request from {} is missing a request_id, using 0", client);
+                            0
+                        }
+                    };
+                    let msg = bulk::ServerBulk::ClipboardRequest(bulk::ServerClipboardRequest {
+                        requested_type,
+                        max_size_bytes,
+                        request_client: Some(client),
+                        request_id,
+                    });
+                    (msg, None, Some(client))
+                }
+            };
             debug!(
                 "Requesting clipboard data with type {} from {}{}",
                 requested_type,
                 clipboard_source,
-                if let ClipboardRequestSource::Remote(client) = &request_source {
-                    format!(" on behalf of {}", client)
-                } else {
-                    "".to_string()
+                match on_behalf_of {
+                    Some(client) => format!(" on behalf of {}", client),
+                    None => "".to_string(),
                 }
             );
-
-            // If the request is coming from the server itself, keep the oneshot for handling the reply.
-            match request_source {
-                ClipboardRequestSource::Local(waiting_clipboard_tx) => {
-                    // Clipboard request is from the server itself.
-                    // Keep the oneshot for replying later.
-                    self.waiting_clipboard_tx = Some(waiting_clipboard_tx);
-                    if !(self.send_bulk(clipboard_source, msg, None).await?) {
+            let sent = self.send_bulk(&clipboard_source, msg, None).await;
+            if let Some(request_id) = local_request_id {
+                if !matches!(sent, Ok(true)) {
+                    // The request couldn't be sent: drop the pending fetch so that
+                    // it fails fast instead of waiting out the 5s timeout.
+                    self.pending_clipboard_requests.remove(&request_id);
+                }
+            }
+            match sent {
+                Ok(true) => {}
+                Ok(false) => {
+                    if let Some(client) = on_behalf_of {
+                        warn!(
+                            "Unable to send request for clipboard to {} on behalf of {}: not connected (clients: {:?})",
+                            clipboard_source,
+                            client,
+                            self.clients,
+                        );
+                    } else {
                         warn!(
                             "Unable to send request for clipboard to {}: not connected (clients: {:?})",
                             clipboard_source,
@@ -472,18 +528,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                         );
                     }
                 }
-                ClipboardRequestSource::Remote(client) => {
-                    // Clipboard request is from a client.
-                    // Route the request to the clipboard owner.
-                    if !(self.send_bulk(clipboard_source, msg, None).await?) {
-                        warn!(
-                            "Unable to send request for clipboard to {} on behalf of {}: not connected (clients: {:?})",
-                            clipboard_source,
-                            client,
-                            self.clients,
-                        );
-                    }
-                }
+                Err(e) => return Err(e),
             }
             Ok(())
         } else {
@@ -499,6 +544,14 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                     target
                 );
             };
+            // Echo the requesting client's id back in the response.
+            let request_id = match request_id {
+                Some(id) => id,
+                None => {
+                    warn!("Clipboard request from {} is missing a request_id, using 0", request_client);
+                    0
+                }
+            };
             let local_clipboard = match &mut self.local_clipboard {
                 Some(c) => c,
                 None => bail!("Fetch for local server clipboard but server clipboard is disabled"),
@@ -511,6 +564,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                 requested_type,
                 data_type: data_type.as_ref().map(|t| t.as_str()),
                 content_len_bytes: content.len() as u64,
+                request_id,
             });
             if !(self.send_bulk(request_client, msg, Some(content)).await?) {
                 warn!(
@@ -529,6 +583,8 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         data_source: SocketAddr,
         // Copied from the ServerClipboardRequest, indicates where the clipboard data should be sent
         request_client: Option<SocketAddr>,
+        // Copied from the ClientClipboardHeader, correlates the content with its request
+        request_id: u64,
         data: data::ClipboardData,
     ) -> Result<()> {
         debug!(
@@ -545,6 +601,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                 requested_type: &data.requested_type,
                 data_type: data.data_type.as_ref().map(|t| t.as_str()),
                 content_len_bytes: data.bytes.len() as u64,
+                request_id,
             });
             // If send_bulk returns Ok(false), the client wasn't found. In that case just ignore the request,
             // don't try to reset state since the client should already be removed.
@@ -556,15 +613,22 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                       data_source, request_client, self.clients);
             }
         } else {
-            // Send to local X11 clipboard, using response oneshot that we'd gotten with the request.
-            if let Some(waiting_clipboard_tx) = self.waiting_clipboard_tx.take() {
-                if let Err(_d_again) = waiting_clipboard_tx.send(data) {
-                    warn!("Discarding clipboard data from client: no pending clipboard request (previous request timed out?)");
+            // Send to local X11 clipboard, completing the pending fetch that made the request.
+            match self.pending_clipboard_requests.remove(&request_id) {
+                Some(waiting_clipboard_tx) => {
+                    if let Err(_d_again) = waiting_clipboard_tx.send(data) {
+                        warn!(
+                            "Discarding clipboard data for request_id={}: the requester already gave up (timed out?)",
+                            request_id
+                        );
+                    }
                 }
-            } else {
-                warn!(
-                    "Ignoring unexpected clipboard data from client: no clipboard fetch is pending"
-                );
+                None => {
+                    warn!(
+                        "Discarding clipboard data for unknown/timed-out request_id={}",
+                        request_id
+                    );
+                }
             }
         }
         Ok(())
