@@ -42,12 +42,12 @@ cd nikau
 Or install directly with cargo:
 
 ```bash
-cargo install --path .
+cargo install --path . --root ~/.local
 ```
 
 The repository includes `.cargo/config.toml` with `target-cpu=native`, so the binary is automatically optimized for the machine you build it on.
 
-After installation, the binary is available as `nikau` in your cargo bin directory (usually `~/.cargo/bin/nikau`).
+After installation, the binary is available as `nikau` in `~/.local/bin`, which is in `PATH` by default on systemd-based distros and in most shell profiles (unlike `~/.cargo/bin`). If your shell doesn't find it, add `export PATH="$HOME/.local/bin:$PATH"` to your shell's rc file.
 
 ### If you want a portable binary
 

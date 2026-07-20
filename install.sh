@@ -34,10 +34,30 @@ devices, run: sudo usermod -aG input $USER  (then log out and back in)
 EOF
 fi
 
+# Install into ~/.local/bin: present in PATH by default on systemd-based
+# distros and in most shell profiles, unlike ~/.cargo/bin.
 echo "Installing nikau..."
-cargo install --path . --force
+cargo install --path . --root "$HOME/.local" --force
 
-echo "Installed nikau to $(which nikau)"
+# Remove a stale copy from the previous cargo-bin install location, so it
+# can't shadow the new one depending on PATH order.
+if [ -f "$HOME/.cargo/bin/nikau" ]; then
+    echo "Removing previous install at $HOME/.cargo/bin/nikau"
+    rm -f "$HOME/.cargo/bin/nikau"
+fi
+
+echo "Installed nikau to $(which nikau 2>/dev/null || echo "$HOME/.local/bin/nikau")"
+case ":$PATH:" in
+    *":$HOME/.local/bin:"*) ;;
+    *)
+        cat >&2 <<'EOF'
+warning: ~/.local/bin is not in your PATH. Add it with:
+    echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc   # or ~/.bashrc
+then restart your shell.
+EOF
+        ;;
+esac
+
 echo
 echo "Run server: nikau server"
 echo "Run client: nikau client [host]"
