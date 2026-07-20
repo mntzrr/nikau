@@ -31,7 +31,7 @@ pub struct DeviceHandles<H: DeviceHandler> {
     always_grabbed_devices: HashMap<PathBuf, DeviceHandle>,
 
     /// Devices which don't support one or more key combo keys, such as mice.
-    /// When the local server is the active target, nikau ungrabs the device and allows
+    /// When the local server is the active target, monux ungrabs the device and allows
     /// its input to pass through directly.
     toggled_devices: HashMap<PathBuf, DeviceHandle>,
 
@@ -71,7 +71,7 @@ impl<H: DeviceHandler> DeviceHandles<H> {
         }
         if supports_any_keys {
             // This device supports one or more keys configured for client switch key combinations.
-            // We should grab/route its input via nikau so that we can omit keypresses from the combos.
+            // We should grab/route its input via monux so that we can omit keypresses from the combos.
             let join_handle = self.handler.handle_device_stream(
                 start_device_stream(device, path)?,
                 None,

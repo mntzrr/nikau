@@ -617,7 +617,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             let request_client = if let ClipboardRequestSource::Remote(c) = &request_source {
                 c
             } else {
-                // The nikau server process is getting asked for a clipboard from itself.
+                // The monux server process is getting asked for a clipboard from itself.
                 // The server should only locally serve clipboards from remote clients, but there isn't one.
                 // This may mean that the serving client disconnected, but we should have cleared the status.
                 bail!(
@@ -1271,7 +1271,7 @@ mod tests {
     use super::*;
 
     fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("nikau-test-{}-{}", std::process::id(), name));
+        let dir = std::env::temp_dir().join(format!("monux-test-{}-{}", std::process::id(), name));
         fs::create_dir_all(&dir).unwrap();
         dir
     }

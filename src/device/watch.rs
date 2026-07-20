@@ -136,7 +136,7 @@ fn compatible_device(d: &Device, path: &Path, device_info: &util::DeviceInfo) ->
     if let Some(name) = d.name() {
         if name.contains(output::VIRTUAL_DEVICE_NAME_PREFIX) {
             trace!(
-                "Ignoring nikau virtual device to avoid loopback problem: {} @ {}",
+                "Ignoring monux virtual device to avoid loopback problem: {} @ {}",
                 name,
                 path.display()
             );

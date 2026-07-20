@@ -96,7 +96,7 @@ impl DeviceHandler for InputHandler {
             task::spawn(async move {
                 // Don't read events until the grab succeeds. Without the grab,
                 // events would leak through to the local system while also being
-                // routed onwards by nikau. Another process (e.g. a stale nikau
+                // routed onwards by monux. Another process (e.g. a stale monux
                 // server) may hold the grab temporarily, so keep retrying.
                 while !handle_grab_event(&mut stream, &mut device_info, GrabEvent::Grab) {
                     warn!(
@@ -159,7 +159,7 @@ async fn read_device_or_grab_events(
     // while a client is already active, so we can't wait for the next switch.
     // If the (un)grab fails, keep retrying in the background instead of giving up
     // on the device: without the grab, input leaks to the local system while also
-    // being routed onwards by nikau.
+    // being routed onwards by monux.
     let mut retry_interval = time::interval(GRAB_RETRY_INTERVAL);
     let mut pending_grab = {
         let current = *grab_rx.borrow_and_update();

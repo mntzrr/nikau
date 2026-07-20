@@ -5,8 +5,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use tracing::{debug, info, warn};
 
-/// mDNS service type used to advertise and discover Nikau servers on the local network.
-const SERVICE_TYPE: &str = "_nikau._udp.local.";
+/// mDNS service type used to advertise and discover Monux servers on the local network.
+const SERVICE_TYPE: &str = "_monux._udp.local.";
 
 /// Default time to wait for a server to be discovered on the LAN.
 const DEFAULT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -16,20 +16,20 @@ const DEFAULT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const EXTRA_RESOLVE_GRACE: Duration = Duration::from_millis(500);
 
 /// Error message when no server is discovered within the timeout.
-const DISCOVERY_TIMEOUT_HINT: &str = "Discovery timeout: no Nikau server found on the local network. Check that: the server is running, both machines are on the same subnet, and no firewall is blocking UDP port 5353 (mDNS). Alternatively, connect directly with 'nikau client <ip>'";
+const DISCOVERY_TIMEOUT_HINT: &str = "Discovery timeout: no Monux server found on the local network. Check that: the server is running, both machines are on the same subnet, and no firewall is blocking UDP port 5353 (mDNS). Alternatively, connect directly with 'monux client <ip>'";
 
-/// Registers a Nikau server on the local network via mDNS.
+/// Registers a Monux server on the local network via mDNS.
 pub struct DiscoveryRegistration {
     daemon: ServiceDaemon,
     fullname: String,
 }
 
 impl DiscoveryRegistration {
-    /// Advertises a Nikau server listening on the given address.
+    /// Advertises a Monux server listening on the given address.
     pub fn register(listen_addr: SocketAddr) -> Result<Self> {
         let hostname = get_hostname().context("Failed to get hostname")?;
         let instance_name = if hostname.is_empty() {
-            "nikau".to_string()
+            "monux".to_string()
         } else {
             hostname
         };
@@ -76,7 +76,7 @@ impl Drop for DiscoveryRegistration {
     }
 }
 
-/// Discovers a Nikau server on the local network via mDNS.
+/// Discovers a Monux server on the local network via mDNS.
 /// Returns the first server found, along with its advertised instance name
 /// (normally the server's hostname) for display in e.g. approval prompts.
 pub async fn discover_server(timeout: Option<Duration>) -> Result<(SocketAddr, String)> {
@@ -84,7 +84,7 @@ pub async fn discover_server(timeout: Option<Duration>) -> Result<(SocketAddr, S
     let daemon = ServiceDaemon::new().context("Failed to create mDNS daemon")?;
     let receiver = daemon
         .browse(SERVICE_TYPE)
-        .context("Failed to browse for Nikau servers")?;
+        .context("Failed to browse for Monux servers")?;
 
     let deadline = Instant::now() + timeout;
     // Addresses of the first-discovered server instance, merged across resolve
@@ -131,7 +131,7 @@ pub async fn discover_server(timeout: Option<Duration>) -> Result<(SocketAddr, S
                 let fullname = resolved.get_fullname().to_string();
                 match &first_instance {
                     None => {
-                        info!("Discovered Nikau server: {}", fullname);
+                        info!("Discovered Monux server: {}", fullname);
                         first_instance = Some(fullname);
                         grace_deadline = Some(Instant::now() + EXTRA_RESOLVE_GRACE);
                         instance_port = resolved.get_port();
@@ -164,7 +164,7 @@ pub async fn discover_server(timeout: Option<Duration>) -> Result<(SocketAddr, S
 
     if !other_servers.is_empty() {
         info!(
-            "Multiple Nikau servers discovered: {}; connecting to: {}",
+            "Multiple Monux servers discovered: {}; connecting to: {}",
             other_servers.join(", "),
             first_instance.as_deref().unwrap_or("<unknown>")
         );

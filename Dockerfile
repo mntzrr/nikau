@@ -8,8 +8,8 @@ RUN apt-get update \
   && rm -rf /var/lib/apt/lists /var/cache/apt/archives \
   && cargo --version
 
-COPY . /nikau
-RUN cd /nikau && cargo build --release
+COPY . /monux
+RUN cd /monux && cargo build --release
 
 # Release image: copy executable from builder
 # Debian version needs to match builder image to avoid linker issues.
@@ -18,5 +18,5 @@ FROM docker.io/library/debian:bookworm-slim
 RUN apt-get update \
   && apt-get clean \
   && rm -rf /var/lib/apt/lists /var/cache/apt/archives
-COPY --from=0 /nikau/target/release/nikau /nikau
-RUN chmod +x /nikau && /nikau --version
+COPY --from=0 /monux/target/release/monux /monux
+RUN chmod +x /monux && /monux --version

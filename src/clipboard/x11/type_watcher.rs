@@ -31,10 +31,10 @@ impl ClipboardTypeWatcher {
                         // - we store the advertised types to X11 for future pastes into other applications
                         // - we see the update and think that another application took over the clipboard
                         if types.is_empty()
-                            || types.contains(&shared::NIKAU_REMOTE_TARGET.to_string())
+                            || types.contains(&shared::MONUX_REMOTE_TARGET.to_string())
                         {
                             debug!(
-                                "Ignoring clipboard update that's empty or from nikau itself: {:?}",
+                                "Ignoring clipboard update that's empty or from monux itself: {:?}",
                                 types
                             );
                             continue;

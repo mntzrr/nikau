@@ -44,7 +44,7 @@ impl LocalClipboard {
             }
             Err(e) => {
                 warn!("Unable to reach X11 clipboard: {}", e);
-                warn!("CLIPBOARD SHARING DISABLED: no wayland or X11 clipboard is reachable. If nikau is running under sudo, start it with 'sudo -E ...' to preserve the session environment (WAYLAND_DISPLAY, XDG_RUNTIME_DIR)");
+                warn!("CLIPBOARD SHARING DISABLED: no wayland or X11 clipboard is reachable. If monux is running under sudo, start it with 'sudo -E ...' to preserve the session environment (WAYLAND_DISPLAY, XDG_RUNTIME_DIR)");
                 None
             }
         }
@@ -123,7 +123,7 @@ impl LocalClipboard {
             .await
     }
 
-    /// Switches to serving the local clipboard, rather than from the nikau server
+    /// Switches to serving the local clipboard, rather than from the monux server
     pub async fn set_local_clipboard(&mut self) {
         self.local_types.replace(self.local_types_rx.borrow().clone());
         // The local clipboard changed: never serve stale cached contents.
@@ -137,7 +137,7 @@ impl LocalClipboard {
         self.local_types.clone()
     }
 
-    /// Clears the clipboard, discarding any types provided by the nikau server
+    /// Clears the clipboard, discarding any types provided by the monux server
     pub fn clear_remote_clipboard(&mut self) -> Result<()> {
         if self.serving_remote_clipboard {
             self.local_types = None;
@@ -147,7 +147,7 @@ impl LocalClipboard {
         Ok(())
     }
 
-    /// Sets the clipboard to types provided by the nikau server
+    /// Sets the clipboard to types provided by the monux server
     pub fn set_remote_clipboard(&mut self, types: Vec<String>) -> Result<()> {
         self.local_types = None;
         self.serving_remote_clipboard = true;

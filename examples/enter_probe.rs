@@ -1,5 +1,5 @@
 //! Development probe: injects key events into a physical input device and
-//! reads back what arrives on another device (e.g. nikau's virtual keyboard).
+//! reads back what arrives on another device (e.g. monux's virtual keyboard).
 //! The output device is grabbed during the probe so no injected events can
 //! leak to the compositor.
 //!

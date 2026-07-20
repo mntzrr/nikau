@@ -13,7 +13,7 @@ use crate::clipboard::wayland::data_control::{
 /// A special mime type for clipboards that we're advertising locally.
 /// Clipboards containing this mime type are ignored.
 /// This avoids the problem of advertising a clipboard then seeing/consuming that advertisement in the update stream.
-pub const IGNORED_MIME_TYPE: &str = "application/x.nikau.ignore";
+pub const IGNORED_MIME_TYPE: &str = "application/x.monux.ignore";
 
 struct OfferData {
     /// The offer for clipboard data

@@ -12,7 +12,7 @@ use crate::clipboard::{
     x11::{events, shared},
 };
 
-/// Reads data from the local clipboard for serving to other nikau nodes
+/// Reads data from the local clipboard for serving to other monux nodes
 pub struct ClipboardReader {
     context: shared::XContext,
     atoms: shared::Atoms,

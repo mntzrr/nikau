@@ -12,10 +12,10 @@ use tokio::sync::{mpsc, watch as watchchan};
 use tokio::{runtime, task, time};
 use tracing::{error, info, warn};
 
-use nikau::device::output::OutputHandler;
-use nikau::device::{handles, input, output, shortcut, watch, Event};
-use nikau::network::{approval, transport::NetworkMode};
-use nikau::{client, clipboard, discovery, logging, rotation, server, single_instance};
+use monux::device::output::OutputHandler;
+use monux::device::{handles, input, output, shortcut, watch, Event};
+use monux::network::{approval, transport::NetworkMode};
+use monux::{client, clipboard, discovery, logging, rotation, server, single_instance};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -27,10 +27,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Runs a Nikau server
+    /// Runs a Monux server
     Server(ServerArgs),
 
-    /// Runs a Nikau client
+    /// Runs a Monux client
     Client(ClientArgs),
 }
 
@@ -159,7 +159,7 @@ fn main() -> Result<()> {
             }
             let _server_lock = single_instance::acquire("server")?;
             let fingerprint = Arc::new(Mutex::new(None));
-            let verifier = approval::NikauCertVerification::new(
+            let verifier = approval::MonuxCertVerification::new(
                 "server",
                 args.fingerprint.unwrap_or(vec![]),
                 &config_dir,
@@ -236,7 +236,7 @@ fn main() -> Result<()> {
                     addr
                 }
             };
-            let verifier = approval::NikauCertVerification::new(
+            let verifier = approval::MonuxCertVerification::new(
                 "client",
                 args.fingerprint.unwrap_or(vec![]),
                 &config_dir,
@@ -281,10 +281,27 @@ fn main() -> Result<()> {
 fn init_config_dir() -> Result<PathBuf> {
     let mut homedir = home::home_dir().context("No home dir found: Unable to store certs")?;
     homedir.push(".config");
-    homedir.push("nikau");
-    fs::create_dir_all(&homedir)
-        .with_context(|| format!("Failed to create config directory: {}", homedir.display()))?;
-    Ok(homedir)
+    let new_dir = homedir.join("monux");
+    // One-time migration from the pre-rename config dir, preserving the
+    // keypair (our identity) and known_certs (peer approvals).
+    let old_dir = homedir.join("nikau");
+    if !new_dir.exists() && old_dir.exists() {
+        fs::rename(&old_dir, &new_dir).with_context(|| {
+            format!(
+                "Failed to migrate config directory from {} to {}",
+                old_dir.display(),
+                new_dir.display()
+            )
+        })?;
+        info!(
+            "Migrated config directory from {} to {}",
+            old_dir.display(),
+            new_dir.display()
+        );
+    }
+    fs::create_dir_all(&new_dir)
+        .with_context(|| format!("Failed to create config directory: {}", new_dir.display()))?;
+    Ok(new_dir)
 }
 
 async fn server(
@@ -295,7 +312,7 @@ async fn server(
     keys_goto: Vec<String>,
     device_filters: Vec<Regex>,
     exit_secs: Option<u32>,
-    verifier: Arc<approval::NikauCertVerification<'static>>,
+    verifier: Arc<approval::MonuxCertVerification<'static>>,
     fingerprint: Arc<Mutex<Option<String>>>,
     max_clipboard_size_bytes: u64,
     mode: NetworkMode,
@@ -305,7 +322,7 @@ async fn server(
         .context("Failed to create virtual devices for output, possible solutions:
 - Add your user to the 'input' group and log back in: 'sudo usermod -aG input $USER'
 - Enable uinput and/or evdev in the kernel, check for /dev/uinput and /dev/input/
-- As a fallback, run as root with 'sudo -E nikau server ...' (-E keeps clipboard support)")?;
+- As a fallback, run as root with 'sudo -E monux server ...' (-E keeps clipboard support)")?;
 
     let (event_tx, event_rx): (mpsc::Sender<Event>, mpsc::Receiver<Event>) = mpsc::channel(256);
 
@@ -313,7 +330,7 @@ async fn server(
     let signals = Signals::new([signal::SIGUSR1, signal::SIGUSR2])?;
     std::thread::spawn(|| handle_signals(signals, event_tx2));
 
-    let (grab_tx, _grab_rx) = watchchan::channel(nikau::device::GrabEvent::Ungrab);
+    let (grab_tx, _grab_rx) = watchchan::channel(monux::device::GrabEvent::Ungrab);
     let grab_tx2 = grab_tx.clone();
 
     let key_combos = shortcut::parse_key_combos(keys_next, keys_prev, keys_goto)?;
@@ -376,7 +393,7 @@ async fn server(
     if let Ok(ips) = discovery::advertise_ips(listen_addr.ip()) {
         if !ips.is_empty() {
             info!(
-                "Local IP address(es) for clients: {}; connect with 'nikau client {}' or omit the address for mDNS auto-discovery",
+                "Local IP address(es) for clients: {}; connect with 'monux client {}' or omit the address for mDNS auto-discovery",
                 ips.iter().map(|ip| ip.to_string()).collect::<Vec<_>>().join(", "),
                 ips[0]
             );
@@ -432,7 +449,7 @@ async fn server(
 async fn client(
     config_dir: PathBuf,
     connect_addr: SocketAddr,
-    verifier: Arc<approval::NikauCertVerification<'static>>,
+    verifier: Arc<approval::MonuxCertVerification<'static>>,
     max_clipboard_size_bytes: u64,
     mode: NetworkMode,
     from_discovery: bool,
@@ -442,7 +459,7 @@ async fn client(
         .context("Failed to create virtual devices for output, possible solutions:
 - Add your user to the 'input' group and log back in: 'sudo usermod -aG input $USER'
 - Enable uinput and/or evdev in the kernel, check for /dev/uinput and /dev/input/
-- As a fallback, run as root with 'sudo -E nikau client ...' (-E keeps clipboard support)")?;
+- As a fallback, run as root with 'sudo -E monux client ...' (-E keeps clipboard support)")?;
     let max_uncompressed_size_bytes = 10 * max_clipboard_size_bytes;
     let mut local_clipboard = clipboard::client::LocalClipboard::new(
         config_dir,

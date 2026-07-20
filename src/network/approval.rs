@@ -13,7 +13,7 @@ const ALPN_QUIC_HTTP: &[&[u8]] = &[b"hq-29"];
 const PROMPT_TIMEOUT_SECS: u64 = 60;
 
 pub fn rustls_client_config(
-    verifier: Arc<NikauCertVerification<'static>>,
+    verifier: Arc<MonuxCertVerification<'static>>,
 ) -> Result<Arc<dyn quinn::crypto::ClientConfig>> {
     let mut rustls_config = quinn::rustls::ClientConfig::builder_with_provider(verifier.crypto_provider.clone())
         .with_safe_default_protocol_versions().context("Failed to set client default protocol versions")?
@@ -30,7 +30,7 @@ pub fn rustls_client_config(
 }
 
 pub fn rustls_server_config(
-    verifier: Arc<NikauCertVerification<'static>>,
+    verifier: Arc<MonuxCertVerification<'static>>,
 ) -> Result<Arc<dyn quinn::crypto::ServerConfig>> {
     let mut rustls_config = quinn::rustls::ServerConfig::builder_with_provider(verifier.crypto_provider.clone())
         .with_safe_default_protocol_versions().context("Failed to set server default protocol versions")?
@@ -56,7 +56,7 @@ struct ApprovalState<'a> {
 }
 
 #[derive(Debug)]
-pub struct NikauCertVerification<'a> {
+pub struct MonuxCertVerification<'a> {
     /// For storing certs to disk
     config_dir: PathBuf,
     /// Used for building rustls configs
@@ -81,7 +81,7 @@ pub struct NikauCertVerification<'a> {
     crypto_provider: Arc<rustls::crypto::CryptoProvider>,
 }
 
-impl<'a> NikauCertVerification<'a> {
+impl<'a> MonuxCertVerification<'a> {
     /// The fingerprint of our own certificate, for display so that peers can
     /// verify or pre-approve us.
     pub fn our_fingerprint(&self) -> String {
@@ -118,7 +118,7 @@ impl<'a> NikauCertVerification<'a> {
                 approved_cert_fingerprints
             )
         }
-        Ok(Arc::new(NikauCertVerification {
+        Ok(Arc::new(MonuxCertVerification {
             config_dir: config_dir.clone(),
             our_cert,
             our_privkey,
@@ -228,7 +228,7 @@ impl<'a> NikauCertVerification<'a> {
 }
 
 /// Run by the client to verify servers
-impl rustls::client::danger::ServerCertVerifier for NikauCertVerification<'_> {
+impl rustls::client::danger::ServerCertVerifier for MonuxCertVerification<'_> {
     fn verify_server_cert(
         &self,
         server_cert: &rustls_pki_types::CertificateDer<'_>,
@@ -270,7 +270,7 @@ impl rustls::client::danger::ServerCertVerifier for NikauCertVerification<'_> {
 }
 
 /// Run by the server to verify clients
-impl<'a> rustls::server::danger::ClientCertVerifier for NikauCertVerification<'a> {
+impl<'a> rustls::server::danger::ClientCertVerifier for MonuxCertVerification<'a> {
     fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
         &[]
     }

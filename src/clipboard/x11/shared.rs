@@ -9,14 +9,14 @@ use x11rb_async::protocol::xproto::{
 use x11rb_async::rust_connection::RustConnection;
 
 /// A clipboard type that we advertise to tell if we're serving a clipboard already
-pub(crate) const NIKAU_REMOTE_TARGET: &str = "__NIKAU_REMOTE__";
+pub(crate) const MONUX_REMOTE_TARGET: &str = "__MONUX_REMOTE__";
 
 pub(crate) struct Atoms {
     // atoms that are needed internally:
     pub(crate) clipboard: Atom,
     pub(crate) targets: Atom,
     pub(crate) timestamp: Atom,
-    pub(crate) nikau_remote: Atom,
+    pub(crate) monux_remote: Atom,
     pub(crate) incr: Atom,
     pub(crate) recv_clipboard: Atom,
 
@@ -31,7 +31,7 @@ impl Atoms {
             clipboard: Atom::MIN,
             targets: Atom::MIN,
             timestamp: Atom::MIN,
-            nikau_remote: Atom::MIN,
+            monux_remote: Atom::MIN,
             incr: Atom::MIN,
             recv_clipboard: Atom::MIN,
             atom_to_name: HashMap::new(),
@@ -41,9 +41,9 @@ impl Atoms {
         atoms.clipboard = atoms.get_atom(conn, "CLIPBOARD").await?;
         atoms.targets = atoms.get_atom(conn, "TARGETS").await?;
         atoms.timestamp = atoms.get_atom(conn, "TIMESTAMP").await?;
-        atoms.nikau_remote = atoms.get_atom(conn, NIKAU_REMOTE_TARGET).await?;
+        atoms.monux_remote = atoms.get_atom(conn, MONUX_REMOTE_TARGET).await?;
         atoms.incr = atoms.get_atom(conn, "INCR").await?;
-        atoms.recv_clipboard = atoms.get_atom(conn, "NIKAU_CLIPBOARD_OUT").await?;
+        atoms.recv_clipboard = atoms.get_atom(conn, "MONUX_CLIPBOARD_OUT").await?;
         Ok(atoms)
     }
 

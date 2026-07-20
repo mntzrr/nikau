@@ -310,12 +310,12 @@ fn write_clipboard(
 }
 
 /// Task that advertises received clipboard types to local programs,
-/// and fetches clipboard contents from nikau in response to local type requests (pastes).
+/// and fetches clipboard contents from monux in response to local type requests (pastes).
 pub struct ClipboardWriter {
     clipboard_type: ClipboardType,
     config_dir: PathBuf,
     max_uncompressed_size_bytes: u64,
-    /// Send available clipboard types, received from Nikau server
+    /// Send available clipboard types, received from Monux server
     clipboard_fetch_tx: mpsc::Sender<data::ClipboardFetch>,
 }
 

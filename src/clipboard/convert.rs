@@ -21,14 +21,14 @@ const UNCOMPRESSIBLE_TYPES: &[&str] = &["image/png"];
 /// Special handling to support cases where the clipboard is a set of local file paths:
 /// The reader combines the file(s) as a single .zip payload to preserve their filenames.
 /// The writer extracts the file(s) into a temp directory and advertises the paths in that directory.
-const NIKAU_COPIED_FILES_DATATYPE: &str = "application/zip+clipboard-paths";
+const MONUX_COPIED_FILES_DATATYPE: &str = "application/zip+clipboard-paths";
 
 /// data_type value for data that has been compressed using zstandard to improve clipboard transfer performance.
 /// In practice this should be used for all payloads that aren't ZIPPED_FILES.
-const NIKAU_ZSTD_TARGET_DATATYPE: &str = "application/zstd";
+const MONUX_ZSTD_TARGET_DATATYPE: &str = "application/zstd";
 
 /// Converts clipboard data received from a host application
-/// to a payload and/or datatype suitable for sending to a Nikau peer.
+/// to a payload and/or datatype suitable for sending to a Monux peer.
 /// If the datatype String is None, then the data is being sent as-is.
 pub async fn read(
     buf: Vec<u8>,
@@ -41,7 +41,7 @@ pub async fn read(
                 .await??;
         Ok((
             converted,
-            Some(NIKAU_COPIED_FILES_DATATYPE.to_string()),
+            Some(MONUX_COPIED_FILES_DATATYPE.to_string()),
         ))
     } else if requested_type == PATHS_TARGET_URIS {
         let converted =
@@ -49,7 +49,7 @@ pub async fn read(
                 .await??;
         Ok((
             converted,
-            Some(NIKAU_COPIED_FILES_DATATYPE.to_string()),
+            Some(MONUX_COPIED_FILES_DATATYPE.to_string()),
         ))
     } else if buf.len() >= 100 && !UNCOMPRESSIBLE_TYPES.contains(&requested_type) {
         let requested_type = requested_type.to_string();
@@ -59,7 +59,7 @@ pub async fn read(
         .await??;
         Ok((
             converted,
-            Some(NIKAU_ZSTD_TARGET_DATATYPE.to_string()),
+            Some(MONUX_ZSTD_TARGET_DATATYPE.to_string()),
         ))
     } else {
         // Don't bother compressing small or incompressible data
@@ -67,7 +67,7 @@ pub async fn read(
     }
 }
 
-/// Converts clipboard data received from another Nikau peer over the network
+/// Converts clipboard data received from another Monux peer over the network
 /// to a payload suitable for sending to a host application.
 pub async fn write(
     buf: Vec<u8>,
@@ -78,14 +78,14 @@ pub async fn write(
 ) -> Result<Vec<u8>> {
     debug!("Converting clipboard data from data_type={} to requested_type={}", data_type, requested_type);
     match (requested_type, data_type) {
-        (requested_type, NIKAU_ZSTD_TARGET_DATATYPE) => {
+        (requested_type, MONUX_ZSTD_TARGET_DATATYPE) => {
             let requested_type = requested_type.to_string();
             task::spawn_blocking(move || {
                 write_zstd(buf, max_uncompressed_size_bytes, &requested_type)
             })
             .await?
         }
-        (PATHS_TARGET_GNOME, NIKAU_COPIED_FILES_DATATYPE) => {
+        (PATHS_TARGET_GNOME, MONUX_COPIED_FILES_DATATYPE) => {
             let config_dir = config_dir.clone();
             let paths = task::spawn_blocking(move || {
                 unpack_zip_payload(buf, max_uncompressed_size_bytes, &config_dir)
@@ -93,7 +93,7 @@ pub async fn write(
             .await??;
             write_gnome_file_paths(paths)
         }
-        (PATHS_TARGET_URIS, NIKAU_COPIED_FILES_DATATYPE) => {
+        (PATHS_TARGET_URIS, MONUX_COPIED_FILES_DATATYPE) => {
             let config_dir = config_dir.clone();
             let paths = task::spawn_blocking(move || {
                 unpack_zip_payload(buf, max_uncompressed_size_bytes, &config_dir)

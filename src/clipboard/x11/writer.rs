@@ -22,15 +22,15 @@ use crate::clipboard::{ClipboardWriter as ClipboardWriterTrait, data, x11::share
 const CLIPBOARD_MAX_CHUNK_BYTES: usize = 256000;
 
 /// Task that advertises received clipboard types to local programs,
-/// and fetches clipboard contents from nikau in response to local type requests (pastes).
+/// and fetches clipboard contents from monux in response to local type requests (pastes).
 pub struct ClipboardWriter {
-    /// Send available clipboard types, received from Nikau server
+    /// Send available clipboard types, received from Monux server
     store_types_tx: watch::Sender<Vec<String>>,
 }
 
 impl ClipboardWriter {
     /// Launches the async background task and returns a call for sending clipboard type updates.
-    /// fetch_data_tx is the call for requesting clipboard contents for a given type from Nikau.
+    /// fetch_data_tx is the call for requesting clipboard contents for a given type from Monux.
     pub async fn start(
         config_dir: PathBuf,
         max_uncompressed_size_bytes: u64,
@@ -69,10 +69,10 @@ async fn serve(
     config_dir: PathBuf,
     max_uncompressed_size_bytes: u64,
     context: shared::XContext,
-    // Receive available clipboard types, advertised by Nikau server.
+    // Receive available clipboard types, advertised by Monux server.
     // Uses watch rather than an mpsc since we only care about the current/latest clipboard.
     mut store_types_rx: watch::Receiver<Vec<String>>,
-    // Ask Nikau to get clipboard content, for one of the types previously advertised
+    // Ask Monux to get clipboard content, for one of the types previously advertised
     // via store_types()/store_types_rx. The ClipboardFetch has a oneshot for sending the data.
     fetch_data_tx: mpsc::Sender<data::ClipboardFetch>,
 ) -> Result<()> {
@@ -196,11 +196,11 @@ impl ClipboardServerState {
                             "Returning available clipboard types to requestor={}: {:?}",
                             event.requestor, clipboard_info.types
                         );
-                        // TARGETS, NIKAU_REMOTE, and the data types themselves:
+                        // TARGETS, MONUX_REMOTE, and the data types themselves:
                         let target_count = 2 + clipboard_info.types.len();
                         let mut data_u8 = Vec::with_capacity(4 * target_count);
                         data_u8.extend(self.atoms.targets.to_ne_bytes());
-                        data_u8.extend(self.atoms.nikau_remote.to_ne_bytes());
+                        data_u8.extend(self.atoms.monux_remote.to_ne_bytes());
                         for type_ in &clipboard_info.types {
                             data_u8.extend(type_.0.to_ne_bytes());
                         }

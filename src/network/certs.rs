@@ -29,7 +29,7 @@ fn splash(label: &str, fingerprint: &str) {
  \\ //
   \V/
    U
-   | nikau {}
+   | monux {}
    | {}
 ",
         label, fingerprint

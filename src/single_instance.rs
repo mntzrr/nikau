@@ -9,7 +9,7 @@
 //! takes over.
 //!
 //! The lock deliberately does NOT live in the per-user config dir: a root-run
-//! nikau (HOME=/root) and a user-run nikau (HOME=/home/user) must never run
+//! monux (HOME=/root) and a user-run monux (HOME=/home/user) must never run
 //! side by side, since two instances on one machine fight over keyboard grabs
 //! and virtual devices (seen in the wild as endless grab-retry log spam).
 //! The file is created world-writable (0666) so that instances running as
@@ -33,7 +33,7 @@ const TAKEOVER_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Environment variable overriding the lock directory; used by tests to
 /// avoid colliding with real instances on the same machine.
-const LOCK_DIR_ENV: &str = "NIKAU_LOCK_DIR";
+const LOCK_DIR_ENV: &str = "MONUX_LOCK_DIR";
 
 /// Holds the single-instance flock for the lifetime of the process.
 pub struct InstanceLock {
@@ -45,7 +45,7 @@ fn lock_path(kind: &str) -> PathBuf {
     let dir = std::env::var_os(LOCK_DIR_ENV)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/tmp"));
-    dir.join(format!("nikau-{}.lock", kind))
+    dir.join(format!("monux-{}.lock", kind))
 }
 
 /// Takes the single-instance lock for `kind` ("server" or "client").
@@ -84,33 +84,33 @@ pub fn acquire(kind: &str) -> Result<InstanceLock> {
     // Another instance holds the lock and is alive (flocks can't go stale).
     let pid = read_pid(&path).with_context(|| {
         format!(
-            "Another nikau {} is already running, but its pid couldn't be determined (lock: {}). Stop it manually.",
+            "Another monux {} is already running, but its pid couldn't be determined (lock: {}). Stop it manually.",
             kind,
             path.display()
         )
     })?;
     if pid == std::process::id() as i32 {
         // Defensive: we can't be the holder and fail to lock our own file.
-        bail!("Another nikau {} is already running (lock: {})", kind, path.display());
+        bail!("Another monux {} is already running (lock: {})", kind, path.display());
     }
     // Guard against pid reuse or a stale/poisoned pid file: only signal a
-    // process whose executable is actually nikau running the matching kind.
+    // process whose executable is actually monux running the matching kind.
     // comm (exact exe name) rules out wrapper shells whose cmdline merely
-    // contains the nikau invocation.
+    // contains the monux invocation.
     let comm = fs::read_to_string(format!("/proc/{}/comm", pid)).unwrap_or_default();
     let cmdline = fs::read_to_string(format!("/proc/{}/cmdline", pid))
         .map(|s| s.replace('\0', " "))
         .unwrap_or_default();
-    if comm.trim() != "nikau" || !cmdline.contains(kind) {
+    if comm.trim() != "monux" || !cmdline.contains(kind) {
         bail!(
-            "Another nikau {0} is already running, but the pid recorded in {1} ({2}) doesn't look like a nikau {0} process (comm: '{3}'). Refusing to kill it; stop the old instance manually.",
+            "Another monux {0} is already running, but the pid recorded in {1} ({2}) doesn't look like a monux {0} process (comm: '{3}'). Refusing to kill it; stop the old instance manually.",
             kind, path.display(), pid, comm.trim()
         );
     }
-    info!("Asking existing nikau {} (pid {}) to shut down...", kind, pid);
+    info!("Asking existing monux {} (pid {}) to shut down...", kind, pid);
     if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
         bail!(
-            "Failed to SIGTERM existing nikau {} (pid {}): {}. Stop it manually.",
+            "Failed to SIGTERM existing monux {} (pid {}): {}. Stop it manually.",
             kind,
             pid,
             std::io::Error::last_os_error()
@@ -120,13 +120,13 @@ pub fn acquire(kind: &str) -> Result<InstanceLock> {
     let deadline = Instant::now() + TAKEOVER_TIMEOUT;
     loop {
         if try_lock(&file) {
-            info!("Previous nikau {} exited, taking over", kind);
+            info!("Previous monux {} exited, taking over", kind);
             write_pid(&file);
             return Ok(InstanceLock { _file: file });
         }
         if Instant::now() >= deadline {
             bail!(
-                "Existing nikau {} (pid {}) did not exit within {}s of SIGTERM. Kill it manually (kill -9 {}) and retry.",
+                "Existing monux {} (pid {}) did not exit within {}s of SIGTERM. Kill it manually (kill -9 {}) and retry.",
                 kind,
                 pid,
                 TAKEOVER_TIMEOUT.as_secs(),

@@ -19,7 +19,7 @@ use crate::network::{approval, transport};
 /// Returns an error on connection failure or other logic error, in which case a new connection can be tried.
 pub async fn run<O: output::OutputHandler>(
     server_addr: &SocketAddr,
-    cert_verifier: Arc<approval::NikauCertVerification<'static>>,
+    cert_verifier: Arc<approval::MonuxCertVerification<'static>>,
     max_clipboard_size_bytes: u64,
     local_clipboard: &mut Option<client::LocalClipboard>,
     output_handler: &mut O,
@@ -69,7 +69,7 @@ impl Connection {
     /// Connects to the specified server, or returns an error if the connection fails.
     async fn new(
         server_addr: &SocketAddr,
-        cert_verifier: Arc<approval::NikauCertVerification<'static>>,
+        cert_verifier: Arc<approval::MonuxCertVerification<'static>>,
         max_clipboard_size_bytes: u64,
         mode: transport::NetworkMode,
     ) -> Result<(Self, Instant)> {

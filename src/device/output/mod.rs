@@ -4,8 +4,8 @@ use crate::msgs::event;
 use anyhow::Result;
 use async_trait::async_trait;
 
-/// Name prefix to use on nikau-created devices that should not be consumed by nikau
-pub const VIRTUAL_DEVICE_NAME_PREFIX: &str = "nikau virtual";
+/// Name prefix to use on monux-created devices that should not be consumed by monux
+pub const VIRTUAL_DEVICE_NAME_PREFIX: &str = "monux virtual";
 
 /// Trait for watching the addition and removal of devices from the machine
 #[async_trait]

@@ -10,8 +10,8 @@ secrets:
 # creates /home/build/.docker/config.json
 - 53238824-89f5-4c14-bd90-5e1be107dd85
 environment:
-  REPO_NAME: nikau
-  IMAGE_NAME: ghcr.io/nickbp/nikau
+  REPO_NAME: monux
+  IMAGE_NAME: ghcr.io/nickbp/monux
   # Disable arm64 for now: Seeing 'Killed' in sourcehut build
   #IMAGE_PLATFORMS: linux/amd64,linux/arm64
   IMAGE_PLATFORMS: linux/amd64

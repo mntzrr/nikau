@@ -1,5 +1,5 @@
 [package]
-name = "nikau"
+name = "monux"
 version = "0.3.3"
 authors = ["Nick Parker <nick@nickbp.com>"]
 license = "AGPL-3.0-or-later"
@@ -8,7 +8,7 @@ readme = "README-CRATES.md"
 description = "Linux network KVM for Wayland/X11/Console"
 documentation = "https://nikau.nickbp.com"
 homepage = "https://nikau.nickbp.com"
-repository = "https://sr.ht/~nickbp/nikau/"
+repository = "https://github.com/mntzrr/monux"
 exclude = ["README.md", "Dockerfile", ".build.yml", "*.sh"]
 
 [dependencies]

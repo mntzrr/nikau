@@ -73,7 +73,7 @@ pub async fn run_server_events_loop<O: output::OutputHandler>(
 
 pub async fn run_server_connections_loop(
     listen_addr: &SocketAddr,
-    cert_verifier: Arc<approval::NikauCertVerification<'static>>,
+    cert_verifier: Arc<approval::MonuxCertVerification<'static>>,
     fingerprint: Arc<Mutex<Option<String>>>,
     max_clipboard_size_bytes: u64,
     rotation_tx: mpsc::Sender<rotation::RotationEvent>,

@@ -9,10 +9,10 @@ use tokio::sync::watch as tokio_watch;
 use tokio::task;
 use tracing::{error, info, warn};
 
-use nikau::device::output::{uinput, OutputHandler};
-use nikau::device::{handles, util, watch, GrabEvent};
-use nikau::logging;
-use nikau::msgs::event;
+use monux::device::output::{uinput, OutputHandler};
+use monux::device::{handles, util, watch, GrabEvent};
+use monux::logging;
+use monux::msgs::event;
 
 struct StubHandler {}
 

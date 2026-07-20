@@ -5,13 +5,13 @@ use tokio::sync::{mpsc, watch};
 use tokio::task;
 use tracing::{error, info};
 
-use nikau::clipboard::{
+use monux::clipboard::{
     ClipboardReader as ClipboardReaderTrait,
     ClipboardWriter as ClipboardWriterTrait,
     data,
 };
-use nikau::clipboard::wayland::{reader, type_watcher, writer};
-use nikau::logging;
+use monux::clipboard::wayland::{reader, type_watcher, writer};
+use monux::logging;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -65,7 +65,7 @@ fn write(content: &str) -> Result<()> {
     let (fetch_tx, mut fetch_rx) = mpsc::channel(32);
     writer::ClipboardWriter::new(
         writer::ClipboardType::Regular,
-        PathBuf::from("/tmp/nikau"),
+        PathBuf::from("/tmp/monux"),
         max_uncompressed_bytes,
         fetch_tx,
     ).store_types(text_types)?;

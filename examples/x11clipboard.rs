@@ -6,13 +6,13 @@ use tokio::sync::{mpsc, watch, Mutex};
 use tokio::{task, time};
 use tracing::{error, info};
 
-use nikau::logging;
-use nikau::clipboard::{
+use monux::logging;
+use monux::clipboard::{
     ClipboardReader as ClipboardReaderTrait,
     ClipboardWriter as ClipboardWriterTrait,
 };
-use nikau::clipboard::data::ClipboardData;
-use nikau::clipboard::x11::{
+use monux::clipboard::data::ClipboardData;
+use monux::clipboard::x11::{
     reader::ClipboardReader,
     type_watcher::ClipboardTypeWatcher,
     writer::ClipboardWriter,
@@ -39,7 +39,7 @@ async fn main() -> Result<()> {
     let writer = Arc::new(Mutex::new(
         ClipboardWriter::start(
             // For zipping/unzipping files to serve their paths
-            PathBuf::from("/tmp/nikau"),
+            PathBuf::from("/tmp/monux"),
             max_uncompressed_bytes,
             fetch_tx,
         )
@@ -74,7 +74,7 @@ async fn main() -> Result<()> {
 
     {
         let mut writer = writer.lock().await;
-        // This should get flagged as FROM nikau, and so ignored
+        // This should get flagged as FROM monux, and so ignored
         x11_store_types(&mut writer, &types).await?;
     }
 

@@ -11,6 +11,6 @@ docker run -it \
        --privileged \
        --network host \
        -v /dev/input:/dev/input \
-       -v /root/.config/nikau:$HOME/.config/nikau \
-       "ghcr.io/nickbp/nikau:$1" \
-       /bin/sh -c "LOG_LEVEL=$LOG_LEVEL /nikau client $2"
+       -v /root/.config/monux:$HOME/.config/monux \
+       "ghcr.io/nickbp/monux:$1" \
+       /bin/sh -c "LOG_LEVEL=$LOG_LEVEL /monux client $2"

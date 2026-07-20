@@ -53,7 +53,7 @@ pub enum NetworkMode {
 
 pub fn build_client(
     bind_addr: &SocketAddr,
-    cert_verifier: Arc<approval::NikauCertVerification<'static>>,
+    cert_verifier: Arc<approval::MonuxCertVerification<'static>>,
     mode: NetworkMode,
 ) -> Result<quinn::Endpoint> {
     let socket = create_socket(*bind_addr, mode)
@@ -74,7 +74,7 @@ pub fn build_client(
 
 pub fn build_server(
     listen_addr: &SocketAddr,
-    cert_verifier: Arc<approval::NikauCertVerification<'static>>,
+    cert_verifier: Arc<approval::MonuxCertVerification<'static>>,
     mode: NetworkMode,
 ) -> Result<quinn::Endpoint> {
     let socket = create_socket(*listen_addr, mode)
@@ -283,8 +283,8 @@ pub async fn recv_version(recv: &mut RecvStream, buf: &mut Vec<u8>) -> Result<()
     let resp = recv
         .read_chunk(1024, true)
         .await
-        .context("Failed reading protocol version (possible protocol version mismatch; run 'nikau -V' on both ends to compare)")?
-        .context("Peer closed connection during version exchange (possible protocol version mismatch; run 'nikau -V' on both ends to compare)")?;
+        .context("Failed reading protocol version (possible protocol version mismatch; run 'monux -V' on both ends to compare)")?
+        .context("Peer closed connection during version exchange (possible protocol version mismatch; run 'monux -V' on both ends to compare)")?;
     trace!(
         "Received {} byte version: {:X?}",
         resp.bytes.len(),
@@ -296,7 +296,7 @@ pub async fn recv_version(recv: &mut RecvStream, buf: &mut Vec<u8>) -> Result<()
     {
         let (versionmsg, resp_remainder) =
             postcard::take_from_bytes_cobs::<shared::VersionBootstrapMessage>(buf)
-                .map_err(|e| anyhow!("Failed to deserialize protocol version message (possible protocol version mismatch; run 'nikau -V' on both ends to compare): {:?}", e))?;
+                .map_err(|e| anyhow!("Failed to deserialize protocol version message (possible protocol version mismatch; run 'monux -V' on both ends to compare): {:?}", e))?;
         version = versionmsg.version;
         // Remove this message from the front of buf.
         // resp_remainder is relative to buf, which may have had content before this call.
@@ -308,7 +308,7 @@ pub async fn recv_version(recv: &mut RecvStream, buf: &mut Vec<u8>) -> Result<()
     }
     if version != shared::PROTOCOL_VERSION {
         bail!(
-            "Their protocol version {} doesn't match our expected version {}. You need to update nikau across your server and client(s) so that the protocol versions line up. Use 'nikau -V' to check the version.",
+            "Their protocol version {} doesn't match our expected version {}. You need to update monux across your server and client(s) so that the protocol versions line up. Use 'monux -V' to check the version.",
             version,
             shared::PROTOCOL_VERSION
         );

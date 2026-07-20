@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use anyhow::Result;
 
-use nikau::discovery;
-use nikau::logging;
+use monux::discovery;
+use monux::logging;
 
 /// Prints the address that a client would get from mDNS discovery right now.
 #[tokio::main]

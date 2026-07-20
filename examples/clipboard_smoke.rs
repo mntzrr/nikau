@@ -5,13 +5,13 @@ use anyhow::Result;
 use tokio::sync::{mpsc, watch};
 use tracing::info;
 
-use nikau::clipboard::{
+use monux::clipboard::{
     ClipboardReader as ClipboardReaderTrait,
     ClipboardWriter as ClipboardWriterTrait,
     data,
 };
-use nikau::clipboard::wayland::{reader, type_watcher, writer};
-use nikau::logging;
+use monux::clipboard::wayland::{reader, type_watcher, writer};
+use monux::logging;
 
 /// Smoke test for the wayland clipboard paths on a live session.
 /// Drive externally with wl-copy / wl-paste while it runs.
@@ -28,23 +28,23 @@ async fn main() -> Result<()> {
     });
     type_watcher::start(Some(regular_types_tx))?;
 
-    // 2. Writer: advertise text/plain and serve "hello-from-nikau" on paste.
+    // 2. Writer: advertise text/plain and serve "hello-from-monux" on paste.
     let (fetch_tx, mut fetch_rx) = mpsc::channel(32);
     writer::ClipboardWriter::new(
         writer::ClipboardType::Regular,
-        PathBuf::from("/tmp/nikau"),
+        PathBuf::from("/tmp/monux"),
         1024 * 1024,
         fetch_tx,
     )
     .store_types(vec!["text/plain".to_string()])?;
-    info!("[WRITE] advertised text/plain, serving 'hello-from-nikau' — try: wl-paste --no-newline");
+    info!("[WRITE] advertised text/plain, serving 'hello-from-monux' — try: wl-paste --no-newline");
     tokio::spawn(async move {
         while let Some(fetch) = fetch_rx.recv().await {
             info!("[FETCH] requested_type={}", fetch.requested_type);
             let d = data::ClipboardData {
                 requested_type: fetch.requested_type,
                 data_type: None,
-                bytes: b"hello-from-nikau".to_vec(),
+                bytes: b"hello-from-monux".to_vec(),
                 remaining_bytes: 0,
             };
             if fetch.fetch_result_tx.send(d).is_err() {

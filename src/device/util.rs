@@ -109,9 +109,9 @@ pub fn log_device_info(
     } else {
         debug!("{}", msg);
     }
-    // under debug, show nikau version of device details
+    // under debug, show monux version of device details
     debug!(
-        "Nikau device details:{}",
+        "Monux device details:{}",
         device_info_string(device, &device_info.dims)
     );
     // under trace, show evdev version of things too, but note that the abs values are missing:
