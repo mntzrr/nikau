@@ -1,8 +1,9 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Result};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task;
 use tracing::{debug, error, info, warn};
 
@@ -12,7 +13,9 @@ use crate::rotation;
 /// Wrapper around server-local clipboard storage, if available.
 /// Clipboard contents can still be transferred by the server among clients if this is unavailable.
 pub struct LocalClipboard {
-    reader: Box<dyn ClipboardReader>,
+    /// Shared with spawned clipboard-serving tasks so that slow reads (e.g.
+    /// zipping large copied files) never block the rotation event loop.
+    reader: Arc<Mutex<Box<dyn ClipboardReader>>>,
     writer: Box<dyn ClipboardWriter>,
 }
 
@@ -156,24 +159,33 @@ impl LocalClipboard {
         });
 
         Ok(Self {
-            reader,
+            reader: Arc::new(Mutex::new(reader)),
             writer,
         })
+    }
+
+    /// Handle for sharing the clipboard reader with spawned serving tasks,
+    /// so that slow reads never block the rotation event loop.
+    pub fn reader_handle(&self) -> Arc<Mutex<Box<dyn ClipboardReader>>> {
+        self.reader.clone()
     }
 
     /// Reads the clipboard data for the specified type.
     /// The result may be converted/compressed to a different type for network transfer.
     pub async fn read(
-        &mut self,
+        reader: &Arc<Mutex<Box<dyn ClipboardReader>>>,
         requested_type: &str,
         max_size_bytes: u64,
         request_client: &SocketAddr,
     ) -> Result<(Vec<u8>, Option<String>)> {
         let request_source = format!("client {}", request_client);
-        let original_data = self
-            .reader
-            .read(requested_type, max_size_bytes, &request_source)
-            .await?;
+        // Hold the reader lock only for the system read itself, not for conversion.
+        let original_data = {
+            let mut guard = reader.lock().await;
+            guard
+                .read(requested_type, max_size_bytes, &request_source)
+                .await?
+        };
         let (content, data_type) = convert::read(original_data, max_size_bytes, requested_type).await?;
         if let Some(data_type) = &data_type {
             debug!(

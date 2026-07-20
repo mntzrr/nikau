@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use quinn::SendStream;
 use serde::Serialize;
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio::task;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::clipboard::{data, server};
@@ -40,7 +41,10 @@ struct ClientInfo {
     /// Cert fingerprint used to select clients via --shortcut-goto keyboard shortcuts
     fingerprint: String,
     events_send: SendStream,
-    bulk_send: SendStream,
+    /// Queue for the client's bulk writer task, which owns the actual bulk
+    /// stream. Keeping large clipboard writes out of the rotation loop means
+    /// they never stall input forwarding.
+    bulk_tx: mpsc::UnboundedSender<Vec<u8>>,
 }
 
 /// Keeps track of the most recently disconnected client,
@@ -172,6 +176,9 @@ pub struct Rotation<O: device::output::OutputHandler> {
     /// Next server-originated clipboard request id. Wrapping is fine: ids only
     /// need to correlate a reply with its request, not resist adversaries.
     next_clipboard_request_id: u64,
+    /// Self-handle for spawned tasks (e.g. per-client bulk writers) to report
+    /// events back to the rotation loop, such as client removal on stream failure.
+    rotation_tx: mpsc::Sender<RotationEvent>,
 }
 
 impl<O: device::output::OutputHandler> Rotation<O> {
@@ -180,6 +187,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         output_handler: O,
         local_clipboard: Option<server::LocalClipboard>,
         config_dir: &Path,
+        rotation_tx: mpsc::Sender<RotationEvent>,
     ) -> Result<Self> {
         let active_client_path = active_client_state_path(config_dir);
         let pending_resume_fingerprint = load_pending_resume(&active_client_path);
@@ -201,6 +209,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             local_clipboard,
             pending_clipboard_requests: HashMap::new(),
             next_clipboard_request_id: 0,
+            rotation_tx,
         })
     }
 
@@ -267,13 +276,34 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             Ok(idx) => idx,
             Err(idx) => idx,
         };
+        // Dedicated writer task for this client's bulk stream: clipboard payloads
+        // can be megabytes, and writing them inline would stall input forwarding
+        // for the whole rotation. The task also keeps each header glued to its
+        // payload by writing queued byte blobs sequentially.
+        let (bulk_tx, mut bulk_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        {
+            let rotation_tx = self.rotation_tx.clone();
+            let mut bulk_send = bulk_send;
+            task::spawn(async move {
+                while let Some(bytes) = bulk_rx.recv().await {
+                    trace!("Sending {} byte bulk message to {}", bytes.len(), endpoint);
+                    if let Err(e) = bulk_send.write_all(&bytes).await {
+                        warn!("Bulk stream to {} failed, removing client: {:?}", endpoint, e);
+                        let _ = rotation_tx
+                            .send(RotationEvent::RemoveClient(endpoint))
+                            .await;
+                        return;
+                    }
+                }
+            });
+        }
         self.clients.insert(
             idx,
             ClientInfo {
                 endpoint,
                 fingerprint: fingerprint.clone(),
                 events_send,
-                bulk_send,
+                bulk_tx,
             },
         );
 
@@ -597,26 +627,76 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                     0
                 }
             };
-            let local_clipboard = match &mut self.local_clipboard {
+            let local_clipboard = match &self.local_clipboard {
                 Some(c) => c,
                 None => bail!("Fetch for local server clipboard but server clipboard is disabled"),
             };
-            // Read and send the clipboard content
-            let (content, data_type) = local_clipboard
-                .read(requested_type, max_size_bytes, request_client)
-                .await?;
-            let msg = bulk::ServerBulk::ClipboardHeader(bulk::ServerClipboardHeader {
-                requested_type,
-                data_type: data_type.as_ref().map(|t| t.as_str()),
-                content_len_bytes: content.len() as u64,
-                request_id,
+            let reader = local_clipboard.reader_handle();
+            // Look up the requesting client's bulk queue before spawning.
+            let bulk_tx = match self
+                .clients
+                .binary_search_by(|c| c.endpoint.cmp(request_client))
+            {
+                Ok(idx) => self
+                    .clients
+                    .get(idx)
+                    .expect("missing request_client")
+                    .bulk_tx
+                    .clone(),
+                Err(_idx) => {
+                    warn!(
+                        "Unable to send server clipboard data to {}: not connected (clients: {:?})",
+                        request_client, self.clients
+                    );
+                    return Ok(());
+                }
+            };
+            // Reading the clipboard can take seconds for large copies (files get
+            // zipped from disk), so serve it from a spawned task: the rotation
+            // loop must keep forwarding input meanwhile.
+            let request_client = *request_client;
+            let requested_type = requested_type.to_string();
+            task::spawn(async move {
+                match server::LocalClipboard::read(
+                    &reader,
+                    &requested_type,
+                    max_size_bytes,
+                    &request_client,
+                )
+                .await
+                {
+                    Ok((content, data_type)) => {
+                        let msg = bulk::ServerBulk::ClipboardHeader(bulk::ServerClipboardHeader {
+                            requested_type: &requested_type,
+                            data_type: data_type.as_ref().map(|t| t.as_str()),
+                            content_len_bytes: content.len() as u64,
+                            request_id,
+                        });
+                        match postcard::to_stdvec_cobs(&msg) {
+                            Ok(mut bytes) => {
+                                bytes.extend_from_slice(&content);
+                                if bulk_tx.send(bytes).is_err() {
+                                    warn!(
+                                        "Unable to send server clipboard data to {}: bulk queue closed",
+                                        request_client
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to serialize clipboard header: {:?}", e);
+                            }
+                        }
+                    }
+                    // No reply is sent: as before, the requester's fetch times
+                    // out and it can retry later.
+                    Err(e) => {
+                        warn!(
+                            "Failed to read server clipboard for {}: {:?}",
+                            request_client, e
+                        );
+                    }
+                }
             });
-            if !(self.send_bulk(request_client, msg, Some(content)).await?) {
-                warn!(
-                    "Unable to send server clipboard data to {}: not connected (clients: {:?})",
-                    request_client, self.clients
-                );
-            }
             Ok(())
         }
     }
@@ -947,30 +1027,28 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         msg: bulk::ServerBulk<'_>,
         payload: Option<Vec<u8>>,
     ) -> Result<bool> {
+        // Serialize up front: a serialization failure is a problem with the message,
+        // not with the client's connection, so it shouldn't kick the client out.
+        let mut bytes = postcard::to_stdvec_cobs(&msg)
+            .map_err(|e| anyhow!("Failed to serialize bulk message: {:?}", e))?;
+        if let Some(payload) = payload {
+            trace!("Queueing {} byte payload for {}", payload.len(), endpoint);
+            bytes.extend_from_slice(&payload);
+        }
         match self.clients.binary_search_by(|c| c.endpoint.cmp(endpoint)) {
             Ok(idx) => {
-                let bulk_send = &mut self
+                let bulk_tx = &self
                     .clients
-                    .get_mut(idx)
+                    .get(idx)
                     .expect("missing current_client")
-                    .bulk_send;
-                // Try sending the message, then the payload. Stop on the first failure, to handle below.
-                if let Err(e) = send_message_to_client(bulk_send, &msg).await {
-                    if self.handle_client_removal(endpoint).await {
-                        self.clipboard_clear().await;
-                    }
-                    return Err(e);
+                    .bulk_tx;
+                // The network write happens in the client's bulk writer task, so
+                // large payloads never block the rotation loop. A closed queue
+                // means the writer task died; it reports the removal itself.
+                match bulk_tx.send(bytes) {
+                    Ok(()) => Ok(true),
+                    Err(_) => Ok(false),
                 }
-                if let Some(payload) = payload {
-                    trace!("Sending {} byte payload", payload.len());
-                    if let Err(e) = bulk_send.write_all(&payload).await {
-                        if self.handle_client_removal(endpoint).await {
-                            self.clipboard_clear().await;
-                        }
-                        return Err(e.into());
-                    }
-                }
-                Ok(true)
             }
             Err(_idx) => {
                 warn!(

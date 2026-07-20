@@ -33,7 +33,7 @@ pub async fn run_server_events_loop<O: output::OutputHandler>(
     ).await;
 
     let mut rotation =
-        rotation::Rotation::new(grab_tx, output_handler, local_clipboard, &config_dir).await?;
+        rotation::Rotation::new(grab_tx, output_handler, local_clipboard, &config_dir, rotation_tx).await?;
     loop {
         tokio::select! {
             // Listen and forward rotation events to rotation

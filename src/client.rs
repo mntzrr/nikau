@@ -6,7 +6,9 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
 use quinn::{RecvStream, SendStream};
-use tracing::{debug, info, trace, warn};
+use tokio::sync::Mutex;
+use tokio::task;
+use tracing::{debug, error, info, trace, warn};
 
 use crate::clipboard::{client, data};
 use crate::device::output;
@@ -35,7 +37,11 @@ pub async fn run<O: output::OutputHandler>(
 struct Connection {
     events_send: SendStream,
     events_recv: RecvStream,
-    bulk_send: SendStream,
+    /// Shared with spawned clipboard-serving tasks so that large clipboard
+    /// writes never block this loop from applying incoming input events.
+    /// The lock is always held across header+payload writes, keeping the
+    /// stream framing intact when transfers overlap.
+    bulk_send: Arc<Mutex<SendStream>>,
     bulk_recv: RecvStream,
     max_clipboard_size_bytes: u64,
 
@@ -111,7 +117,7 @@ impl Connection {
             Self {
                 events_send,
                 events_recv,
-                bulk_send,
+                bulk_send: Arc::new(Mutex::new(bulk_send)),
                 bulk_recv,
                 max_clipboard_size_bytes,
                 active: false,
@@ -155,7 +161,9 @@ impl Connection {
                         // Drop fetches whose requester already timed out, then track this one.
                         self.pending_fetches.retain(|_, f| !f.fetch_result_tx.is_closed());
                         self.pending_fetches.insert(request_id, local_fetch_request);
-                        self.bulk_send.write_all(&serializedmsg)
+                        // May wait briefly behind an in-flight clipboard payload
+                        // write; that delays only clipboard traffic, never input.
+                        self.bulk_send.lock().await.write_all(&serializedmsg)
                             .await
                             .context("Failed to send clipboard request message")?;
                     } else {
@@ -412,50 +420,59 @@ impl Connection {
                             bail!("Got ClipboardRequest event from server when we don't support clipboards, resetting connection");
                         }
                     };
-                    // Read the clipboard data from the local application.
-                    // On read failure or timeout, reply with an empty header so that the requester just sets nothing.
-                    // The read must always answer within the 5s fetch timeout on the requester side.
-                    let (local_clipboard_data, data_type) = match tokio::time::timeout(
-                        Duration::from_secs(4),
-                        local_clipboard.read(c.requested_type, c.max_size_bytes, c.request_client),
-                    )
-                    .await
-                    {
-                        Ok(Ok(result)) => result,
-                        Ok(Err(e)) => {
-                            warn!("Failed to read local clipboard of type {}: {:?}", c.requested_type, e);
-                            (Vec::new(), None)
-                        }
-                        Err(_) => {
-                            warn!("Timed out after 4s reading local clipboard of type {}", c.requested_type);
-                            (Vec::new(), None)
-                        }
-                    };
-                    let msg = bulk::ClientBulk::ClipboardHeader(bulk::ClientClipboardHeader {
-                        requested_type: c.requested_type,
-                        data_type: data_type.as_ref().map(|t| t.as_str()),
-                        content_len_bytes: local_clipboard_data.len() as u64,
-                        request_client: c.request_client,
-                        request_id: c.request_id,
-                    });
-                    let serializedmsg = postcard::to_stdvec_cobs(&msg).map_err(|e| {
-                        anyhow!("Failed to serialize clipboard types message: {:?}", e)
-                    })?;
-                    self.bulk_send
-                        .write_all(&serializedmsg)
+                    // Serve the data from a spawned task: reading the local
+                    // clipboard (zipping large copied files can take seconds) and
+                    // writing a big payload must not stall input event handling.
+                    let reader = local_clipboard.reader_handle();
+                    let bulk_send = self.bulk_send.clone();
+                    let requested_type = c.requested_type.to_string();
+                    let max_size_bytes = c.max_size_bytes;
+                    let request_client = c.request_client;
+                    let request_id = c.request_id;
+                    task::spawn(async move {
+                        // Read the clipboard data from the local application.
+                        // On read failure or timeout, reply with an empty header so that the requester just sets nothing.
+                        // The read must always answer within the 5s fetch timeout on the requester side.
+                        let (local_clipboard_data, data_type) = match tokio::time::timeout(
+                            Duration::from_secs(4),
+                            client::LocalClipboard::read(&reader, &requested_type, max_size_bytes, request_client),
+                        )
                         .await
-                        .context("Failed to send clipboard content header")?;
-                    if !local_clipboard_data.is_empty() {
-                        self.bulk_send
-                            .write_all(&local_clipboard_data)
-                            .await
-                            .with_context(|| {
-                                format!(
-                                    "Failed to send {} byte clipboard content",
-                                    local_clipboard_data.len()
-                                )
-                            })?;
-                    }
+                        {
+                            Ok(Ok(result)) => result,
+                            Ok(Err(e)) => {
+                                warn!("Failed to read local clipboard of type {}: {:?}", requested_type, e);
+                                (Vec::new(), None)
+                            }
+                            Err(_) => {
+                                warn!("Timed out after 4s reading local clipboard of type {}", requested_type);
+                                (Vec::new(), None)
+                            }
+                        };
+                        let msg = bulk::ClientBulk::ClipboardHeader(bulk::ClientClipboardHeader {
+                            requested_type: &requested_type,
+                            data_type: data_type.as_ref().map(|t| t.as_str()),
+                            content_len_bytes: local_clipboard_data.len() as u64,
+                            request_client,
+                            request_id,
+                        });
+                        let mut bytes = match postcard::to_stdvec_cobs(&msg) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                error!("Failed to serialize clipboard header message: {:?}", e);
+                                return;
+                            }
+                        };
+                        bytes.extend_from_slice(&local_clipboard_data);
+                        // Hold the lock across header+payload so overlapping
+                        // transfers can't interleave on the stream.
+                        let mut send = bulk_send.lock().await;
+                        if let Err(e) = send.write_all(&bytes).await {
+                            // A broken stream also fails the step loop's read
+                            // side, which resets the connection.
+                            error!("Failed to send {} byte clipboard content: {:?}", bytes.len(), e);
+                        }
+                    });
                 }
                 bulk::ServerBulk::ClipboardHeader(c) => {
                     if c.content_len_bytes > self.max_clipboard_size_bytes {
