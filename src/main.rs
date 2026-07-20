@@ -294,16 +294,33 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// After taking over from a previous instance, give udev and the compositor a
-/// moment to process the previous instance's virtual-device teardown before we
+/// After taking over from a previous instance, wait for udev to finish
+/// processing the previous instance's virtual-device teardown before we
 /// create ours. Without this, rapid restarts race: the old devices' evdev
-/// remove events can be processed after the new devices' add events for the
-/// same devpath, making the compositor drop our brand-new virtual keyboard
-/// (seen in the wild as all keyboard input going dead after a few restarts).
+/// remove events can reach the compositor after the new devices' add events
+/// for the same devpath, making the compositor drop or never register our
+/// brand-new virtual keyboard (seen in the wild as all keyboard input going
+/// dead after a few restarts; 'hyprctl reload' makes it reappear).
 fn settle_after_takeover(lock: &single_instance::InstanceLock) {
-    if lock.took_over {
+    if !lock.took_over {
+        return;
+    }
+    // udevadm settle waits for udev's event queue to drain, so the old remove
+    // events are emitted before our new add events (monitor order is preserved
+    // for libinput/the compositor). Fall back to a plain sleep if unavailable.
+    let settled = std::process::Command::new("udevadm")
+        .args(["settle", "--timeout=2000"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if settled {
+        info!("Settled after taking over from the previous instance (udev queue drained)");
+    } else {
         info!("Settling briefly after taking over from the previous instance");
-        std::thread::sleep(std::time::Duration::from_millis(400));
+        std::thread::sleep(std::time::Duration::from_millis(500));
     }
 }
 
