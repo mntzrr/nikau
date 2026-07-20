@@ -7,7 +7,7 @@ use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task;
 use tracing::{debug, error, info, warn};
 
-use crate::clipboard::{ClipboardReader, ClipboardWriter, convert, data, wayland, x11};
+use crate::clipboard::{ClipboardReader, ClipboardWriter, data, serve, wayland, x11};
 use crate::rotation;
 
 /// Wrapper around server-local clipboard storage, if available.
@@ -15,7 +15,9 @@ use crate::rotation;
 pub struct LocalClipboard {
     /// Shared with spawned clipboard-serving tasks so that slow reads (e.g.
     /// zipping large copied files) never block the rotation event loop.
-    reader: Arc<Mutex<Box<dyn ClipboardReader>>>,
+    /// Serializes serves and caches the last payload, so request bursts
+    /// (e.g. clipboard managers fetching every type) can't pile up CPU work.
+    reader: Arc<Mutex<serve::SharedClipboardReader>>,
     writer: Box<dyn ClipboardWriter>,
 }
 
@@ -160,34 +162,31 @@ impl LocalClipboard {
         });
 
         Ok(Self {
-            reader: Arc::new(Mutex::new(reader)),
+            reader: serve::SharedClipboardReader::new(reader),
             writer,
         })
     }
 
     /// Handle for sharing the clipboard reader with spawned serving tasks,
     /// so that slow reads never block the rotation event loop.
-    pub fn reader_handle(&self) -> Arc<Mutex<Box<dyn ClipboardReader>>> {
+    pub fn reader_handle(&self) -> Arc<Mutex<serve::SharedClipboardReader>> {
         self.reader.clone()
     }
 
     /// Reads the clipboard data for the specified type.
     /// The result may be converted/compressed to a different type for network transfer.
     pub async fn read(
-        reader: &Arc<Mutex<Box<dyn ClipboardReader>>>,
+        reader: &Arc<Mutex<serve::SharedClipboardReader>>,
         requested_type: &str,
         max_size_bytes: u64,
         request_client: &SocketAddr,
     ) -> Result<(Vec<u8>, Option<String>)> {
         let request_source = format!("client {}", request_client);
-        // Hold the reader lock only for the system read itself, not for conversion.
-        let original_data = {
-            let mut guard = reader.lock().await;
-            guard
-                .read(requested_type, max_size_bytes, &request_source)
-                .await?
-        };
-        let (content, data_type) = convert::read(original_data, max_size_bytes, requested_type).await?;
+        let (content, data_type) = reader
+            .lock()
+            .await
+            .read(requested_type, max_size_bytes, &request_source)
+            .await?;
         if let Some(data_type) = &data_type {
             debug!(
                 "Sending clipboard data for requested type {} (data type {}) from server to {}",

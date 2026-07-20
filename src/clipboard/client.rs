@@ -6,13 +6,15 @@ use anyhow::{Result};
 use tokio::sync::{Mutex, mpsc, watch};
 use tracing::{debug, info, warn};
 
-use crate::clipboard::{ClipboardReader, ClipboardWriter, convert, data, wayland, x11};
+use crate::clipboard::{ClipboardWriter, data, serve, wayland, x11};
 
 /// Wrapper around client-local clipboard storage, if available.
 pub struct LocalClipboard {
     /// Shared with spawned clipboard-serving tasks so that slow reads (e.g.
     /// zipping large copied files) never block the client event loop.
-    reader: Arc<Mutex<Box<dyn ClipboardReader>>>,
+    /// Serializes serves and caches the last payload, so request bursts
+    /// (e.g. clipboard managers fetching every type) can't pile up CPU work.
+    reader: Arc<Mutex<serve::SharedClipboardReader>>,
     writer: Box<dyn ClipboardWriter>,
     // TODO can we nest a tokio select here instead of exposing these upstream?:
     pub clipboard_fetch_rx: mpsc::Receiver<data::ClipboardFetch>,
@@ -64,7 +66,7 @@ impl LocalClipboard {
             clipboard_fetch_tx,
         );
         Ok(Some(Self{
-            reader: Arc::new(Mutex::new(Box::new(reader) as Box<dyn ClipboardReader>)),
+            reader: serve::SharedClipboardReader::new(Box::new(reader)),
             writer: Box::new(writer),
             clipboard_fetch_rx,
             local_types_rx: local_regular_types_rx,
@@ -81,7 +83,7 @@ impl LocalClipboard {
         let writer =
             x11::writer::ClipboardWriter::start(config_dir, max_uncompressed_size_bytes, clipboard_fetch_tx).await?;
         Ok(Self {
-            reader: Arc::new(Mutex::new(Box::new(reader) as Box<dyn ClipboardReader>)),
+            reader: serve::SharedClipboardReader::new(Box::new(reader)),
             writer: Box::new(writer),
             clipboard_fetch_rx,
             local_types_rx,
@@ -92,14 +94,14 @@ impl LocalClipboard {
 
     /// Handle for sharing the clipboard reader with spawned serving tasks,
     /// so that slow reads never block the client event loop.
-    pub fn reader_handle(&self) -> Arc<Mutex<Box<dyn ClipboardReader>>> {
+    pub fn reader_handle(&self) -> Arc<Mutex<serve::SharedClipboardReader>> {
         self.reader.clone()
     }
 
     /// Reads the clipboard data for the specified type.
     /// The result may be converted/compressed to a different type for network transfer.
     pub async fn read(
-        reader: &Arc<Mutex<Box<dyn ClipboardReader>>>,
+        reader: &Arc<Mutex<serve::SharedClipboardReader>>,
         requested_type: &str,
         max_size_bytes: u64,
         request_client: Option<SocketAddr>,
@@ -114,19 +116,18 @@ impl LocalClipboard {
             requested_type,
             request_source,
         );
-        // Hold the reader lock only for the system read itself, not for conversion.
-        let original_data = {
-            let mut guard = reader.lock().await;
-            guard
-                .read(requested_type, max_size_bytes, &request_source)
-                .await?
-        };
-        convert::read(original_data, max_size_bytes, requested_type).await
+        reader
+            .lock()
+            .await
+            .read(requested_type, max_size_bytes, &request_source)
+            .await
     }
 
     /// Switches to serving the local clipboard, rather than from the nikau server
-    pub fn set_local_clipboard(&mut self) {
+    pub async fn set_local_clipboard(&mut self) {
         self.local_types.replace(self.local_types_rx.borrow().clone());
+        // The local clipboard changed: never serve stale cached contents.
+        self.reader.lock().await.invalidate();
         // Now that we have a local clipboard, don't fetch clipboards from the server.
         self.serving_remote_clipboard = false;
     }

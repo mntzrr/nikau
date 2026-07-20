@@ -179,7 +179,7 @@ impl Connection {
                         return Err(anyhow!(e));
                     }
                     if self.active {
-                        local_clipboard.set_local_clipboard();
+                        local_clipboard.set_local_clipboard().await;
                     }
                 },
                 event_result = self.events_recv.read_chunk(1024, true) => {

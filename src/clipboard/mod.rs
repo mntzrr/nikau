@@ -4,6 +4,7 @@ use async_trait::async_trait;
 pub mod client;
 pub mod convert;
 pub mod data;
+pub mod serve;
 pub mod server;
 pub mod wayland;
 pub mod x11;

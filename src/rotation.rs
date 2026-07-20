@@ -480,6 +480,12 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         max_size_bytes: u64,
     ) -> Result<()> {
         debug!("Announcing new clipboard source: source={:?} current={:?} with max_size_bytes={} has types={:?}", source, self.current_client, max_size_bytes, types);
+        // The clipboard changed hands: drop any cached served payload so
+        // stale contents are never served. Clone the reader handle first:
+        // only the Arc may cross the await (LocalClipboard isn't Sync).
+        if let Some(reader) = self.local_clipboard.as_ref().map(|lc| lc.reader_handle()) {
+            reader.lock().await.invalidate();
+        }
         // Save the clipboard types/source for future retrievals and client switches
         self.clipboard_target = Some(ClipboardTarget {
             source,
