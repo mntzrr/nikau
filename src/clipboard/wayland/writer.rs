@@ -228,6 +228,8 @@ fn write_clipboard(
     let (mut state, clipboard_manager, mut queue) = init_state()
         .context("Failed to init wayland session for clipboard write")?;
 
+    // Sources stay empty when clearing the clipboard.
+    let mut sources = vec![];
     if mime_types.is_empty() {
         // Clearing the clipboard: explicitly release the selection, so compositors
         // that require an explicit clear don't keep offering the stale clipboard.
@@ -242,54 +244,55 @@ fn write_clipboard(
                 }
             }
         }
-        queue.roundtrip(&mut state)?;
-        return Ok(());
-    }
+    } else {
+        // Ensure the clipboard we're advertising includes the ignored type,
+        // which ensures we don't treat this clipboard as if it's from another application source on the system.
+        let ignored_type = state::IGNORED_MIME_TYPE.to_string();
+        if !mime_types.contains(&ignored_type) {
+            mime_types.push(ignored_type);
+        }
+        debug!("Advertising {:?} clipboard to wayland: {:?}", clipboard_type, mime_types);
 
-    // Ensure the clipboard we're advertising includes the ignored type,
-    // which ensures we don't treat this clipboard as if it's from another application source on the system.
-    let ignored_type = state::IGNORED_MIME_TYPE.to_string();
-    if !mime_types.contains(&ignored_type) {
-        mime_types.push(ignored_type);
-    }
-    debug!("Advertising {:?} clipboard to wayland: {:?}", clipboard_type, mime_types);
+        for device in state.seats.values() {
+            let data_source = clipboard_manager.create_data_source(&queue.handle());
 
-    let mut sources = vec![];
-    for device in state.seats.values() {
-        let data_source = clipboard_manager.create_data_source(&queue.handle());
+            for mime_type in &mime_types {
+                data_source.offer(mime_type.clone());
+            }
 
-        for mime_type in &mime_types {
-            data_source.offer(mime_type.clone());
+            match clipboard_type {
+                ClipboardType::Regular => {
+                    device.set_selection(Some(&data_source));
+                },
+                ClipboardType::Primary => {
+                    device.set_primary_selection(Some(&data_source));
+                },
+                ClipboardType::Both => {
+                    device.set_selection(Some(&data_source));
+                    device.set_primary_selection(Some(&data_source));
+                },
+            }
+            sources.push(data_source);
         }
 
-        match clipboard_type {
-            ClipboardType::Regular => {
-                device.set_selection(Some(&data_source));
-            },
-            ClipboardType::Primary => {
-                device.set_primary_selection(Some(&data_source));
-            },
-            ClipboardType::Both => {
-                device.set_selection(Some(&data_source));
-                device.set_primary_selection(Some(&data_source));
-            },
-        }
-        sources.push(data_source);
+        state.prepared_copy_state = Some(PreparedCopyState{
+            mime_types,
+            fetch_data_tx,
+            config_dir,
+            max_uncompressed_size_bytes,
+            clipboard_data: None,
+        });
     }
-
-    state.prepared_copy_state = Some(PreparedCopyState{
-        mime_types,
-        fetch_data_tx,
-        config_dir,
-        max_uncompressed_size_bytes,
-        clipboard_data: None,
-    });
 
     // All queue dispatch (including the initial roundtrip that publishes the
-    // sources) must happen on this dedicated plain thread: the Send handler uses
-    // block_on, which panics if it ever runs on a tokio worker thread, and a
-    // paste request (e.g. from a clipboard manager) can legally arrive as early
-    // as the first roundtrip.
+    // sources or applies the clear) must happen on this dedicated plain thread:
+    // the Send handler uses block_on, which panics if it ever runs on a tokio
+    // worker thread, and a paste request (e.g. from a clipboard manager) can
+    // legally arrive as early as the first roundtrip.
+    // State also owns the tokio Runtime used for that block_on, so it must be
+    // dropped on this plain thread too: dropping it in the caller's async
+    // context panics ("Cannot drop a runtime in a context where blocking is
+    // not allowed"), e.g. when clearing the clipboard after a connection loss.
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<()>>(1);
     let _ = std::thread::spawn(move || {
         if let Err(e) = queue.roundtrip(&mut state) {
@@ -299,6 +302,12 @@ fn write_clipboard(
         }
         if ready_tx.send(Ok(())).is_err() {
             error!("Failed to send ready_tx");
+            return;
+        }
+        if sources.is_empty() {
+            // Clipboard was cleared: the roundtrip above applied it, and
+            // there is nothing to serve.
+            trace!("Exiting clipboard serving thread after clear");
             return;
         }
         loop {
