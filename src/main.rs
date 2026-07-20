@@ -157,7 +157,7 @@ fn main() -> Result<()> {
             if args.port == 0 {
                 bail!("--port 0 (ephemeral port) is not supported: the mDNS advertisement must match the actual listen port");
             }
-            let _server_lock = single_instance::acquire(&config_dir, "server")?;
+            let _server_lock = single_instance::acquire("server")?;
             let fingerprint = Arc::new(Mutex::new(None));
             let verifier = approval::NikauCertVerification::new(
                 "server",
@@ -200,7 +200,7 @@ fn main() -> Result<()> {
             })?;
         }
         Commands::Client(args) => {
-            let _client_lock = single_instance::acquire(&config_dir, "client")?;
+            let _client_lock = single_instance::acquire("client")?;
             // When no host is given, the server address comes from mDNS discovery,
             // which allows re-discovering it after repeated connection failures.
             let from_discovery = args.host.is_none();
