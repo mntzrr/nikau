@@ -811,6 +811,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                         .collect::<Vec<String>>()
                         .join(", ")
                 );
+                notify_switch(&format!("Input on {}", new_client.ip()));
             }
         } else {
             info!(
@@ -821,6 +822,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                     .collect::<Vec<String>>()
                     .join(", ")
             );
+            notify_switch("Input on this machine");
         }
 
         // Notify the new client (or server) about any current clipboard info, or a noop if it fails.
@@ -1221,6 +1223,32 @@ where
     send.write_all(&serializedmsg)
         .await
         .context("Failed to send serialized message")
+}
+
+/// Shows a best-effort desktop notification about an input switch, so that an
+/// accidental switch (e.g. a switch shortcut colliding with a compositor bind)
+/// is visible at a glance instead of looking like dead keys. Uses notify-send
+/// (libnotify); any failure (missing binary, no session bus, root without -E)
+/// is ignored. The spawned child is reaped by the tokio runtime.
+fn notify_switch(body: &str) {
+    let _ = tokio::process::Command::new("notify-send")
+        .args([
+            "-a",
+            "monux",
+            "-u",
+            "low",
+            "-t",
+            "2000",
+            // Replace the previous switch notification instead of stacking.
+            "-h",
+            "string:x-canonical-private-synchronous:monux-switch",
+            "monux",
+            body,
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
 }
 
 /// Path of the file recording the active client's fingerprint (see
