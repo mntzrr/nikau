@@ -44,7 +44,8 @@ impl LocalClipboard {
                 Some(c)
             }
             Err(e) => {
-                info!("Unable to reach X11 clipboard, disabled system clipboard support: {}", e);
+                warn!("Unable to reach X11 clipboard: {}", e);
+                warn!("CLIPBOARD SHARING DISABLED: no wayland or X11 clipboard is reachable. If nikau is running under sudo, start it with 'sudo -E ...' to preserve the session environment (WAYLAND_DISPLAY, XDG_RUNTIME_DIR)");
                 None
             }
         }
