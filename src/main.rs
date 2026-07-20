@@ -157,6 +157,7 @@ fn main() -> Result<()> {
             if args.port == 0 {
                 bail!("--port 0 (ephemeral port) is not supported: the mDNS advertisement must match the actual listen port");
             }
+            let _server_lock = acquire_server_lock(&config_dir)?;
             let fingerprint = Arc::new(Mutex::new(None));
             let verifier = approval::NikauCertVerification::new(
                 "server",
@@ -274,6 +275,33 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Ensures only one server instance runs at a time, via an exclusive
+/// non-blocking flock on CONFIG_DIR/server.lock. The lock is held by the
+/// kernel for as long as the returned file stays open, so it can never go
+/// stale: any process death (crash, kill -9, panic) releases it
+/// automatically. The file itself is deliberately never deleted.
+fn acquire_server_lock(config_dir: &PathBuf) -> Result<fs::File> {
+    use std::io::Write;
+
+    let path = config_dir.join("server.lock");
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("Failed to open server lock file: {}", path.display()))?;
+    rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive).map_err(|_| {
+        anyhow!(
+            "Another nikau server is already running (lock held: {}). Only one server instance can run at a time.",
+            path.display()
+        )
+    })?;
+    // Best-effort note for humans debugging which process holds the lock;
+    // the flock above is authoritative, this is never read by nikau.
+    let _ = file.set_len(0);
+    let _ = writeln!(&file, "pid {}", std::process::id());
+    Ok(file)
 }
 
 fn init_config_dir() -> Result<PathBuf> {
