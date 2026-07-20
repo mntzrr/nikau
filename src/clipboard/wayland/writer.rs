@@ -46,6 +46,32 @@ struct PreparedCopyState {
     clipboard_data: ClipboardCache,
 }
 
+/// Runs a clipboard data fetch on the current (background) thread, using a
+/// short-lived runtime. Returns None on retryable failure.
+fn fetch_sync(
+    mime_type: &str,
+    fetch_data_tx: &mpsc::Sender<data::ClipboardFetch>,
+    max_uncompressed_size_bytes: u64,
+    config_dir: &PathBuf,
+) -> Option<data::ClipboardData> {
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            error!("Failed to create clipboard fetch runtime: {}", e);
+            return None;
+        }
+    };
+    rt.block_on(data::fetch_clipboard_data(
+        fetch_data_tx,
+        mime_type,
+        max_uncompressed_size_bytes,
+        config_dir,
+    ))
+}
+
 /// Fetches clipboard data for a mime type on a background thread and stores it
 /// in the shared cache. Doing this off the dispatch thread is what keeps the
 /// wayland writer (and, through backpressure, the compositor) responsive while
@@ -58,23 +84,7 @@ fn spawn_fetch(
     clipboard_data: ClipboardCache,
 ) {
     std::thread::spawn(move || {
-        let rt = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(rt) => rt,
-            Err(e) => {
-                error!("Failed to create clipboard fetch runtime: {}", e);
-                return;
-            }
-        };
-        let result = rt.block_on(data::fetch_clipboard_data(
-            &fetch_data_tx,
-            &mime_type,
-            max_uncompressed_size_bytes,
-            &config_dir,
-        ));
-        if let Some(d) = result {
+        if let Some(d) = fetch_sync(&mime_type, &fetch_data_tx, max_uncompressed_size_bytes, &config_dir) {
             debug!("Background-fetched clipboard type {}: {} bytes", d.requested_type, d.bytes.len());
             *clipboard_data.lock().unwrap() = Some((d.requested_type, d.bytes));
         }
@@ -125,7 +135,7 @@ impl_dispatch_offer!(State);
 impl_dispatch_source!(State, |state: &mut Self, source: data_control::Source, event| {
     match event {
         Event::Send { mime_type, fd } => {
-            let prepared_state = if let Some(state) = state.prepared_copy_state.as_mut() {
+            let prepared_state = if let Some(state) = state.prepared_copy_state.as_ref() {
                 state
             } else {
                 error!("Missing prepared_copy_state when serving paste request");
@@ -137,80 +147,103 @@ impl_dispatch_source!(State, |state: &mut Self, source: data_control::Source, ev
                 return;
             }
 
-            let copy_result = || {
-                // Serve from the shared cache; on a miss, serve empty and fetch
-                // in the background so the NEXT request for this type is cached.
-                // The dispatch thread must never block on a fetch: during
-                // clipboard-manager storms that backpressures the compositor's
-                // wayland connection to us, freezing input.
-                let cached = prepared_state.clipboard_data.lock().unwrap().clone();
-                let bytes = match cached {
-                    Some((cached_type, cached_bytes)) if cached_type == mime_type => {
-                        debug!("Reusing cached clipboard with type {}: {} bytes", mime_type, cached_bytes.len());
-                        cached_bytes
-                    }
-                    _ => {
-                        spawn_fetch(
-                            mime_type.clone(),
-                            prepared_state.fetch_data_tx.clone(),
-                            prepared_state.max_uncompressed_size_bytes,
-                            prepared_state.config_dir.clone(),
-                            prepared_state.clipboard_data.clone(),
-                        );
-                        Vec::new()
-                    }
-                };
-                // Set O_NONBLOCK and write via a poll() loop with a deadline,
-                // so that a stuck paste reader can't hang us forever.
-                fcntl_setfl(&fd, OFlags::NONBLOCK).map_err(io::Error::from)?;
-                let mut file = File::from(fd);
-                let raw_fd = file.as_raw_fd();
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-                let mut written: usize = 0;
-                while written < bytes.len() {
-                    match file.write(&bytes[written..]) {
-                        Ok(0) => break,
-                        Ok(n) => written += n,
-                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                            if remaining.is_zero() {
-                                warn!(
-                                    "Timed out writing clipboard data to paste request, aborting ({} of {} bytes written)",
-                                    written,
-                                    bytes.len()
-                                );
-                                return Ok(written as u64);
-                            }
-                            let mut pfd = libc::pollfd {
-                                fd: raw_fd,
-                                events: libc::POLLOUT,
-                                revents: 0,
-                            };
-                            if unsafe { libc::poll(&mut pfd, 1, remaining.as_millis() as libc::c_int) } < 0 {
-                                return Err(io::Error::last_os_error());
-                            }
-                        }
-                        Err(e) => return Err(e),
-                    }
-                }
-                Ok(written as u64)
-            };
-
-            if let Err(err) = copy_result() {
-                if err.kind() == io::ErrorKind::BrokenPipe {
-                    // The paste requester closed the pipe before we could serve it
-                    // (e.g. 'wl-paste --watch' with a command that doesn't read stdin).
-                    // Not an error: there is simply nobody left to serve.
-                    debug!("Paste requester closed the pipe before clipboard could be served");
-                } else {
-                    error!("Failed to write clipboard data: {}", err);
-                }
-            }
+            // Serve the paste on a background thread (fetch + write). The
+            // dispatch thread must never block here: a slow fetch (remote
+            // clipboard over a slow link) or a slow paste reader would
+            // otherwise park it for seconds, backpressuring the compositor's
+            // wayland connection to us during clipboard-manager storms and
+            // freezing input.
+            std::thread::spawn({
+                let fetch_data_tx = prepared_state.fetch_data_tx.clone();
+                let config_dir = prepared_state.config_dir.clone();
+                let max_uncompressed_size_bytes = prepared_state.max_uncompressed_size_bytes;
+                let clipboard_data = prepared_state.clipboard_data.clone();
+                move || serve_send(mime_type, fd, fetch_data_tx, config_dir, max_uncompressed_size_bytes, clipboard_data)
+            });
         }
         Event::Cancelled => source.destroy(),
         _ => (),
     }
 });
+
+/// Serves a paste (Send) request on a background thread: fetch the data (or
+/// reuse the cache) and write it to the paste fd.
+fn serve_send(
+    mime_type: String,
+    fd: std::os::fd::OwnedFd,
+    fetch_data_tx: mpsc::Sender<data::ClipboardFetch>,
+    config_dir: PathBuf,
+    max_uncompressed_size_bytes: u64,
+    clipboard_data: ClipboardCache,
+) {
+    let bytes = {
+        let cached = clipboard_data.lock().unwrap().clone();
+        match cached {
+            Some((cached_type, cached_bytes)) if cached_type == mime_type => {
+                debug!("Reusing cached clipboard with type {}: {} bytes", mime_type, cached_bytes.len());
+                cached_bytes
+            }
+            _ => {
+                match fetch_sync(&mime_type, &fetch_data_tx, max_uncompressed_size_bytes, &config_dir) {
+                    Some(d) => {
+                        debug!("Background-fetched clipboard type {}: {} bytes", d.requested_type, d.bytes.len());
+                        let bytes = d.bytes;
+                        *clipboard_data.lock().unwrap() = Some((d.requested_type, bytes.clone()));
+                        bytes
+                    }
+                    // Retryable fetch failure: serve empty, the next request retries.
+                    None => Vec::new(),
+                }
+            }
+        }
+    };
+    if let Err(err) = write_paste_fd(fd, &bytes) {
+        if err.kind() == io::ErrorKind::BrokenPipe {
+            // The paste requester closed the pipe before we could serve it
+            // (e.g. 'wl-paste --watch' with a command that doesn't read stdin).
+            debug!("Paste requester closed the pipe before clipboard could be served");
+        } else {
+            error!("Failed to write clipboard data: {}", err);
+        }
+    }
+}
+
+/// Writes clipboard data to the paste fd with a deadline, so that a stuck
+/// paste reader can't hang the serving thread forever.
+fn write_paste_fd(fd: std::os::fd::OwnedFd, bytes: &[u8]) -> io::Result<u64> {
+    fcntl_setfl(&fd, OFlags::NONBLOCK).map_err(io::Error::from)?;
+    let mut file = File::from(fd);
+    let raw_fd = file.as_raw_fd();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut written: usize = 0;
+    while written < bytes.len() {
+        match file.write(&bytes[written..]) {
+            Ok(0) => break,
+            Ok(n) => written += n,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    warn!(
+                        "Timed out writing clipboard data to paste request, aborting ({} of {} bytes written)",
+                        written,
+                        bytes.len()
+                    );
+                    return Ok(written as u64);
+                }
+                let mut pfd = libc::pollfd {
+                    fd: raw_fd,
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                if unsafe { libc::poll(&mut pfd, 1, remaining.as_millis() as libc::c_int) } < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(written as u64)
+}
 
 /// Connects to the wayland environment, or returns Ok(None) if wayland isn't available
 fn init_state() -> Result<(State, data_control::Manager, EventQueue<State>)> {
