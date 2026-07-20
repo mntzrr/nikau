@@ -170,7 +170,14 @@ impl_dispatch_source!(State, |state: &mut Self, source: data_control::Source, ev
             };
 
             if let Err(err) = copy_result() {
-                error!("Failed to write clipboard data: {}", err);
+                if err.kind() == io::ErrorKind::BrokenPipe {
+                    // The paste requester closed the pipe before we could serve it
+                    // (e.g. 'wl-paste --watch' with a command that doesn't read stdin).
+                    // Not an error: there is simply nobody left to serve.
+                    debug!("Paste requester closed the pipe before clipboard could be served");
+                } else {
+                    error!("Failed to write clipboard data: {}", err);
+                }
             }
         }
         Event::Cancelled => source.destroy(),
