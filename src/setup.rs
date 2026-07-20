@@ -30,7 +30,12 @@ fn udev_rule_content() -> &'static str {
 
 pub fn run() -> Result<()> {
     if unsafe { libc::geteuid() } != 0 {
-        bail!("monux setup persists system settings and needs root. Run it with: sudo monux setup");
+        // sudo resets PATH, so 'sudo monux setup' often fails with
+        // "command not found": print the full invocation that works.
+        let exe = std::env::current_exe()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "monux".to_string());
+        bail!("monux setup persists system settings and needs root. Run it with: sudo {} setup", exe);
     }
 
     let mut failures = 0;
