@@ -7,3 +7,4 @@ pub mod msgs;
 pub mod network;
 pub mod rotation;
 pub mod server;
+pub mod single_instance;
