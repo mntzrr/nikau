@@ -40,7 +40,7 @@ struct ServerArgs {
     #[arg(
         long,
         alias = "shortcut-next",
-        default_value = "leftalt,n",
+        default_value = "leftshift,leftalt,r",
         value_name = "key1,key2,key3"
     )]
     shortcut: String,
