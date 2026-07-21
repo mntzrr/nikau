@@ -245,7 +245,7 @@ fn verify_socket_buf(fd: libc::c_int, opt: libc::c_int, sysctl: &str) {
     }
     if value < SOCKET_BUF_SIZE {
         warn!(
-            "UDP socket buffer clamped to {} bytes (wanted {}): raise {} (e.g. via 'sudo monux setup') to avoid drops during clipboard bursts",
+            "UDP socket buffer clamped to {} bytes (wanted {}): raise {} (e.g. via 'sudo monux system setup') to avoid drops during clipboard bursts",
             value, SOCKET_BUF_SIZE, sysctl
         );
     }

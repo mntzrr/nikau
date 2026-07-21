@@ -20,7 +20,7 @@ This fork adds low-latency tuning for local networks and a `--www` mode for use 
 
 - Linux with `uinput` and `evdev` kernel modules enabled (`/dev/uinput` and `/dev/input/` should exist).
 - A Rust toolchain (`rustup` recommended).
-- Access to input devices: your user in the `input` group with `/dev/uinput` group-writable. `monux setup` persists both for you (it re-executes with sudo and prompts for your password; log out and back in after the group change). Running the server as root with `sudo -E monux server` also works as a fallback, `-E` preserving your session so clipboard sharing works.
+- Access to input devices: your user in the `input` group with `/dev/uinput` group-writable. `monux system setup` persists both for you (it re-executes with sudo and prompts for your password; log out and back in after the group change). Running the server as root with `sudo -E monux server` also works as a fallback, `-E` preserving your session so clipboard sharing works.
 
 ### From this repository
 
@@ -38,7 +38,7 @@ cargo install --path . --root ~/.local
 
 The repository includes `.cargo/config.toml` with `target-cpu=native`, so the binary is automatically optimized for the machine you build it on.
 
-To uninstall later: `./uninstall.sh` removes the binary, the `/usr/local/bin` link, and the system settings persisted by `monux setup` (udev rules, uinput module load, WiFi powersave and UDP buffer configs), and asks before removing `~/.config/monux` (identity keypair and peer approvals).
+To uninstall later: `monux system uninstall` stops any running server/client, removes the binary (and stale copies), the `/usr/local/bin` link, and the system settings persisted by `monux system setup` (udev rules, uinput module load, WiFi powersave and UDP buffer configs). It asks before removing `~/.config/monux` (identity keypair and peer approvals) — non-interactively the config is kept — and prints a hint for undoing the `input` group membership (`sudo gpasswd -d $USER input`), which is deliberately left alone since it may predate monux. If the binary is already gone, `./uninstall.sh` from the repo is a fallback wrapper that prints the remaining manual steps.
 
 After installation, the binary is available as `monux` in `~/.local/bin`, which is in `PATH` by default on systemd-based distros and in most shell profiles (unlike `~/.cargo/bin`). If your shell doesn't find it, add `export PATH="$HOME/.local/bin:$PATH"` to your shell's rc file.
 
@@ -93,7 +93,7 @@ The first time a client connects, verify the fingerprint shown on both sides mat
 
 ### Server: sudo vs non-sudo
 
-The server runs as your normal user (in the `input` group, with `/dev/uinput` accessible — see `monux setup`). This is the recommended setup.
+The server runs as your normal user (in the `input` group, with `/dev/uinput` accessible — see `monux system setup`). This is the recommended setup.
 
 `sudo -E monux server` remains available as a fallback (e.g. if device permissions aren't set up); `-E` preserves your session environment so clipboard sharing keeps working. Note that running as root did **not** prove to prevent intermittent input freezes: with aggressive clipboard managers (`wl-clip-persist`, `wl-paste --watch`) a stall is still possible on some compositors. If you hit freezes, see *Troubleshooting* — `WAYLAND_DISPLAY= monux server` (clipboard sharing disabled) is the isolation test.
 

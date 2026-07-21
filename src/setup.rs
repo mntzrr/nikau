@@ -1,4 +1,4 @@
-//! `monux setup`: persists machine-local settings that optimize the host for
+//! `monux system setup`: persists machine-local settings that optimize the host for
 //! local KVM use. Everything here is idempotent and reported step by step.
 //!
 //! Currently applied:
@@ -19,10 +19,11 @@ use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 
-const NM_POWERSAVE_CONF_PATH: &str = "/etc/NetworkManager/conf.d/99-monux-disable-wifi-powersave.conf";
-const UDEV_RULE_PATH: &str = "/etc/udev/rules.d/99-monux-uinput.rules";
-const MODULES_LOAD_PATH: &str = "/etc/modules-load.d/monux-uinput.conf";
-const SYSCTL_BUF_CONF_PATH: &str = "/etc/sysctl.d/90-monux-udp-buffers.conf";
+pub(crate) const NM_POWERSAVE_CONF_PATH: &str =
+    "/etc/NetworkManager/conf.d/99-monux-disable-wifi-powersave.conf";
+pub(crate) const UDEV_RULE_PATH: &str = "/etc/udev/rules.d/99-monux-uinput.rules";
+pub(crate) const MODULES_LOAD_PATH: &str = "/etc/modules-load.d/monux-uinput.conf";
+pub(crate) const SYSCTL_BUF_CONF_PATH: &str = "/etc/sysctl.d/90-monux-udp-buffers.conf";
 
 /// Target for net.core.{r,w}mem_max: comfortably above the 2 MiB that monux
 /// requests for its QUIC UDP socket buffers (the kernel clamps SO_SNDBUF/
@@ -47,12 +48,12 @@ fn sysctl_buf_conf_content() -> String {
 pub fn run() -> Result<()> {
     if unsafe { libc::geteuid() } != 0 {
         // Reaching here non-root means auto-elevation was opted out of
-        // (MONUX_NO_ELEVATE). sudo resets PATH, so 'sudo monux setup' often
+        // (MONUX_NO_ELEVATE). sudo resets PATH, so 'sudo monux system setup' often
         // fails with "command not found": print the full invocation that works.
         let exe = std::env::current_exe()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "monux".to_string());
-        bail!("monux setup persists system settings and needs root. Run it with: sudo {} setup (or re-run without MONUX_NO_ELEVATE to elevate automatically)", exe);
+        bail!("monux system setup persists system settings and needs root. Run it with: sudo {} system setup (or re-run without MONUX_NO_ELEVATE to elevate automatically)", exe);
     }
 
     let mut failures = 0;

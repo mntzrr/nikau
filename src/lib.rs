@@ -10,4 +10,5 @@ pub mod rotation;
 pub mod server;
 pub mod setup;
 pub mod single_instance;
+pub mod uninstall;
 pub mod update;

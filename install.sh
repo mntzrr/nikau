@@ -50,7 +50,7 @@ done
 
 echo "Installed monux to $(which monux 2>/dev/null || echo "$HOME/.local/bin/monux")"
 
-# 'sudo monux ...' (e.g. 'sudo monux setup') fails with "command not found"
+# 'sudo monux ...' (e.g. 'sudo monux system setup') fails with "command not found"
 # because sudo resets PATH to secure_path, which excludes ~/.local/bin.
 # /usr/local/bin is in secure_path, so link the binary there too (needs sudo).
 if [ ! -e /usr/local/bin/monux ]; then
@@ -77,5 +77,5 @@ echo "Run server: monux server   (as your user; needs 'input' group + /dev/uinpu
 echo "Run client: monux client [host]"
 echo "Update later with: monux update"
 echo
-echo "If device permissions aren't set up, run 'monux setup' (elevates via sudo),"
+echo "If device permissions aren't set up, run 'monux system setup' (elevates via sudo),"
 echo "or fall back to: sudo -E monux server"

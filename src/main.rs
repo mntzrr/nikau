@@ -45,15 +45,34 @@ enum Commands {
     /// Runs a Monux client
     Client(ClientArgs),
 
-    /// Persists machine-local settings that optimize this machine for local KVM
-    /// (input device access, /dev/uinput permissions, WiFi power saving,
-    /// UDP socket buffers). Re-executes with sudo automatically.
-    Setup,
+    /// Manages this machine's system integration for monux: persisting
+    /// machine-local settings (setup) and removing monux again (uninstall)
+    System(SystemArgs),
 
     /// Updates monux to the latest version from GitHub, rebuilding from
     /// source. The server protocol-compatibility gate is first refreshed
     /// from the mDNS advertisements of servers on the LAN.
     Update(UpdateArgs),
+}
+
+#[derive(Args)]
+struct SystemArgs {
+    #[command(subcommand)]
+    command: SystemCommands,
+}
+
+#[derive(Subcommand)]
+enum SystemCommands {
+    /// Persists machine-local settings that optimize this machine for local KVM
+    /// (input device access, /dev/uinput permissions, WiFi power saving,
+    /// UDP socket buffers). Re-executes with sudo automatically.
+    Setup,
+
+    /// Removes monux from this machine: stops any running server/client, then
+    /// removes the binary (and stale copies), the /usr/local/bin link, and the
+    /// system settings persisted by 'monux system setup'. Asks before also
+    /// removing ~/.config/monux (identity keypair and peer approvals).
+    Uninstall,
 }
 
 #[derive(Args)]
@@ -282,12 +301,18 @@ fn main() -> Result<()> {
     // Record the exact build in the log: invaluable when diagnosing bug reports.
     info!("monux v{} starting", VERSION);
 
-    // Setup and update don't need the config dir, devices, or the async runtime.
+    // System commands and update don't need the config dir, devices, or the
+    // async runtime.
     match &cli.command {
-        Commands::Setup => {
-            maybe_elevate("to persist system settings")?;
-            return monux::setup::run();
-        }
+        Commands::System(args) => match &args.command {
+            SystemCommands::Setup => {
+                maybe_elevate("to persist system settings")?;
+                return monux::setup::run();
+            }
+            SystemCommands::Uninstall => {
+                return monux::uninstall::run();
+            }
+        },
         Commands::Update(args) => {
             // Gate on the server's protocol version when this machine acts as
             // a client, so an update can't break the connection. The version
@@ -317,8 +342,8 @@ fn main() -> Result<()> {
     );
 
     match cli.command {
-        Commands::Setup | Commands::Update(_) => {
-            unreachable!("setup and update are handled before runtime initialization")
+        Commands::System(_) | Commands::Update(_) => {
+            unreachable!("system commands and update are handled before runtime initialization")
         }
         Commands::Server(args) => {
             if args.port == 0 {
@@ -528,9 +553,10 @@ fn settle_after_takeover(lock: &single_instance::InstanceLock) {
     }
 }
 
-/// 'monux setup' persists system settings and needs root. Rather than making
-/// the user type 'sudo monux setup' (which also trips over sudo's restricted
-/// PATH hiding ~/.local/bin), re-exec with sudo -E, prompting for the password.
+/// 'monux system setup' persists system settings and needs root. Rather than
+/// making the user type 'sudo monux system setup' (which also trips over
+/// sudo's restricted PATH hiding ~/.local/bin), re-exec with sudo -E,
+/// prompting for the password.
 /// Opt out with MONUX_NO_ELEVATE=1 to get the manual invocation instead.
 fn maybe_elevate(reason: &str) -> Result<()> {
     if unsafe { libc::geteuid() } == 0 || std::env::var_os("MONUX_NO_ELEVATE").is_some() {
