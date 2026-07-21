@@ -58,6 +58,20 @@ impl std::fmt::Display for SwitchEvent {
 
 // InputEvent
 
+/// A pointer-motion batch sent from server to client as a QUIC datagram
+/// (unreliable, unordered). Motion updates are stale the moment a newer one
+/// exists, so skipping a lost datagram beats stalling all later input behind
+/// a stream retransmission. Only pure REL_X/REL_Y batches use this path;
+/// everything else (keys, buttons, wheel, absolute axes) stays on the ordered
+/// events stream.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct MotionDatagram {
+    /// Per-connection sequence number; the client drops datagrams that arrive
+    /// older than the newest one it has already applied.
+    pub seq: u64,
+    pub events: Vec<InputEvent>,
+}
+
 /// An input event to be written to a virtual device indicated by the target.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct InputEvent {

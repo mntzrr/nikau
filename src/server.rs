@@ -208,6 +208,7 @@ async fn handle_connection(
                 fingerprint,
                 events_send,
                 bulk_send,
+                conn: conn.clone(),
             },
         ))
         .await?;

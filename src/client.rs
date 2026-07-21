@@ -63,6 +63,12 @@ struct Connection {
     /// Next fetch request id. Wrapping is fine: ids only need to correlate a
     /// reply with its request, not resist adversaries.
     next_fetch_id: u64,
+
+    /// Connection handle for receiving unreliable QUIC datagrams carrying
+    /// high-rate pointer motion (see MotionDatagram).
+    quinn_conn: quinn::Connection,
+    /// Newest applied motion datagram sequence number; older ones are dropped.
+    last_motion_seq: u64,
 }
 
 impl Connection {
@@ -126,6 +132,8 @@ impl Connection {
                 incoming_clipboard_data: None,
                 pending_fetches: HashMap::new(),
                 next_fetch_id: 0,
+                quinn_conn: conn,
+                last_motion_seq: 0,
             },
             connect_time,
         ))
@@ -197,6 +205,11 @@ impl Connection {
                     self.event_bytes.extend_from_slice(&resp.bytes);
                     self.handle_event_messages(Some(local_clipboard), output_handler).await?;
                 },
+                datagram_result = self.quinn_conn.read_datagram() => {
+                    // Unreliable/unordered pointer motion (see MotionDatagram).
+                    let bytes = datagram_result.context("Lost datagram connection")?;
+                    self.handle_motion_datagram(&bytes, output_handler).await?;
+                },
                 bulk_result = self.bulk_recv.read_chunk(65536, true) => {
                     let resp = bulk_result
                         .with_context(|| if is_new_connection(connect_time) {
@@ -227,6 +240,11 @@ impl Connection {
                     // Copy the immutable response data into a mutable buffer
                     self.event_bytes.extend_from_slice(&resp.bytes);
                     self.handle_event_messages(None, output_handler).await?;
+                },
+                datagram_result = self.quinn_conn.read_datagram() => {
+                    // Unreliable/unordered pointer motion (see MotionDatagram).
+                    let bytes = datagram_result.context("Lost datagram connection")?;
+                    self.handle_motion_datagram(&bytes, output_handler).await?;
                 },
                 bulk_result = self.bulk_recv.read_chunk(65536, true) => {
                     let resp = bulk_result
@@ -329,6 +347,38 @@ impl Connection {
         // Retain any unconsumed partial frame for the next chunk.
         self.event_bytes.drain(..offset);
         Ok(())
+    }
+
+    /// Applies a pointer-motion datagram, dropping stale ones. Datagrams are
+    /// unreliable and unordered: each carries only REL_X/REL_Y deltas that are
+    /// superseded by the next update, so applying an out-of-order one would
+    /// just add jitter.
+    async fn handle_motion_datagram<O: output::OutputHandler>(
+        &mut self,
+        bytes: &[u8],
+        output_handler: &mut O,
+    ) -> Result<()> {
+        let msg = postcard::from_bytes::<event::MotionDatagram>(bytes)
+            .map_err(|e| anyhow!("Failed to deserialize motion datagram: {:?}", e))?;
+        if !self.active {
+            // We're not the switched-active client; the datagram raced a switch.
+            return Ok(());
+        }
+        if msg.seq <= self.last_motion_seq {
+            trace!(
+                "Dropping stale motion datagram seq={} (last applied {})",
+                msg.seq,
+                self.last_motion_seq
+            );
+            return Ok(());
+        }
+        self.last_motion_seq = msg.seq;
+        trace!(
+            "Applying motion datagram seq={} ({} events)",
+            msg.seq,
+            msg.events.len()
+        );
+        output_handler.write(msg.events).await
     }
 
     async fn handle_bulk_data_or_messages(

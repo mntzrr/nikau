@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 /// The protocol version exchanged between client and server on each stream.
 /// This is compared on initial connection between client and server.
 /// If the event/bulk definitions change, then this should change.
-pub const PROTOCOL_VERSION: u64 = 6;
+pub const PROTOCOL_VERSION: u64 = 7;
 
 /// An initial handshake message exchanged between client and server on each stream.
 /// If the peer doesn't support the provided version value, it can cut off the connection early.

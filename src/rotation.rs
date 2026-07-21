@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
-use quinn::SendStream;
+use bytes::Bytes;
+use quinn::{SendDatagramError, SendStream};
 use serde::Serialize;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task;
@@ -51,6 +52,12 @@ struct ClientInfo {
     /// stream. Keeping large clipboard writes out of the rotation loop means
     /// they never stall input forwarding.
     bulk_tx: mpsc::UnboundedSender<Vec<u8>>,
+    /// Connection handle for sending unreliable/unordered QUIC datagrams
+    /// (used for high-rate pointer motion; see MotionDatagram).
+    conn: quinn::Connection,
+    /// Whether the peer accepts QUIC datagrams. Disabled permanently on the
+    /// first UnsupportedByPeer/Disabled error, falling back to the stream.
+    datagrams_ok: bool,
 }
 
 /// Keeps track of the most recently disconnected client,
@@ -106,6 +113,29 @@ pub struct AddClientArgs {
     pub fingerprint: String,
     pub events_send: SendStream,
     pub bulk_send: SendStream,
+    pub conn: quinn::Connection,
+}
+
+/// Outcome of a pointer-motion datagram send attempt.
+enum MotionSend {
+    Sent,
+    /// The events weren't sent as a datagram; send them over the stream instead.
+    Fallback(Vec<event::InputEvent>),
+}
+
+/// Returns true if the batch consists solely of relative X/Y pointer motion,
+/// which is safe to send over unreliable datagrams: each update is a delta that
+/// is immediately superseded by the next one. Buttons, wheel, and absolute axes
+/// must NOT be lost or reordered and always stay on the ordered stream.
+fn is_pure_pointer_motion(events: &[event::InputEvent]) -> bool {
+    const EV_REL: u16 = evdev::EventType::RELATIVE.0;
+    const REL_X: u16 = evdev::RelativeAxisCode::REL_X.0;
+    const REL_Y: u16 = evdev::RelativeAxisCode::REL_Y.0;
+    !events.is_empty()
+        && events.iter().all(|e| {
+            e.inputf64.is_none()
+                && matches!(&e.inputi32, Some(i) if i.type_ == EV_REL && (i.code == REL_X || i.code == REL_Y))
+        })
 }
 
 pub struct ClipboardUpdateSourceArgs {
@@ -189,6 +219,11 @@ pub struct Rotation<O: device::output::OutputHandler> {
     /// machine-paced update bursts from clipboard managers (see
     /// CLIPBOARD_UPDATE_DEBOUNCE).
     last_clipboard_update: Option<Instant>,
+    /// Sequence number for the next pointer-motion datagram (per server; only
+    /// monotonicity within a client connection matters for stale-drop).
+    motion_seq: u64,
+    /// Set once we've logged that pointer motion is using QUIC datagrams.
+    motion_datagram_announced: bool,
 }
 
 impl<O: device::output::OutputHandler> Rotation<O> {
@@ -221,6 +256,8 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             next_clipboard_request_id: 0,
             rotation_tx,
             last_clipboard_update: None,
+            motion_seq: 0,
+            motion_datagram_announced: false,
         })
     }
 
@@ -232,6 +269,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                     args.fingerprint,
                     args.events_send,
                     args.bulk_send,
+                    args.conn,
                 )
                 .await
             }
@@ -281,6 +319,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         fingerprint: String,
         events_send: SendStream,
         bulk_send: SendStream,
+        conn: quinn::Connection,
     ) {
         // Sort clients by their endpoints as an arbitrary consistent order across sessions
         let idx = match self.clients.binary_search_by(|c| c.endpoint.cmp(&endpoint)) {
@@ -315,6 +354,8 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                 fingerprint: fingerprint.clone(),
                 events_send,
                 bulk_tx,
+                conn,
+                datagrams_ok: true,
             },
         );
 
@@ -973,6 +1014,71 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         }
     }
 
+    /// Attempts to send a pure pointer-motion batch as a QUIC datagram.
+    /// Returns MotionSend::Fallback with the events if they should go over the
+    /// ordered events stream instead (peer can't do datagrams, the datagram is
+    /// too big, or the send buffer is momentarily full).
+    fn try_send_motion_datagram(
+        &mut self,
+        endpoint: &SocketAddr,
+        events: Vec<event::InputEvent>,
+    ) -> MotionSend {
+        let idx = match self.clients.binary_search_by(|c| c.endpoint.cmp(endpoint)) {
+            Ok(idx) => idx,
+            Err(_) => return MotionSend::Fallback(events),
+        };
+        if !self.clients[idx].datagrams_ok {
+            return MotionSend::Fallback(events);
+        }
+        self.motion_seq = self.motion_seq.wrapping_add(1);
+        let msg = event::MotionDatagram {
+            seq: self.motion_seq,
+            events,
+        };
+        let serialized = match postcard::to_stdvec(&msg) {
+            Ok(s) => s,
+            Err(e) => {
+                error!("Failed to serialize motion datagram: {:?}", e);
+                return MotionSend::Fallback(msg.events);
+            }
+        };
+        let event_count = msg.events.len();
+        match self.clients[idx].conn.send_datagram(Bytes::from(serialized)) {
+            Ok(()) => {
+                if !self.motion_datagram_announced {
+                    self.motion_datagram_announced = true;
+                    info!(
+                        "Sending pointer motion to {} as QUIC datagrams (lost updates are skipped, not retransmitted)",
+                        endpoint
+                    );
+                }
+                trace!(
+                    "Sent motion datagram seq={} ({} events) to {}",
+                    self.motion_seq,
+                    event_count,
+                    endpoint
+                );
+                MotionSend::Sent
+            }
+            Err(e @ (SendDatagramError::UnsupportedByPeer | SendDatagramError::Disabled)) => {
+                debug!(
+                    "QUIC datagrams unsupported by {} ({}), using the ordered stream for motion",
+                    endpoint, e
+                );
+                self.clients[idx].datagrams_ok = false;
+                MotionSend::Fallback(msg.events)
+            }
+            Err(e) => {
+                // Blocked (send buffer full) or TooLarge: use the stream this time.
+                trace!(
+                    "Motion datagram to {} not sent ({}), using the stream",
+                    endpoint, e
+                );
+                MotionSend::Fallback(msg.events)
+            }
+        }
+    }
+
     /// Sends an event to the currently active client, removing it if sending fails.
     /// If no client is active, this does nothing.
     async fn send_event_to_remote_client(&mut self, msg: event::ServerEvent<'_>) -> Result<()> {
@@ -994,9 +1100,20 @@ impl<O: device::output::OutputHandler> Rotation<O> {
 
     /// Handles an input event collected from the server.
     pub async fn send_input_events(&mut self, batch: device::InputBatch) -> Result<()> {
-        if let Some(_) = self.current_client {
+        if let Some(endpoint) = self.current_client {
             // Remote client is active, send all input to client and not to local machine.
-            self.send_event_to_remote_client(event::ServerEvent::Input(batch.events))
+            let mut events = batch.events;
+            if is_pure_pointer_motion(&events) {
+                // High-rate pointer motion goes over unreliable/unordered QUIC
+                // datagrams: a lost motion update is instantly superseded by the
+                // next one, so skipping it beats stalling all later input behind
+                // a stream retransmission (the cause of visible micro-stutter).
+                match self.try_send_motion_datagram(&endpoint, events) {
+                    MotionSend::Sent => return Ok(()),
+                    MotionSend::Fallback(returned_events) => events = returned_events,
+                }
+            }
+            self.send_event_to_remote_client(event::ServerEvent::Input(events))
                 .await
         } else if batch.is_grabbed {
             // Local machine is active and device is grabbed, write input to local virtual devices.
@@ -1349,6 +1466,46 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("monux-test-{}-{}", std::process::id(), name));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn i32_event(type_: u16, code: u16, value: i32) -> event::InputEvent {
+        event::InputEvent {
+            inputi32: Some(event::InputI32 { type_, code, value }),
+            inputf64: None,
+        }
+    }
+
+    #[test]
+    fn pure_pointer_motion_detection() {
+        let ev_rel = evdev::EventType::RELATIVE.0;
+        let rel_x = evdev::RelativeAxisCode::REL_X.0;
+        let rel_y = evdev::RelativeAxisCode::REL_Y.0;
+
+        // Pure X/Y motion in one or several events: datagram-worthy.
+        assert!(is_pure_pointer_motion(&[i32_event(ev_rel, rel_x, 3)]));
+        assert!(is_pure_pointer_motion(&[
+            i32_event(ev_rel, rel_x, 3),
+            i32_event(ev_rel, rel_y, -2)
+        ]));
+
+        // Empty batches are not sent as datagrams.
+        assert!(!is_pure_pointer_motion(&[]));
+
+        // Wheel, buttons, keys, and absolute axes must stay on the ordered stream.
+        let rel_wheel = evdev::RelativeAxisCode::REL_WHEEL.0;
+        assert!(!is_pure_pointer_motion(&[i32_event(ev_rel, rel_wheel, 1)]));
+        assert!(!is_pure_pointer_motion(&[
+            i32_event(ev_rel, rel_x, 3),
+            i32_event(evdev::EventType::KEY.0, 0x110, 1) // BTN_LEFT press
+        ]));
+        assert!(!is_pure_pointer_motion(&[event::InputEvent {
+            inputi32: None,
+            inputf64: Some(event::InputF64 {
+                type_: evdev::EventType::ABSOLUTE.0,
+                code: evdev::AbsoluteAxisCode::ABS_X.0,
+                value: 0.5,
+            }),
+        }]));
     }
 
     #[test]
