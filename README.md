@@ -97,6 +97,10 @@ monux client --www <server-host-or-ip>
 
 `--www` uses conservative QUIC settings (default congestion control and RTT estimation) and skips socket QoS flags.
 
+### Pointer motion rate (office vs gaming)
+
+By default the server coalesces pointer motion to **125 updates per second**: high-polling-rate mice (1000-8000 Hz) otherwise produce thousands of tiny packets per second for no visible benefit at a desk. Motion deltas are summed losslessly — the cursor ends up in exactly the same place, just updated less often, with far less network traffic and CPU use on both machines. Pure motion is sent as loss-tolerant QUIC datagrams regardless of rate. Tune with `--motion-hz`, e.g. `--motion-hz 0` to forward every event as it comes (gaming) or `--motion-hz 60` for maximum savings.
+
 ## Troubleshooting
 
 If input (e.g. the Enter key) stops registering on the server machine while `monux server` runs, the server log tells you what monux sees. The first log line records the exact build (`monux v0.3.3+<sha> starting`) — always include it when reporting.

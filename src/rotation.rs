@@ -123,6 +123,18 @@ enum MotionSend {
     Fallback(Vec<event::InputEvent>),
 }
 
+/// Builds a single relative-axis input event (for coalesced motion flushes).
+fn motion_event(code: u16, value: i32) -> event::InputEvent {
+    event::InputEvent {
+        inputi32: Some(event::InputI32 {
+            type_: evdev::EventType::RELATIVE.0,
+            code,
+            value,
+        }),
+        inputf64: None,
+    }
+}
+
 /// Returns true if the batch consists solely of relative X/Y pointer motion,
 /// which is safe to send over unreliable datagrams: each update is a delta that
 /// is immediately superseded by the next one. Buttons, wheel, and absolute axes
@@ -241,6 +253,15 @@ pub struct Rotation<O: device::output::OutputHandler> {
     status_counts: InputCounts,
     /// When the current status window started.
     status_window_start: Instant,
+    /// Coalescing accumulator for relative pointer motion (dx, dy, source event
+    /// count), flushed on a timer at the --motion-hz rate. Deltas are summed
+    /// losslessly: the cursor ends up in the same place with far less traffic.
+    pending_motion: (i32, i32, u64),
+    /// Whether pending_motion holds unsent deltas.
+    motion_dirty: bool,
+    /// Flush interval for motion coalescing; None = forward every batch
+    /// immediately (e.g. --motion-hz 0 for gaming).
+    motion_flush_interval: Option<Duration>,
 }
 
 impl<O: device::output::OutputHandler> Rotation<O> {
@@ -250,6 +271,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         local_clipboard: Option<server::LocalClipboard>,
         config_dir: &Path,
         rotation_tx: mpsc::Sender<RotationEvent>,
+        motion_flush_interval: Option<Duration>,
     ) -> Result<Self> {
         let active_client_path = active_client_state_path(config_dir);
         let pending_resume_fingerprint = load_pending_resume(&active_client_path);
@@ -277,6 +299,9 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             motion_datagram_announced: false,
             status_counts: InputCounts::default(),
             status_window_start: Instant::now(),
+            pending_motion: (0, 0, 0),
+            motion_dirty: false,
+            motion_flush_interval,
         })
     }
 
@@ -1111,6 +1136,76 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             self.status_counts.forwarded,
             self.status_counts.emitted_local,
         );
+        if self.motion_dirty {
+            info!(
+                "Diagnostics: coalesced motion pending: dx={} dy={} (from {} events)",
+                self.pending_motion.0, self.pending_motion.1, self.pending_motion.2
+            );
+        }
+    }
+
+    /// Adds a pure-motion batch to the coalescing accumulator (see --motion-hz).
+    fn accumulate_motion(&mut self, events: &[event::InputEvent]) {
+        for e in events {
+            if let Some(i) = &e.inputi32 {
+                if i.code == evdev::RelativeAxisCode::REL_X.0 {
+                    self.pending_motion.0 = self.pending_motion.0.saturating_add(i.value);
+                } else {
+                    self.pending_motion.1 = self.pending_motion.1.saturating_add(i.value);
+                }
+            }
+        }
+        self.pending_motion.2 += events.len() as u64;
+        self.motion_dirty = true;
+        trace!(
+            "Accumulated motion: dx={} dy={} ({} events pending)",
+            self.pending_motion.0, self.pending_motion.1, self.pending_motion.2
+        );
+    }
+
+    /// Whether coalesced motion is waiting for the flush timer (see --motion-hz).
+    pub fn motion_dirty(&self) -> bool {
+        self.motion_dirty
+    }
+
+    /// Sends any coalesced pointer motion to the active client as a single
+    /// batch (see --motion-hz). No-op when nothing is pending.
+    pub async fn flush_pending_motion(&mut self) {
+        if !self.motion_dirty {
+            return;
+        }
+        self.motion_dirty = false;
+        let (dx, dy, source_count) = std::mem::replace(&mut self.pending_motion, (0, 0, 0));
+        let endpoint = match self.current_client {
+            Some(endpoint) => endpoint,
+            // Switched away meanwhile; the pending deltas are moot.
+            None => return,
+        };
+        let mut events = Vec::with_capacity(2);
+        if dx != 0 {
+            events.push(motion_event(evdev::RelativeAxisCode::REL_X.0, dx));
+        }
+        if dy != 0 {
+            events.push(motion_event(evdev::RelativeAxisCode::REL_Y.0, dy));
+        }
+        if events.is_empty() {
+            return;
+        }
+        match self.try_send_motion_datagram(&endpoint, events) {
+            MotionSend::Sent => {
+                self.status_counts.forwarded += source_count;
+            }
+            MotionSend::Fallback(events) => {
+                if let Err(e) = self
+                    .send_event_to_remote_client(event::ServerEvent::Input(events))
+                    .await
+                {
+                    warn!("Failed to forward coalesced motion: {:?}", e);
+                } else {
+                    self.status_counts.forwarded += source_count;
+                }
+            }
+        }
     }
 
     /// Attempts to send a pure pointer-motion batch as a QUIC datagram.
@@ -1205,6 +1300,14 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             // Remote client is active, send all input to client and not to local machine.
             let mut events = batch.events;
             if is_pure_pointer_motion(&events) {
+                if self.motion_flush_interval.is_some() {
+                    // Office-mode coalescing (--motion-hz): sum the deltas into
+                    // the accumulator; the flush timer forwards them at the
+                    // configured rate. Lossless for the cursor position, far
+                    // less network/CPU load than one message per 8kHz poll.
+                    self.accumulate_motion(&events);
+                    return Ok(());
+                }
                 // High-rate pointer motion goes over unreliable/unordered QUIC
                 // datagrams: a lost motion update is instantly superseded by the
                 // next one, so skipping it beats stalling all later input behind
@@ -1217,6 +1320,9 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                     MotionSend::Fallback(returned_events) => events = returned_events,
                 }
             }
+            // Ordering: coalesced motion must reach the client before this
+            // batch (e.g. a click lands after the motion that preceded it).
+            self.flush_pending_motion().await;
             self.send_event_to_remote_client(event::ServerEvent::Input(events))
                 .await?;
             self.status_counts.forwarded += event_count;
@@ -1403,6 +1509,9 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                 warn!("Failed to release held keys on local virtual devices: {:?}", e);
             }
         }
+        // Motion accumulated for the previous target is moot after a switch.
+        self.pending_motion = (0, 0, 0);
+        self.motion_dirty = false;
         self.current_client = client;
         // Record which client is active (or none) so that an unexpected exit
         // mid-session can be recovered on the next server start. This is the
@@ -1692,6 +1801,7 @@ mod tests {
             None,
             &dir,
             rotation_tx,
+            None,
         )
         .await
         .unwrap();
@@ -1712,6 +1822,51 @@ mod tests {
         rotation.log_input_status();
         assert_eq!(rotation.status_counts.physical, 0);
         assert_eq!(rotation.status_counts.emitted_local, 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn motion_coalescing_accumulates_and_clears() {
+        let dir = temp_dir("coalesce");
+        let (grab_tx, _grab_rx) = watch::channel(device::GrabEvent::Ungrab);
+        let (rotation_tx, _rotation_rx) = mpsc::channel(8);
+        let mut rotation = Rotation::new(
+            grab_tx,
+            StubOutput { written: 0 },
+            None,
+            &dir,
+            rotation_tx,
+            Some(Duration::from_millis(8)),
+        )
+        .await
+        .unwrap();
+
+        // With a client "active" (no network attached), pure motion batches are
+        // accumulated instead of forwarded.
+        rotation.current_client = Some("127.0.0.1:1234".parse().unwrap());
+        let rel = evdev::EventType::RELATIVE.0;
+        let rel_x = evdev::RelativeAxisCode::REL_X.0;
+        let rel_y = evdev::RelativeAxisCode::REL_Y.0;
+        for (dx, dy) in [(3, -2), (1, 0), (-2, 5)] {
+            rotation
+                .send_input_events(device::InputBatch {
+                    events: vec![i32_event(rel, rel_x, dx), i32_event(rel, rel_y, dy)],
+                    is_grabbed: false,
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!(rotation.pending_motion, (2, 3, 6));
+        assert!(rotation.motion_dirty());
+        // Nothing was forwarded yet; the physical side was counted.
+        assert_eq!(rotation.status_counts.physical, 6);
+        assert_eq!(rotation.status_counts.forwarded, 0);
+
+        // Switching away clears the accumulator without sending.
+        rotation.current_client = None;
+        rotation.flush_pending_motion().await;
+        assert!(!rotation.motion_dirty());
+        assert_eq!(rotation.pending_motion, (0, 0, 0));
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -25,6 +25,7 @@ pub async fn run_server_events_loop<O: output::OutputHandler>(
     max_uncompressed_size_bytes: u64,
     rotation_tx: mpsc::Sender<rotation::RotationEvent>,
     mut rotation_rx: mpsc::Receiver<rotation::RotationEvent>,
+    motion_flush_interval: Option<Duration>,
 ) -> Result<()> {
     let local_clipboard = LocalClipboard::start(
         config_dir.clone(),
@@ -34,12 +35,24 @@ pub async fn run_server_events_loop<O: output::OutputHandler>(
     ).await;
 
     let mut rotation =
-        rotation::Rotation::new(grab_tx, output_handler, local_clipboard, &config_dir, rotation_tx).await?;
+        rotation::Rotation::new(grab_tx, output_handler, local_clipboard, &config_dir, rotation_tx, motion_flush_interval).await?;
     // Input-flow heartbeat: makes "user is typing but nothing arrives anywhere"
     // visible in the log, instead of silent (the dead-Enter investigations).
     let mut status_tick = time::interval(Duration::from_secs(10));
     // Skip the immediate first tick; the first heartbeat lands 10s in.
     status_tick.tick().await;
+    // Pointer-motion coalescing flush timer (office mode, see --motion-hz).
+    // The branch guard keeps it inert until motion has accumulated; after a
+    // long idle the first tick fires immediately, so the first delta goes out
+    // without added delay and only sustained streams are coalesced.
+    let mut motion_tick =
+        time::interval(motion_flush_interval.unwrap_or(Duration::from_secs(3600)));
+    // The tick is only polled while motion is pending, so after an idle stretch
+    // many periods count as "missed". Delay (not the default Burst) skips the
+    // catch-up: one immediate flush after idle, then one per interval. With
+    // Burst, the backlog of catch-up ticks would fire on every frame and
+    // silently defeat the coalescing.
+    motion_tick.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             // Listen and forward rotation events to rotation
@@ -78,6 +91,9 @@ pub async fn run_server_events_loop<O: output::OutputHandler>(
             },
             _ = status_tick.tick() => {
                 rotation.log_input_status();
+            },
+            _ = motion_tick.tick(), if rotation.motion_dirty() => {
+                rotation.flush_pending_motion().await;
             },
         }
     }

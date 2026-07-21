@@ -99,6 +99,14 @@ struct ServerArgs {
     /// The default is low-latency tuning for local networks.
     #[arg(long)]
     www: bool,
+
+    /// Target rate for forwarding pointer motion, in updates per second. Motion
+    /// deltas are coalesced (summed losslessly) between updates: the cursor ends
+    /// up in the same place with far less network and CPU load. The default of
+    /// 125 is plenty for office work; set 0 to forward every event as it comes
+    /// (e.g. for gaming with a high-polling-rate mouse).
+    #[arg(long, default_value_t = 125, value_name = "hz")]
+    motion_hz: u32,
 }
 
 #[derive(Args)]
@@ -228,6 +236,14 @@ fn main() -> Result<()> {
                 .max_clipboard_size_kb
                 .checked_mul(1024)
                 .context("--max-clipboard-size-kb is too large")?;
+            let motion_flush_interval =
+                (args.motion_hz > 0).then(|| Duration::from_secs_f64(1.0 / args.motion_hz as f64));
+            if motion_flush_interval.is_some() {
+                info!(
+                    "Coalescing pointer motion to {} updates/s (--motion-hz 0 to disable)",
+                    args.motion_hz
+                );
+            }
             rt.block_on(async {
                 server(
                     config_dir,
@@ -241,6 +257,7 @@ fn main() -> Result<()> {
                     fingerprint,
                     max_clipboard_size_bytes,
                     mode,
+                    motion_flush_interval,
                 )
                 .await
             })?;
@@ -413,6 +430,7 @@ async fn server(
     fingerprint: Arc<Mutex<Option<String>>>,
     max_clipboard_size_bytes: u64,
     mode: NetworkMode,
+    motion_flush_interval: Option<Duration>,
 ) -> Result<()> {
     // Try to set up virtual devices up-front - exit early if we can't access uinput
     let mut output_handler = output::uinput::VirtualUInputDevices::new()
@@ -471,6 +489,7 @@ async fn server(
             10 * max_clipboard_size_bytes,
             rotation_tx,
             rotation_rx,
+            motion_flush_interval,
         )
         .await
     });
