@@ -8,7 +8,7 @@ use quinn::{
     congestion::BbrConfig, AckFrequencyConfig, ClientConfig, Endpoint, EndpointConfig, IdleTimeout,
     RecvStream, SendStream, ServerConfig, TransportConfig, VarInt,
 };
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::msgs::shared;
 use crate::network::approval;
@@ -283,6 +283,22 @@ fn transport_config(mode: NetworkMode) -> Arc<TransportConfig> {
     }
 
     Arc::new(transport_config)
+}
+
+/// Logs QUIC path stats when a connection drops, to tell apart a lossy link
+/// (high loss/congestion/black holes) from a silent peer (low loss and normal
+/// RTT, e.g. a CPU stall or WiFi buffering on the other side).
+pub fn log_conn_stats(conn: &quinn::Connection) {
+    let path = conn.stats().path;
+    info!(
+        "Connection stats on drop: rtt={:?} cwnd={} lost_packets={}/{} congestion_events={} black_holes={}",
+        path.rtt,
+        path.cwnd,
+        path.lost_packets,
+        path.sent_packets,
+        path.congestion_events,
+        path.black_holes_detected
+    );
 }
 
 pub async fn send_version(send: &mut SendStream) -> Result<()> {

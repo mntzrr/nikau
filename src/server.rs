@@ -247,18 +247,26 @@ async fn handle_connection(
     loop {
         tokio::select! {
             event_result = events_recv.read_chunk(16384, true) => {
-                let resp = event_result
-                    .context("Lost client events connection")?
-                    .context("Client closed events connection")?;
+                let resp = match event_result {
+                    Ok(chunk) => chunk.context("Client closed events connection")?,
+                    Err(e) => {
+                        transport::log_conn_stats(&conn);
+                        Err(e).context("Lost client events connection")?
+                    }
+                };
                 trace!("Received {} bytes from events stream: {:X?}", resp.bytes.len(), &*resp.bytes);
                 // Copy the immutable response data into a mutable buffer
                 event_bytes.extend_from_slice(&resp.bytes);
                 handle_event_messages(conn.remote_address(), &rotation_tx, &mut event_bytes, max_clipboard_size_bytes).await?;
             },
             bulk_result = bulk_recv.read_chunk(65536, true) => {
-                let resp = bulk_result
-                    .context("Lost client bulk connection")?
-                    .context("Client closed bulk connection")?;
+                let resp = match bulk_result {
+                    Ok(chunk) => chunk.context("Client closed bulk connection")?,
+                    Err(e) => {
+                        transport::log_conn_stats(&conn);
+                        Err(e).context("Lost client bulk connection")?
+                    }
+                };
                 trace!("Received {} bytes from bulk stream: {:X?}", resp.bytes.len(), &*resp.bytes);
                 if let Some((c, request_client, request_id)) = &mut incoming_clipboard_data {
                     if c.remaining_bytes >= resp.bytes.len() {

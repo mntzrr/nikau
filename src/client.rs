@@ -28,9 +28,14 @@ pub async fn run<O: output::OutputHandler>(
     let (mut client, connect_time) =
         Connection::new(server_addr, cert_verifier, max_clipboard_size_bytes, mode).await?;
     loop {
-        client
+        if let Err(e) = client
             .step(local_clipboard, output_handler, &connect_time)
-            .await?
+            .await
+        {
+            // Log QUIC path stats: tells a lossy link apart from a silent peer.
+            transport::log_conn_stats(client.conn());
+            return Err(e);
+        }
     }
 }
 
@@ -137,6 +142,11 @@ impl Connection {
             },
             connect_time,
         ))
+    }
+
+    /// Exposes the QUIC connection for stats logging on connection loss.
+    fn conn(&self) -> &quinn::Connection {
+        &self.quinn_conn
     }
 
     /// Performs a step of the client event loop, returning an error if the connection should be retried.
