@@ -109,8 +109,9 @@ struct ServerArgs {
     motion_hz: u32,
 
     /// Automatically check for updates and install them in the background
-    /// (daily, at low CPU priority). Never restarts the running session;
-    /// you'll get a desktop notification when a restart is due.
+    /// (daily, at low CPU priority), then restart to apply them: after a
+    /// short grace period the process re-execs the new binary and the
+    /// session resumes automatically on reconnect.
     #[arg(long)]
     auto_update: bool,
 }
@@ -138,8 +139,9 @@ struct ClientArgs {
     www: bool,
 
     /// Automatically check for updates and install them in the background
-    /// (daily, at low CPU priority). Never restarts the running session;
-    /// you'll get a desktop notification when a restart is due.
+    /// (daily, at low CPU priority), then restart to apply them: after a
+    /// short grace period the process re-execs the new binary and the
+    /// session resumes automatically on reconnect.
     #[arg(long)]
     auto_update: bool,
 }
@@ -362,18 +364,53 @@ fn main() -> Result<()> {
             })?;
         }
     }
+    // A background auto-update may have scheduled a restart (autoupdate.rs):
+    // the graceful shutdown above has completed, so replace this process with
+    // the freshly installed binary.
+    if monux::autoupdate::restart_scheduled() {
+        reexec_after_update()?;
+    }
     Ok(())
 }
 
-/// After taking over from a previous instance, wait for udev to finish
-/// processing the previous instance's virtual-device teardown before we
-/// create ours. Without this, rapid restarts race: the old devices' evdev
-/// remove events can reach the compositor after the new devices' add events
-/// for the same devpath, making the compositor drop or never register our
-/// brand-new virtual keyboard (seen in the wild as all keyboard input going
-/// dead after a few restarts; 'hyprctl reload' makes it reappear).
+/// Replaces this process image with the freshly installed monux binary after
+/// a background auto-update. execve preserves our pid, args and environment
+/// and closes our (CLOEXEC) fds, releasing the single-instance lock, keyboard
+/// grabs and virtual devices for the new image in one atomic step.
+/// MONUX_RESTARTED tells the new image to let udev settle before creating its
+/// virtual devices (the same teardown/create race as a take-over restart).
+fn reexec_after_update() -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    let exe = std::env::current_exe()
+        .context("Failed to find our own executable for the post-update restart")?;
+    // The update replaced the binary on disk while we were running, so Linux
+    // reports our exe as "<path> (deleted)"; the plain path is the new binary.
+    let exe = exe.to_string_lossy().trim_end_matches(" (deleted)").to_string();
+    info!("Restarting into the updated monux ({})...", exe);
+    let err = std::process::Command::new(&exe)
+        .args(std::env::args_os().skip(1))
+        .env("MONUX_RESTARTED", "1")
+        .exec();
+    Err(anyhow!(
+        "Failed to restart into the updated monux ({}): {}",
+        exe,
+        err
+    ))
+}
+
+/// After taking over from a previous instance (or re-exec'ing ourselves after
+/// an auto-update), wait for udev to finish processing the previous instance's
+/// virtual-device teardown before we create ours. Without this, rapid restarts
+/// race: the old devices' evdev remove events can reach the compositor after
+/// the new devices' add events for the same devpath, making the compositor
+/// drop or never register our brand-new virtual keyboard (seen in the wild as
+/// all keyboard input going dead after a few restarts; 'hyprctl reload' makes
+/// it reappear).
 fn settle_after_takeover(lock: &single_instance::InstanceLock) {
-    if !lock.took_over {
+    // A re-exec after an auto-update (MONUX_RESTARTED) releases the lock
+    // atomically, so took_over is false — but the old image's virtual devices
+    // were torn down at the same instant, so the same udev race applies.
+    if !lock.took_over && std::env::var_os("MONUX_RESTARTED").is_none() {
         return;
     }
     // udevadm settle waits for udev's event queue to drain, so the old remove
@@ -388,9 +425,9 @@ fn settle_after_takeover(lock: &single_instance::InstanceLock) {
         .map(|s| s.success())
         .unwrap_or(false);
     if settled {
-        info!("Settled after taking over from the previous instance (udev queue drained)");
+        info!("Settled before creating virtual devices (udev queue drained)");
     } else {
-        info!("Settling briefly after taking over from the previous instance");
+        info!("Settling briefly before creating virtual devices");
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
 }

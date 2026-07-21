@@ -1673,8 +1673,12 @@ pub fn active_client_state_path(config_dir: &Path) -> PathBuf {
 
 /// Reads the fingerprint of the client that was active when the previous
 /// server instance exited unexpectedly. Returns None when there is nothing to
-/// resume: no state file, a stale one, or an empty one. The file is removed in
-/// any case; it is rewritten on the next switch to a client.
+/// resume: no state file, a stale one, or an empty one (stale and empty files
+/// are removed as junk). A fresh file is LEFT IN PLACE: the resume may span
+/// several restarts before the client manages to reconnect (e.g. chained
+/// auto-update restarts), and consuming it at load would lose the state after
+/// the first one. It is rewritten on the next switch to a client and removed
+/// on switch back to the local machine.
 fn load_pending_resume(path: &Path) -> Option<String> {
     let metadata = fs::metadata(path).ok()?;
     let stale = match metadata.modified().ok().and_then(|m| m.elapsed().ok()) {
@@ -1689,8 +1693,8 @@ fn load_pending_resume(path: &Path) -> Option<String> {
         return None;
     }
     let fingerprint = fs::read_to_string(path).ok()?.trim().to_string();
-    let _ = fs::remove_file(path);
     if fingerprint.is_empty() {
+        let _ = fs::remove_file(path);
         None
     } else {
         Some(fingerprint)
@@ -1698,8 +1702,8 @@ fn load_pending_resume(path: &Path) -> Option<String> {
 }
 
 /// Removes the active-client state file, if present. Called on switches back
-/// to the local machine and on graceful server shutdown, so that only an
-/// unexpected exit (crash, kill -9) leaves a session behind to resume.
+/// to the local machine. The file deliberately survives shutdown (graceful or
+/// not): the next server instance uses it to resume the session.
 pub fn clear_active_client(path: &Path) {
     if let Err(e) = fs::remove_file(path) {
         if e.kind() != std::io::ErrorKind::NotFound {
@@ -1764,8 +1768,10 @@ mod tests {
         let path = active_client_state_path(&dir);
         fs::write(&path, "deadbeef").unwrap();
         assert_eq!(load_pending_resume(&path), Some("deadbeef".to_string()));
-        // The file is consumed by the load.
-        assert!(!path.exists());
+        // A fresh file survives the load: the resume may span several
+        // restarts before the client manages to reconnect.
+        assert!(path.exists());
+        assert_eq!(load_pending_resume(&path), Some("deadbeef".to_string()));
         let _ = fs::remove_dir_all(&dir);
     }
 

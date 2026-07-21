@@ -57,13 +57,13 @@ Updating never disrupts a running session: the processes keep their in-memory bi
 To pick up the new version, restart the processes — the session then heals itself:
 
 - **Server:** start `monux server` again however you normally run it (the new instance asks the old one to shut down and takes over). Clients reconnect within a few seconds, and the machine that was active is re-activated automatically — no client-side steps needed.
-- **Client:** run `monux update` on the client machine and restart the client there (e.g. over SSH). It reconnects and resumes by itself.
+- **Client:** run `monux update` on the client machine and restart the client there (e.g. over SSH). It reconnects and resumes by itself. Or run the client with `--auto-update` (below) so it updates and restarts itself — no remote access needed.
 
 Active-session resumption survives server restarts for up to an hour (see `active_client` in `~/.config/monux`).
 
 ### Automatic updates
 
-Pass `--auto-update` to `monux server` and/or `monux client` to have them check the GitHub repo once shortly after startup and then daily. When a newer commit appears, it is rebuilt and installed in the background at low CPU priority — the running session is never interrupted and never restarted on its own. When an update is installed you get a desktop notification; restart the process whenever convenient (the session resumes automatically, see above). Auto-update trusts the configured GitHub repo and this machine's git setup implicitly; leave it off if you prefer to review changes first.
+Pass `--auto-update` to `monux server` and/or `monux client` to have them check the GitHub repo once shortly after startup and then daily. When a newer commit appears, it is rebuilt and installed in the background at low CPU priority; a few seconds later (after a desktop notification) the process restarts itself into the new binary. The restart drops the session for a few seconds, which then heals itself: clients reconnect automatically and whichever machine was active is re-activated (see above). This is handy for machines you can't easily reach — e.g. keeping a client up to date without SSH access. Auto-update trusts the configured GitHub repo and this machine's git setup implicitly; leave it off if you prefer to review changes first.
 
 ## Usage
 

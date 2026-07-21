@@ -98,7 +98,10 @@ fn create_socket(bind_addr: SocketAddr, mode: NetworkMode) -> Result<std::net::U
     } else {
         libc::AF_INET
     };
-    let fd = unsafe { libc::socket(domain, libc::SOCK_DGRAM, 0) };
+    // SOCK_CLOEXEC: the auto-update restart re-execs the binary, and this
+    // socket must not leak into the new image — it would keep the listen
+    // port bound, failing the new endpoint with EADDRINUSE.
+    let fd = unsafe { libc::socket(domain, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
     if fd < 0 {
         bail!("Failed to create UDP socket: {}", std::io::Error::last_os_error());
     }
