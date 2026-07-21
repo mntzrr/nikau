@@ -15,6 +15,7 @@ use crate::clipboard::{client, data};
 use crate::device::output;
 use crate::msgs::{bulk, event, shared};
 use crate::network::{approval, transport};
+use crate::notify;
 
 /// Client-side scaling for relative pointer/scroll deltas (--mouse-scale,
 /// --scroll-scale), applied on injection into this machine's virtual devices.
@@ -126,6 +127,18 @@ pub async fn run<O: output::OutputHandler>(
         scroll_scale,
     )
     .await?;
+    notify::notify(
+        "monux-connection",
+        notify::Urgency::Low,
+        3000,
+        "monux connected",
+        &format!("Connected to server {}", server_addr),
+    );
+    // The link monitor's thresholds assume a LAN; a --www connection
+    // legitimately exceeds them, so it only runs in Local mode.
+    if mode == transport::NetworkMode::Local {
+        task::spawn(monitor_link(client.conn().clone()));
+    }
     loop {
         if let Err(e) = client
             .step(local_clipboard, output_handler, &connect_time)
@@ -133,6 +146,20 @@ pub async fn run<O: output::OutputHandler>(
         {
             // Log QUIC path stats: tells a lossy link apart from a silent peer.
             transport::log_conn_stats(client.conn());
+            if !is_new_connection(&connect_time) {
+                // An established session dropped. A connect that fails fast is
+                // a setup/reachability problem and stays in the logs.
+                notify::notify(
+                    "monux-connection",
+                    notify::Urgency::Normal,
+                    5000,
+                    "monux connection lost",
+                    &format!(
+                        "Lost the connection to server {}; reconnecting in the background",
+                        server_addr
+                    ),
+                );
+            }
             return Err(e);
         }
     }
@@ -860,6 +887,151 @@ fn is_new_connection(connect_time: &Instant) -> bool {
     Instant::now().duration_since(*connect_time) < Duration::from_secs(5)
 }
 
+/// How often the link monitor samples the connection's QUIC path stats.
+const LINK_SAMPLE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// RTT above which the link is called degraded. monux targets LANs, where RTT
+/// is single-digit milliseconds; beyond this, the network (usually WiFi) is
+/// adding user-visible lag to every input event.
+const LINK_RTT_WARN: Duration = Duration::from_millis(50);
+
+/// Packet-loss rate (lost/sent within one sample window) above which the link
+/// is called degraded. A healthy LAN loses ~nothing; beyond this, pointer
+/// motion stutters and keystrokes wait on retransmits.
+const LINK_LOSS_WARN: f64 = 0.02;
+
+/// Minimum packets in a sample window before its loss rate means anything. An
+/// idle connection sends only keepalives (~8 per window), where a single lost
+/// packet would already read as >10% loss.
+const LINK_LOSS_MIN_WINDOW_PACKETS: u64 = 20;
+
+/// Minimum spacing between link notifications (degraded and recovered alike),
+/// so a flapping link can't turn into notification spam.
+const LINK_NOTIFY_COOLDOWN: Duration = Duration::from_secs(5 * 60);
+
+/// What a link sample means for the user.
+#[derive(Debug, PartialEq, Eq)]
+enum LinkVerdict {
+    /// Nothing changed (or a change was suppressed by the cooldown).
+    Steady,
+    /// The link crossed a degradation threshold; warn.
+    Degraded,
+    /// The link returned under the thresholds after a warned degradation.
+    Recovered,
+}
+
+/// Tracks link-degradation notification state across samples: warns once when
+/// the link goes bad and once when it recovers, rate-limited to one
+/// notification per LINK_NOTIFY_COOLDOWN. A transition suppressed by the
+/// cooldown leaves the state untouched, so it is retried on the next sample —
+/// a persistent degradation still surfaces once the cooldown expires.
+struct LinkMonitor {
+    /// Whether the user has been told the link is bad and not yet told it recovered.
+    degraded: bool,
+    /// When the last link notification (either kind) was shown.
+    last_notification: Option<Instant>,
+}
+
+impl LinkMonitor {
+    fn new() -> Self {
+        LinkMonitor {
+            degraded: false,
+            last_notification: None,
+        }
+    }
+
+    /// Classifies one stats sample; `loss_rate` is lost/sent over the window.
+    fn check(&mut self, rtt: Duration, loss_rate: f64, now: Instant) -> LinkVerdict {
+        let bad = rtt > LINK_RTT_WARN || loss_rate > LINK_LOSS_WARN;
+        if bad == self.degraded {
+            return LinkVerdict::Steady;
+        }
+        if self
+            .last_notification
+            .is_some_and(|last| last + LINK_NOTIFY_COOLDOWN > now)
+        {
+            return LinkVerdict::Steady;
+        }
+        self.degraded = bad;
+        self.last_notification = Some(now);
+        if bad {
+            LinkVerdict::Degraded
+        } else {
+            LinkVerdict::Recovered
+        }
+    }
+}
+
+/// Samples the connection's QUIC path stats on a timer and warns — at most
+/// once per LINK_NOTIFY_COOLDOWN — when the link degrades past LAN
+/// expectations, plus once when it recovers. The message points at the
+/// WiFi/link, not monux. Exits when the connection closes.
+async fn monitor_link(conn: quinn::Connection) {
+    let mut monitor = LinkMonitor::new();
+    let mut interval = tokio::time::interval(LINK_SAMPLE_INTERVAL);
+    // The first interval tick is immediate: consume it and take the loss
+    // baseline, so every judged window is a genuine post-connect interval.
+    // A handshake that spanned a server outage retransmits Initials into the
+    // void; those cumulative counters would otherwise poison the first window.
+    interval.tick().await;
+    let mut last_sent = conn.stats().path.sent_packets;
+    let mut last_lost = conn.stats().path.lost_packets;
+    loop {
+        tokio::select! {
+            _ = conn.closed() => return,
+            _ = interval.tick() => {}
+        }
+        let path = conn.stats().path;
+        // The counters are cumulative; the rate is over the last window. A
+        // window too small for a meaningful rate (idle, keepalives only)
+        // reports no loss; the RTT is still judged.
+        let sent = path.sent_packets.saturating_sub(last_sent);
+        let lost = path.lost_packets.saturating_sub(last_lost);
+        last_sent = path.sent_packets;
+        last_lost = path.lost_packets;
+        let loss_rate = if sent < LINK_LOSS_MIN_WINDOW_PACKETS {
+            0.0
+        } else {
+            lost as f64 / sent as f64
+        };
+        match monitor.check(path.rtt, loss_rate, Instant::now()) {
+            LinkVerdict::Steady => {}
+            LinkVerdict::Degraded => {
+                warn!(
+                    "Link degraded: rtt={:?} loss={:.1}% over the last {:?} — a WiFi/link issue, not monux",
+                    path.rtt,
+                    loss_rate * 100.0,
+                    LINK_SAMPLE_INTERVAL
+                );
+                notify::notify(
+                    "monux-link",
+                    notify::Urgency::Normal,
+                    10000,
+                    "monux: link degraded",
+                    &format!(
+                        "Connection to the server is degraded: RTT {:.0}ms, {:.1}% packet loss. This is a WiFi/link problem, not monux — check signal strength or cabling.",
+                        path.rtt.as_secs_f64() * 1000.0,
+                        loss_rate * 100.0
+                    ),
+                );
+            }
+            LinkVerdict::Recovered => {
+                info!("Link recovered: rtt={:?}", path.rtt);
+                notify::notify(
+                    "monux-link",
+                    notify::Urgency::Low,
+                    4000,
+                    "monux: link recovered",
+                    &format!(
+                        "Connection to the server is healthy again (RTT {:.0}ms).",
+                        path.rtt.as_secs_f64() * 1000.0
+                    ),
+                );
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1005,5 +1177,82 @@ mod tests {
         s.apply(&mut batch);
         assert_eq!(batch.len(), 3);
         assert_eq!(batch[2].inputi32.as_ref().unwrap().value, 4);
+    }
+
+    #[test]
+    fn link_monitor_thresholds() {
+        let mut m = LinkMonitor::new();
+        let t0 = Instant::now();
+        // Good samples never notify.
+        assert_eq!(m.check(Duration::from_millis(2), 0.0, t0), LinkVerdict::Steady);
+        // Exactly at a threshold is not yet a warning (> not >=).
+        assert_eq!(
+            m.check(LINK_RTT_WARN, LINK_LOSS_WARN, t0),
+            LinkVerdict::Steady
+        );
+        // Loss alone can degrade the link.
+        assert_eq!(
+            m.check(Duration::from_millis(1), LINK_LOSS_WARN + 0.01, t0),
+            LinkVerdict::Degraded
+        );
+    }
+
+    #[test]
+    fn link_monitor_warns_once_per_degradation() {
+        let mut m = LinkMonitor::new();
+        let t0 = Instant::now();
+        // Bad RTT: warn once.
+        assert_eq!(m.check(Duration::from_millis(80), 0.0, t0), LinkVerdict::Degraded);
+        // Still bad: no repeat, however long it lasts.
+        assert_eq!(
+            m.check(Duration::from_millis(90), 0.0, t0 + Duration::from_secs(15)),
+            LinkVerdict::Steady
+        );
+        assert_eq!(
+            m.check(Duration::from_millis(2), 0.05, t0 + Duration::from_secs(30)),
+            LinkVerdict::Steady
+        );
+        // A recovery inside the cooldown is suppressed (retried next sample)...
+        assert_eq!(
+            m.check(Duration::from_millis(2), 0.0, t0 + Duration::from_secs(45)),
+            LinkVerdict::Steady
+        );
+        // ...and reported once the cooldown has expired.
+        let t1 = t0 + LINK_NOTIFY_COOLDOWN + Duration::from_secs(15);
+        assert_eq!(m.check(Duration::from_millis(2), 0.0, t1), LinkVerdict::Recovered);
+        // Good samples stay quiet.
+        assert_eq!(
+            m.check(Duration::from_millis(2), 0.0, t1 + Duration::from_secs(15)),
+            LinkVerdict::Steady
+        );
+    }
+
+    #[test]
+    fn link_monitor_rate_limits_flapping() {
+        let mut m = LinkMonitor::new();
+        let t0 = Instant::now();
+        assert_eq!(m.check(Duration::from_millis(80), 0.0, t0), LinkVerdict::Degraded);
+        // Recovering 30s later is inside the cooldown: suppressed, and the
+        // state stays "degraded" (the user still believes the link is bad).
+        assert_eq!(
+            m.check(Duration::from_millis(2), 0.0, t0 + Duration::from_secs(30)),
+            LinkVerdict::Steady
+        );
+        // Bad again right after: matches the state, nothing owed.
+        assert_eq!(
+            m.check(Duration::from_millis(80), 0.0, t0 + Duration::from_secs(45)),
+            LinkVerdict::Steady
+        );
+        // Once the cooldown has expired, a recovery is reported.
+        let t1 = t0 + LINK_NOTIFY_COOLDOWN + Duration::from_secs(15);
+        assert_eq!(m.check(Duration::from_millis(2), 0.0, t1), LinkVerdict::Recovered);
+        // And a new degradation right after is again suppressed by the
+        // cooldown, then reported once it expires.
+        assert_eq!(
+            m.check(Duration::from_millis(80), 0.0, t1 + Duration::from_secs(15)),
+            LinkVerdict::Steady
+        );
+        let t2 = t1 + LINK_NOTIFY_COOLDOWN + Duration::from_secs(1);
+        assert_eq!(m.check(Duration::from_millis(80), 0.0, t2), LinkVerdict::Degraded);
     }
 }

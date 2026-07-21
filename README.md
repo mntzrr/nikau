@@ -42,6 +42,25 @@ To uninstall later: `monux system uninstall` stops any running server/client, re
 
 After installation, the binary is available as `monux` in `~/.local/bin`, which is in `PATH` by default on systemd-based distros and in most shell profiles (unlike `~/.cargo/bin`). If your shell doesn't find it, add `export PATH="$HOME/.local/bin:$PATH"` to your shell's rc file.
 
+### Autostart on login (optional)
+
+`monux system setup` can also install a per-user systemd service that starts monux with your graphical session:
+
+```bash
+monux system setup --autostart server   # or: --autostart client
+```
+
+This writes `~/.config/systemd/user/monux-<role>.service` and enables+starts it via `systemctl --user` (`Restart=on-failure`, 3s delay). The client service runs plain `monux client` with no address argument, so it finds the server via mDNS auto-discovery — nothing machine-specific is baked into the unit. `--autostart off` disables both services and removes the unit files; omitting the flag leaves autostart untouched.
+
+Check status and logs with:
+
+```bash
+systemctl --user status monux-server
+journalctl --user -u monux-server
+```
+
+**Clipboard sharing caveat:** the service inherits the systemd user manager's environment, not your compositor's session. Clipboard sharing needs `WAYLAND_DISPLAY`/`DISPLAY`, `XDG_RUNTIME_DIR`, and `DBUS_SESSION_BUS_ADDRESS` imported into the user manager. Hyprland handles this when launched via UWSM, or with its systemd integration (`exec-once = dbus-update-activation-environment --systemd WAYLAND_DISPLAY XDG_CURRENT_DESKTOP`). Without it the service still works for input, but clipboard sharing stays disabled — exactly like running monux with `WAYLAND_DISPLAY` unset.
+
 ### If you want a portable binary
 
 Remove or edit `.cargo/config.toml` and change `target-cpu=native` to `target-cpu=x86-64`, then rebuild. This produces a binary that runs on any x86-64 CPU.
@@ -101,7 +120,7 @@ Switch between the server and connected clients using `LeftShift+LeftAlt+R` (nex
 
 Pause input handling entirely with `LeftShift+LeftAlt+P` (configurable via `--pause-shortcut`, empty string disables). While paused, monux ungrabs **all** input devices — keyboards included — so the local machine gets raw evdev input with monux's re-emit completely out of the way (useful for games and raw-input apps). monux keeps listening ungrabbed, so the pause chord still works: press it again to resume, which re-grabs per the current rotation state (keyboards always, mice only while a client is active). While paused nothing is forwarded to clients and switch chords are not acted on — since devices are ungrabbed, those keystrokes also pass through to the local system. Clipboard sharing continues untouched while paused.
 
-Every switch also shows a desktop notification (via `notify-send`), so an unexpected switch is visible immediately.
+Every switch also shows a desktop notification (via `notify-send`), so an unexpected switch is visible immediately. The same goes for connection lifecycle events: the server notifies when a client joins or is dropped, the client notifies when the connection is lost and when it (re)connects, and a client on a degraded link (RTT over 50ms or packet loss over 2% — a WiFi/link problem, not monux) warns at most once per 5 minutes, plus once when the link recovers.
 
 > **Pick a shortcut that doesn't collide with your compositor/WM/application binds.** monux consumes only the *last* key of the combo, so if the same combo is bound elsewhere (e.g. `Alt+Shift+R` toggling your clipboard manager), pressing it fires *both* actions — and a switch you didn't mean to make looks exactly like dead keys: your input silently goes to the other machine. The notification exists to make such accidents obvious.
 

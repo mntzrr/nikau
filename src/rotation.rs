@@ -550,6 +550,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                 .collect::<Vec<String>>()
                 .join(", ")
         );
+        notify_client_joined(&endpoint);
 
         // Announce clipboard to client, if its IP doesn't match the clipboard owner's IP.
         // Matching IP would indicate that the client is reconnecting but we haven't disconnected the old one yet.
@@ -1960,6 +1961,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         match self.clients.binary_search_by(|c| c.endpoint.cmp(&endpoint)) {
             Ok(idx) => {
                 self.clients.remove(idx);
+                notify_client_dropped(endpoint);
             }
             Err(_e) => {
                 // Noop. Can happen if we're cleaning up for a client that wasn't added yet.
@@ -2121,28 +2123,34 @@ fn types_equal(a: &[String], b: &[String]) -> bool {
 
 /// Shows a best-effort desktop notification about an input switch, so that an
 /// accidental switch (e.g. a switch shortcut colliding with a compositor bind)
-/// is visible at a glance instead of looking like dead keys. Uses notify-send
-/// (libnotify); any failure (missing binary, no session bus, root without -E)
-/// is ignored. The spawned child is reaped by the tokio runtime.
+/// is visible at a glance instead of looking like dead keys.
 fn notify_switch(body: &str) {
-    let _ = tokio::process::Command::new("notify-send")
-        .args([
-            "-a",
-            "monux",
-            "-u",
-            "low",
-            "-t",
-            "2000",
-            // Replace the previous switch notification instead of stacking.
-            "-h",
-            "string:x-canonical-private-synchronous:monux-switch",
-            "monux",
-            body,
-        ])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
+    crate::notify::notify("monux-switch", crate::notify::Urgency::Low, 2000, "monux", body);
+}
+
+/// Notifies that a client (re-)entered the rotation. Called from add_client,
+/// which also covers reconnects (incl. session resumes).
+fn notify_client_joined(endpoint: &SocketAddr) {
+    crate::notify::notify(
+        "monux-client",
+        crate::notify::Urgency::Low,
+        3000,
+        "monux client connected",
+        &format!("{} joined the rotation", endpoint.ip()),
+    );
+}
+
+/// Notifies that a client left the rotation because its connection errored.
+/// monux has no client goodbye message, so every removal stems from a
+/// connection failure; a clean server shutdown removes nothing and stays silent.
+fn notify_client_dropped(endpoint: &SocketAddr) {
+    crate::notify::notify(
+        "monux-client",
+        crate::notify::Urgency::Normal,
+        5000,
+        "monux client lost",
+        &format!("Connection to {} was lost; it left the rotation", endpoint.ip()),
+    );
 }
 
 /// Path of the file recording the active client's fingerprint (see

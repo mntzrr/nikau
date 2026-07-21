@@ -6,6 +6,7 @@ pub mod discovery;
 pub mod logging;
 pub mod msgs;
 pub mod network;
+pub mod notify;
 pub mod rotation;
 pub mod server;
 pub mod setup;

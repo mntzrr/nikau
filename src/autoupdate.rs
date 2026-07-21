@@ -187,29 +187,17 @@ async fn restart_after_grace(remote_sha: &str, notify: bool) {
 }
 
 /// Shows a best-effort desktop notification that an update was installed and
-/// the process is about to restart (same pattern as notify_switch in
-/// rotation.rs). Any failure (missing binary, no session bus) is ignored.
+/// the process is about to restart.
 fn notify_update(remote_sha: &str, delay: Duration) {
-    let _ = std::process::Command::new("notify-send")
-        .args([
-            "-a",
-            "monux",
-            "-u",
-            "normal",
-            "-t",
-            "10000",
-            // Replace a previous update notification instead of stacking.
-            "-h",
-            "string:x-canonical-private-synchronous:monux-update",
-            "monux update installed",
-            &format!(
-                "monux {} was installed in the background; restarting in {}s to apply it (your session will resume automatically)",
-                short(remote_sha),
-                delay.as_secs()
-            ),
-        ])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
+    crate::notify::notify(
+        "monux-update",
+        crate::notify::Urgency::Normal,
+        10000,
+        "monux update installed",
+        &format!(
+            "monux {} was installed in the background; restarting in {}s to apply it (your session will resume automatically)",
+            short(remote_sha),
+            delay.as_secs()
+        ),
+    );
 }

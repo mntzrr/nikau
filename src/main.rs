@@ -66,13 +66,24 @@ enum SystemCommands {
     /// Persists machine-local settings that optimize this machine for local KVM
     /// (input device access, /dev/uinput permissions, WiFi power saving,
     /// UDP socket buffers). Re-executes with sudo automatically.
-    Setup,
+    Setup(SetupArgs),
 
     /// Removes monux from this machine: stops any running server/client, then
     /// removes the binary (and stale copies), the /usr/local/bin link, and the
     /// system settings persisted by 'monux system setup'. Asks before also
     /// removing ~/.config/monux (identity keypair and peer approvals).
     Uninstall,
+}
+
+#[derive(Args)]
+struct SetupArgs {
+    /// Also (de)activate autostart via a per-user systemd service: 'server' or
+    /// 'client' writes ~/.config/systemd/user/monux-<role>.service and
+    /// enables+starts it (client runs without an address, using mDNS
+    /// auto-discovery); 'off' disables and removes both. When omitted, no
+    /// autostart changes are made.
+    #[arg(long, value_enum, value_name = "server|client|off")]
+    autostart: Option<monux::setup::Autostart>,
 }
 
 #[derive(Args)]
@@ -340,9 +351,9 @@ fn main() -> Result<()> {
     // async runtime.
     match &cli.command {
         Commands::System(args) => match &args.command {
-            SystemCommands::Setup => {
+            SystemCommands::Setup(args) => {
                 maybe_elevate("to persist system settings")?;
-                return monux::setup::run();
+                return monux::setup::run(args.autostart);
             }
             SystemCommands::Uninstall => {
                 return monux::uninstall::run();
