@@ -154,8 +154,11 @@ struct UpdateArgs {
 }
 
 /// Listens for SIGUSR1 and SIGUSR2, treating them as "switch to next client" and "switch to prev client" respectively.
-/// SIGHUP dumps the server's internal state to the log for troubleshooting.
-fn handle_signals(mut signals: Signals, out: mpsc::Sender<Event>) {
+/// SIGHUP dumps the server's mirrored diagnostics state to the log for troubleshooting.
+/// The dump reads the mirror directly instead of going through the server event
+/// loop, so it still prints when the loop itself is stalled — the exact scenario
+/// the dump exists to debug.
+fn handle_signals(mut signals: Signals, out: mpsc::Sender<Event>, diagnostics: Arc<rotation::DiagnosticsMirror>) {
     let mut iter = signals.into_iter();
     loop {
         match iter.next() {
@@ -170,9 +173,7 @@ fn handle_signals(mut signals: Signals, out: mpsc::Sender<Event>) {
                 }
             }
             Some(signal::SIGHUP) => {
-                if let Err(e) = out.blocking_send(Event::DumpDiagnostics) {
-                    error!("Failed to submit DumpDiagnostics event for SIGHUP: {:?}", e);
-                }
+                diagnostics.dump();
             }
             other => {
                 // None means the signal stream closed; exit instead of spinning on it.
@@ -519,9 +520,13 @@ async fn server(
 
     let (event_tx, event_rx): (mpsc::Sender<Event>, mpsc::Receiver<Event>) = mpsc::channel(256);
 
+    // Mirrored diagnostics state: the rotation loop refreshes it as it goes,
+    // and the SIGHUP handler dumps it without involving the loop.
+    let diagnostics = Arc::new(rotation::DiagnosticsMirror::new());
     let event_tx2 = event_tx.clone();
+    let diagnostics2 = diagnostics.clone();
     let signals = Signals::new([signal::SIGUSR1, signal::SIGUSR2, signal::SIGHUP])?;
-    std::thread::spawn(|| handle_signals(signals, event_tx2));
+    std::thread::spawn(move || handle_signals(signals, event_tx2, diagnostics2));
 
     let (grab_tx, _grab_rx) = watchchan::channel(monux::device::GrabEvent::Ungrab);
     let grab_tx2 = grab_tx.clone();
@@ -556,6 +561,7 @@ async fn server(
             rotation_tx,
             rotation_rx,
             motion_flush_interval,
+            diagnostics,
         )
         .await
     });

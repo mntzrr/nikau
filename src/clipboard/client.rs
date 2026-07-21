@@ -1,9 +1,8 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use anyhow::{Result};
-use tokio::sync::{Mutex, mpsc, watch};
+use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
 use crate::clipboard::{data, serve, wayland, x11};
@@ -14,7 +13,8 @@ pub struct LocalClipboard {
     /// zipping large copied files) never block the client event loop.
     /// Serializes serves and caches the last payload, so request bursts
     /// (e.g. clipboard managers fetching every type) can't pile up CPU work.
-    reader: Arc<Mutex<serve::SharedClipboardReader>>,
+    /// Cache invalidation is lock-free (see SharedClipboardReader).
+    reader: serve::SharedClipboardReader,
     /// Queue to the writer dispatcher thread: keeps blocking clipboard
     /// advertisements off the client event loop (see spawn_writer_dispatcher).
     types_tx: std::sync::mpsc::Sender<Vec<String>>,
@@ -96,14 +96,14 @@ impl LocalClipboard {
 
     /// Handle for sharing the clipboard reader with spawned serving tasks,
     /// so that slow reads never block the client event loop.
-    pub fn reader_handle(&self) -> Arc<Mutex<serve::SharedClipboardReader>> {
+    pub fn reader_handle(&self) -> serve::SharedClipboardReader {
         self.reader.clone()
     }
 
     /// Reads the clipboard data for the specified type.
     /// The result may be converted/compressed to a different type for network transfer.
     pub async fn read(
-        reader: &Arc<Mutex<serve::SharedClipboardReader>>,
+        reader: &serve::SharedClipboardReader,
         requested_type: &str,
         max_size_bytes: u64,
         request_client: Option<SocketAddr>,
@@ -119,17 +119,16 @@ impl LocalClipboard {
             request_source,
         );
         reader
-            .lock()
-            .await
             .read(requested_type, max_size_bytes, &request_source)
             .await
     }
 
     /// Switches to serving the local clipboard, rather than from the monux server
-    pub async fn set_local_clipboard(&mut self) {
+    pub fn set_local_clipboard(&mut self) {
         self.local_types.replace(self.local_types_rx.borrow().clone());
         // The local clipboard changed: never serve stale cached contents.
-        self.reader.lock().await.invalidate();
+        // Lock-free: never waits on a serve in progress.
+        self.reader.invalidate();
         // Now that we have a local clipboard, don't fetch clipboards from the server.
         self.serving_remote_clipboard = false;
     }

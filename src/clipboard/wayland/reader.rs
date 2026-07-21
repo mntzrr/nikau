@@ -16,6 +16,15 @@ use crate::clipboard::wayland::{common, state};
 /// Retrieves clipboard data from other applications on the system.
 /// Watches clipboard mime types, and reads clipboard data.
 pub struct ClipboardReader {
+    /// None only while a blocking roundtrip task owns the queue (or after one
+    /// panicked, in which case every read fails fast).
+    inner: Option<ReaderInner>,
+}
+
+/// The wayland event queue and its dispatch state. Roundtrips block on the
+/// compositor, so reads move these onto a blocking worker thread (see read):
+/// they are Send, but not shareable across an await.
+struct ReaderInner {
     queue: EventQueue<state::State>,
     state: state::State,
 }
@@ -44,11 +53,12 @@ impl ClipboardReader {
         queue.roundtrip(&mut state)?;
 
         Ok(Self{
-            queue,
-            state,
+            inner: Some(ReaderInner { queue, state }),
         })
     }
+}
 
+impl ReaderInner {
     fn get_offer(&mut self, mime_type: String) -> Result<Option<PipeReader>> {
         // Refresh state data to find a matching offer
         self.queue.roundtrip(&mut self.state)?;
@@ -85,7 +95,23 @@ impl ClipboardReaderTrait for ClipboardReader {
         max_size_bytes: u64,
         request_source: &str,
     ) -> Result<Vec<u8>> {
-        let mut pipe_reader = if let Some(rdr) = self.get_offer(requested_type.to_string())? {
+        // The roundtrips inside get_offer block on the compositor; run them on
+        // a blocking worker so a wedged compositor can't park an async
+        // executor thread for the duration.
+        let inner = self
+            .inner
+            .take()
+            .context("Wayland clipboard reader was lost to a failed roundtrip")?;
+        let mime_type = requested_type.to_string();
+        let (inner, offer) = task::spawn_blocking(move || {
+            let mut inner = inner;
+            let offer = inner.get_offer(mime_type);
+            (inner, offer)
+        })
+        .await
+        .context("Wayland clipboard roundtrip worker failed")?;
+        self.inner = Some(inner);
+        let mut pipe_reader = if let Some(rdr) = offer? {
             rdr
         } else {
             bail!("No clipboard available");

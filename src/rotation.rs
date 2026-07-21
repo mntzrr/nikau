@@ -2,6 +2,8 @@ use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -216,6 +218,65 @@ struct InputCounts {
     emitted_local: u64,
 }
 
+/// Mirror of the rotation loop's diagnostic state, read directly by the
+/// SIGHUP handler on the signal thread. The dump must work when the loop
+/// itself is stalled — that scenario is exactly what it exists to debug — so
+/// nothing here touches the loop's channels: an atomic liveness timestamp
+/// plus a pre-formatted state string behind a std Mutex that is only held for
+/// a swap/clone. The rotation loop refreshes it after every iteration (see
+/// Rotation::update_diagnostics).
+pub struct DiagnosticsMirror {
+    /// Base for the liveness timestamp.
+    started: Instant,
+    /// Milliseconds since `started` when the rotation loop last completed an
+    /// iteration. The loop wakes at least every 10s (input-status heartbeat),
+    /// so a value much older than that in a dump means the loop is stuck.
+    last_iteration_ms: AtomicU64,
+    /// The dumpable state, formatted by the loop after each iteration.
+    state: Mutex<String>,
+}
+
+impl DiagnosticsMirror {
+    pub fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            last_iteration_ms: AtomicU64::new(0),
+            state: Mutex::new("<rotation loop has not completed an iteration yet>".to_string()),
+        }
+    }
+
+    /// Stamps loop liveness and swaps in the latest formatted state.
+    /// Rotation-loop side only.
+    fn update(&self, state: String) {
+        self.last_iteration_ms.store(
+            self.started.elapsed().as_millis() as u64,
+            Ordering::Relaxed,
+        );
+        if let Ok(mut s) = self.state.lock() {
+            *s = state;
+        }
+    }
+
+    /// Logs the full state dump for SIGHUP. Runs on the signal thread, so it
+    /// must never wait on the rotation loop: it only reads this mirror.
+    pub fn dump(&self) {
+        let age_ms = self
+            .started
+            .elapsed()
+            .as_millis()
+            .saturating_sub(self.last_iteration_ms.load(Ordering::Relaxed) as u128);
+        let state = match self.state.lock() {
+            Ok(s) => s.clone(),
+            Err(_) => "<diagnostics state lock poisoned>".to_string(),
+        };
+        info!(
+            "Diagnostics dump (SIGHUP): rotation loop last completed an iteration {}ms ago (a healthy loop iterates at least every 10s); {}",
+            age_ms,
+            state
+        );
+    }
+}
+
 pub struct Rotation<O: device::output::OutputHandler> {
     grab_tx: watch::Sender<device::GrabEvent>,
     output_handler: O,
@@ -273,6 +334,9 @@ pub struct Rotation<O: device::output::OutputHandler> {
     motion_flush_interval: Option<Duration>,
     /// When the last next/prev switch was processed (see SWITCH_DEBOUNCE).
     last_switch_at: Option<Instant>,
+    /// Loop-independent mirror of this rotation's diagnostic state, dumped by
+    /// the SIGHUP handler without involving the loop (see DiagnosticsMirror).
+    diagnostics: Arc<DiagnosticsMirror>,
 }
 
 impl<O: device::output::OutputHandler> Rotation<O> {
@@ -283,6 +347,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         config_dir: &Path,
         rotation_tx: mpsc::Sender<RotationEvent>,
         motion_flush_interval: Option<Duration>,
+        diagnostics: Arc<DiagnosticsMirror>,
     ) -> Result<Self> {
         let active_client_path = active_client_state_path(config_dir);
         let pending_resume_fingerprint = load_pending_resume(&active_client_path);
@@ -315,6 +380,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             motion_history: VecDeque::new(),
             motion_flush_interval,
             last_switch_at: None,
+            diagnostics,
         })
     }
 
@@ -624,6 +690,15 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             self.clipboard_clear().await;
             return Ok(());
         }
+        // The clipboard changed hands: drop any cached served payload so
+        // stale contents are never served. Lock-free (an epoch bump), so it
+        // never waits on a serve in progress. This must happen even when the
+        // update is debounced away below: a debounced update still means the
+        // clipboard changed, and the old cache would otherwise keep being
+        // served.
+        if let Some(reader) = self.local_clipboard.as_ref().map(|lc| lc.reader_handle()) {
+            reader.invalidate();
+        }
         // Debounce machine-paced bursts: clipboard managers (wl-clip-persist,
         // wl-paste --watch) can turn one copy into dozens of source updates per
         // second, and each processed update costs a fresh wayland connection
@@ -634,12 +709,6 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                 debug!("Debouncing rapid clipboard source update");
                 return Ok(());
             }
-        }
-        // The clipboard changed hands: drop any cached served payload so
-        // stale contents are never served. Clone the reader handle first:
-        // only the Arc may cross the await (LocalClipboard isn't Sync).
-        if let Some(reader) = self.local_clipboard.as_ref().map(|lc| lc.reader_handle()) {
-            reader.lock().await.invalidate();
         }
         // Break clipboard-manager ping-pong: an update identical to the current
         // target (e.g. wl-clip-persist re-owning the same clipboard, or a
@@ -1227,12 +1296,15 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         }
     }
 
-    /// Full state dump to the log, triggered via Event::DumpDiagnostics (SIGHUP).
-    /// Captures everything relevant to "input is dead" reports in one place.
-    pub fn dump_diagnostics(&self) {
+    /// Refreshes the shared diagnostics mirror with the current state. Called
+    /// once per rotation loop iteration, so the SIGHUP dump (which reads the
+    /// mirror directly from the signal thread) keeps working when this loop
+    /// is stalled: the dump then shows the state as of the last completed
+    /// iteration plus how long the loop has been stuck.
+    pub fn update_diagnostics(&self) {
         let grab = format!("{:?}", *self.grab_tx.borrow());
-        info!(
-            "Diagnostics dump (SIGHUP): current_client={:?} grab={} clients={:?} removed_current_client={:?} pending_resume_fingerprint={:?} clipboard_target={:?} pending_clipboard_requests={} motion_seq={} datagrams_ok={} counts={{physical={} forwarded={} emitted_local={}}}",
+        let mut state = format!(
+            "current_client={:?} grab={} clients={:?} removed_current_client={:?} pending_resume_fingerprint={:?} clipboard_target={:?} pending_clipboard_requests={} motion_seq={} datagrams_ok={} counts={{physical={} forwarded={} emitted_local={}}}",
             self.current_client,
             grab,
             self.clients,
@@ -1251,11 +1323,12 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             self.status_counts.emitted_local,
         );
         if self.motion_dirty {
-            info!(
-                "Diagnostics: coalesced motion pending: dx={} dy={} (from {} events)",
+            state.push_str(&format!(
+                " coalesced_motion_pending={{dx={} dy={} events={}}}",
                 self.pending_motion.0, self.pending_motion.1, self.pending_motion.2
-            );
+            ));
         }
+        self.diagnostics.update(state);
     }
 
     /// Adds a pure-motion batch to the coalescing accumulator (see --motion-hz).
@@ -1969,6 +2042,7 @@ mod tests {
             &dir,
             rotation_tx,
             None,
+            Arc::new(DiagnosticsMirror::new()),
         )
         .await
         .unwrap();
@@ -2004,6 +2078,7 @@ mod tests {
             &dir,
             rotation_tx,
             Some(Duration::from_millis(8)),
+            Arc::new(DiagnosticsMirror::new()),
         )
         .await
         .unwrap();
@@ -2049,6 +2124,7 @@ mod tests {
             &dir,
             rotation_tx,
             None,
+            Arc::new(DiagnosticsMirror::new()),
         )
         .await
         .unwrap();
@@ -2072,6 +2148,7 @@ mod tests {
             &dir,
             rotation_tx,
             None,
+            Arc::new(DiagnosticsMirror::new()),
         )
         .await
         .unwrap();

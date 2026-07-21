@@ -1,9 +1,8 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use anyhow::{Result};
-use tokio::sync::{Mutex, mpsc, watch};
+use tokio::sync::{mpsc, watch};
 use tokio::task;
 use tracing::{debug, error, info, warn};
 
@@ -17,7 +16,8 @@ pub struct LocalClipboard {
     /// zipping large copied files) never block the rotation event loop.
     /// Serializes serves and caches the last payload, so request bursts
     /// (e.g. clipboard managers fetching every type) can't pile up CPU work.
-    reader: Arc<Mutex<serve::SharedClipboardReader>>,
+    /// Cache invalidation is lock-free (see SharedClipboardReader).
+    reader: serve::SharedClipboardReader,
     /// Queue to the writer dispatcher thread (see spawn_writer_dispatcher):
     /// keeps blocking clipboard advertisements off the rotation loop.
     types_tx: std::sync::mpsc::Sender<Vec<String>>,
@@ -171,22 +171,20 @@ impl LocalClipboard {
 
     /// Handle for sharing the clipboard reader with spawned serving tasks,
     /// so that slow reads never block the rotation event loop.
-    pub fn reader_handle(&self) -> Arc<Mutex<serve::SharedClipboardReader>> {
+    pub fn reader_handle(&self) -> serve::SharedClipboardReader {
         self.reader.clone()
     }
 
     /// Reads the clipboard data for the specified type.
     /// The result may be converted/compressed to a different type for network transfer.
     pub async fn read(
-        reader: &Arc<Mutex<serve::SharedClipboardReader>>,
+        reader: &serve::SharedClipboardReader,
         requested_type: &str,
         max_size_bytes: u64,
         request_client: &SocketAddr,
     ) -> Result<(Vec<u8>, Option<String>)> {
         let request_source = format!("client {}", request_client);
         let (content, data_type) = reader
-            .lock()
-            .await
             .read(requested_type, max_size_bytes, &request_source)
             .await?;
         if let Some(data_type) = &data_type {

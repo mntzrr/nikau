@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
 use quinn::{RecvStream, SendStream};
-use tokio::sync::Mutex;
+use tokio::sync::mpsc;
 use tokio::task;
 use tracing::{debug, error, info, trace, warn};
 
@@ -45,11 +45,12 @@ pub async fn run<O: output::OutputHandler>(
 struct Connection {
     events_send: SendStream,
     events_recv: RecvStream,
-    /// Shared with spawned clipboard-serving tasks so that large clipboard
-    /// writes never block this loop from applying incoming input events.
-    /// The lock is always held across header+payload writes, keeping the
-    /// stream framing intact when transfers overlap.
-    bulk_send: Arc<Mutex<SendStream>>,
+    /// Queue for the dedicated bulk-writer task, which owns the actual bulk
+    /// stream. Queuing whole serialized frames (instead of writing inline)
+    /// keeps a multi-megabyte clipboard write from suspending this loop —
+    /// including input application — and keeps each header glued to its
+    /// payload when transfers overlap.
+    bulk_tx: mpsc::UnboundedSender<Vec<u8>>,
     bulk_recv: RecvStream,
     max_clipboard_size_bytes: u64,
 
@@ -155,11 +156,33 @@ impl Connection {
         let server_version = transport::recv_version(&mut bulk_recv, &mut event_bytes).await?;
         transport::ensure_compatible_version(server_version)?;
 
+        // Dedicated writer task for the bulk stream: clipboard payloads can
+        // be megabytes, and writing them inline would suspend the step loop —
+        // including input application — for the whole transfer. The task also
+        // keeps each header glued to its payload by writing queued byte blobs
+        // sequentially. It exits when the last sender is dropped (connection
+        // teardown) or when the stream fails.
+        let (bulk_tx, mut bulk_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        {
+            let mut bulk_send = bulk_send;
+            task::spawn(async move {
+                while let Some(bytes) = bulk_rx.recv().await {
+                    trace!("Sending {} byte bulk message", bytes.len());
+                    if let Err(e) = bulk_send.write_all(&bytes).await {
+                        // A broken stream also fails the step loop's read
+                        // side, which resets the connection.
+                        error!("Failed to write {} bytes to the bulk stream: {:?}", bytes.len(), e);
+                        return;
+                    }
+                }
+            });
+        }
+
         Ok((
             Self {
                 events_send,
                 events_recv,
-                bulk_send: Arc::new(Mutex::new(bulk_send)),
+                bulk_tx,
                 bulk_recv,
                 max_clipboard_size_bytes,
                 active: false,
@@ -211,11 +234,13 @@ impl Connection {
                         // Drop fetches whose requester already timed out, then track this one.
                         self.pending_fetches.retain(|_, f| !f.fetch_result_tx.is_closed());
                         self.pending_fetches.insert(request_id, local_fetch_request);
-                        // May wait briefly behind an in-flight clipboard payload
-                        // write; that delays only clipboard traffic, never input.
-                        self.bulk_send.lock().await.write_all(&serializedmsg)
-                            .await
-                            .context("Failed to send clipboard request message")?;
+                        // Queue the whole frame for the bulk writer task: a
+                        // direct write here would suspend the whole select —
+                        // including input application — behind any in-flight
+                        // clipboard payload.
+                        self.bulk_tx
+                            .send(serializedmsg)
+                            .context("Failed to queue clipboard request message")?;
                     } else {
                         bail!("Clipboard fetch request queue has closed");
                     }
@@ -229,7 +254,7 @@ impl Connection {
                         return Err(anyhow!(e));
                     }
                     if self.active {
-                        local_clipboard.set_local_clipboard().await;
+                        local_clipboard.set_local_clipboard();
                     }
                 },
                 event_result = self.events_recv.read_chunk(16384, true) => {
@@ -538,10 +563,10 @@ impl Connection {
                         }
                     };
                     // Serve the data from a spawned task: reading the local
-                    // clipboard (zipping large copied files can take seconds) and
-                    // writing a big payload must not stall input event handling.
+                    // clipboard (zipping large copied files can take seconds)
+                    // must not stall input event handling.
                     let reader = local_clipboard.reader_handle();
-                    let bulk_send = self.bulk_send.clone();
+                    let bulk_tx = self.bulk_tx.clone();
                     let requested_type = c.requested_type.to_string();
                     let max_size_bytes = c.max_size_bytes;
                     let request_client = c.request_client;
@@ -581,13 +606,15 @@ impl Connection {
                             }
                         };
                         bytes.extend_from_slice(&local_clipboard_data);
-                        // Hold the lock across header+payload so overlapping
-                        // transfers can't interleave on the stream.
-                        let mut send = bulk_send.lock().await;
-                        if let Err(e) = send.write_all(&bytes).await {
-                            // A broken stream also fails the step loop's read
-                            // side, which resets the connection.
-                            error!("Failed to send {} byte clipboard content: {:?}", bytes.len(), e);
+                        // The whole frame — header glued to its payload — goes
+                        // to the bulk writer task as one blob, so overlapping
+                        // transfers can't interleave on the stream, and this
+                        // task never parks on a multi-megabyte write.
+                        let len = bytes.len();
+                        if bulk_tx.send(bytes).is_err() {
+                            // The writer task died with the connection; the
+                            // step loop's read side resets it.
+                            error!("Failed to queue {} byte clipboard content for sending", len);
                         }
                     });
                 }

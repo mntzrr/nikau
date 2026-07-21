@@ -26,6 +26,7 @@ pub async fn run_server_events_loop<O: output::OutputHandler>(
     rotation_tx: mpsc::Sender<rotation::RotationEvent>,
     mut rotation_rx: mpsc::Receiver<rotation::RotationEvent>,
     motion_flush_interval: Option<Duration>,
+    diagnostics: Arc<rotation::DiagnosticsMirror>,
 ) -> Result<()> {
     let local_clipboard = LocalClipboard::start(
         config_dir.clone(),
@@ -35,7 +36,7 @@ pub async fn run_server_events_loop<O: output::OutputHandler>(
     ).await;
 
     let mut rotation =
-        rotation::Rotation::new(grab_tx, output_handler, local_clipboard, &config_dir, rotation_tx, motion_flush_interval).await?;
+        rotation::Rotation::new(grab_tx, output_handler, local_clipboard, &config_dir, rotation_tx, motion_flush_interval, diagnostics).await?;
     // Input-flow heartbeat: makes "user is typing but nothing arrives anywhere"
     // visible in the log, instead of silent (the dead-Enter investigations).
     let mut status_tick = time::interval(Duration::from_secs(10));
@@ -53,6 +54,8 @@ pub async fn run_server_events_loop<O: output::OutputHandler>(
     // Burst, the backlog of catch-up ticks would fire on every frame and
     // silently defeat the coalescing.
     motion_tick.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+    // Seed the diagnostics mirror so a SIGHUP before the first event still dumps.
+    rotation.update_diagnostics();
     loop {
         tokio::select! {
             // Listen and forward rotation events to rotation
@@ -84,9 +87,6 @@ pub async fn run_server_events_loop<O: output::OutputHandler>(
                     Event::SwitchTo(fingerprint) => {
                         rotation.set_client(fingerprint).await;
                     }
-                    Event::DumpDiagnostics => {
-                        rotation.dump_diagnostics();
-                    }
                 }
             },
             _ = status_tick.tick() => {
@@ -96,6 +96,10 @@ pub async fn run_server_events_loop<O: output::OutputHandler>(
                 rotation.flush_pending_motion().await;
             },
         }
+        // Refresh the mirrored state after every iteration: the SIGHUP handler
+        // reads it directly from the signal thread, so the dump must not
+        // depend on this loop being alive.
+        rotation.update_diagnostics();
     }
 }
 
