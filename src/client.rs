@@ -16,6 +16,93 @@ use crate::device::output;
 use crate::msgs::{bulk, event, shared};
 use crate::network::{approval, transport};
 
+/// Client-side scaling for relative pointer/scroll deltas (--mouse-scale,
+/// --scroll-scale), applied on injection into this machine's virtual devices.
+///
+/// Deltas arrive as integers but scales are fractional: rounding each event
+/// independently would turn every sub-1.0 scaled delta into zero and motion
+/// would die (0.5x would emit nothing, ever). Instead each axis carries its
+/// fractional remainder across events, so N input ticks emit floor(N*scale)
+/// output ticks over time with no drift. Remainders are per-axis: X, Y, and
+/// each wheel axis accumulate independently. Applied ONLY here, on the client
+/// injection path — the server's local re-emit (rotation.rs) stays 1:1.
+struct DeltaScaler {
+    mouse_scale: f64,
+    scroll_scale: f64,
+    /// Carried fractional delta per relative-axis code.
+    remainders: HashMap<u16, f64>,
+}
+
+impl DeltaScaler {
+    fn new(mouse_scale: f64, scroll_scale: f64) -> DeltaScaler {
+        DeltaScaler {
+            mouse_scale,
+            scroll_scale,
+            remainders: HashMap::new(),
+        }
+    }
+
+    /// Whether any scaling is in effect; 1.0/1.0 bypasses the math entirely.
+    fn active(&self) -> bool {
+        self.mouse_scale != 1.0 || self.scroll_scale != 1.0
+    }
+
+    /// The scale applying to a relative-axis code, if any: pointer motion axes
+    /// scale by mouse_scale, wheel and hi-res wheel axes by scroll_scale.
+    fn scale_for(&self, code: u16) -> Option<f64> {
+        use evdev::RelativeAxisCode as R;
+        if code == R::REL_X.0 || code == R::REL_Y.0 {
+            Some(self.mouse_scale)
+        } else if code == R::REL_WHEEL.0
+            || code == R::REL_HWHEEL.0
+            || code == R::REL_WHEEL_HI_RES.0
+            || code == R::REL_HWHEEL_HI_RES.0
+        {
+            Some(self.scroll_scale)
+        } else {
+            None
+        }
+    }
+
+    /// Scales the relative-axis deltas of a batch in place. An event whose
+    /// scaled delta hasn't reached a whole tick yet is dropped — its fraction
+    /// is carried in the axis remainder and emitted by a later event. All
+    /// other events (keys, buttons, syn, absolute axes, unscaled relative
+    /// axes) pass through untouched.
+    fn apply(&mut self, events: &mut Vec<event::InputEvent>) {
+        if !self.active() {
+            return;
+        }
+        events.retain_mut(|e| {
+            let Some(i) = &mut e.inputi32 else {
+                return true;
+            };
+            if i.type_ != evdev::EventType::RELATIVE.0 {
+                return true;
+            }
+            let Some(scale) = self.scale_for(i.code) else {
+                return true;
+            };
+            if scale == 1.0 {
+                return true;
+            }
+            let remainder = self.remainders.entry(i.code).or_insert(0.0);
+            *remainder += i.value as f64 * scale;
+            // Truncate toward zero: symmetric for negative deltas, so sign
+            // changes can't bias the carried fraction.
+            let whole = remainder.trunc();
+            *remainder -= whole;
+            if whole == 0.0 {
+                // Sub-tick delta: carried, nothing to emit yet.
+                false
+            } else {
+                i.value = whole as i32;
+                true
+            }
+        });
+    }
+}
+
 /// Initializes a new client connection and runs its event loop.
 /// Returns an error on connection failure or other logic error, in which case a new connection can be tried.
 pub async fn run<O: output::OutputHandler>(
@@ -26,10 +113,19 @@ pub async fn run<O: output::OutputHandler>(
     output_handler: &mut O,
     mode: transport::NetworkMode,
     config_dir: &std::path::Path,
+    mouse_scale: f64,
+    scroll_scale: f64,
 ) -> Result<()> {
-    let (mut client, connect_time) =
-        Connection::new(server_addr, cert_verifier, max_clipboard_size_bytes, mode, config_dir)
-            .await?;
+    let (mut client, connect_time) = Connection::new(
+        server_addr,
+        cert_verifier,
+        max_clipboard_size_bytes,
+        mode,
+        config_dir,
+        mouse_scale,
+        scroll_scale,
+    )
+    .await?;
     loop {
         if let Err(e) = client
             .step(local_clipboard, output_handler, &connect_time)
@@ -87,6 +183,8 @@ struct Connection {
     /// re-announcement on activation (see the Switch handler) only fires on the
     /// FIRST activation of each connection — i.e. on a fresh (re)connect.
     fresh_activation: bool,
+    /// Pointer/scroll delta scaling applied on injection (see DeltaScaler).
+    scaler: DeltaScaler,
 }
 
 impl Connection {
@@ -97,6 +195,8 @@ impl Connection {
         max_clipboard_size_bytes: u64,
         mode: transport::NetworkMode,
         config_dir: &std::path::Path,
+        mouse_scale: f64,
+        scroll_scale: f64,
     ) -> Result<(Self, Instant)> {
         let bind_addr: SocketAddr = match server_addr {
             SocketAddr::V4(_) => "0.0.0.0:0".parse().expect("Failed to parse 0.0.0.0:0"),
@@ -203,6 +303,7 @@ impl Connection {
                 motion_applied_mask: 0,
                 output_write_failing: false,
                 fresh_activation: true,
+                scaler: DeltaScaler::new(mouse_scale, scroll_scale),
             },
             connect_time,
         ))
@@ -467,6 +568,9 @@ impl Connection {
                 }
                 event::ServerEvent::Input(mut events) => {
                     // User input events: coalesced and written after the loop.
+                    // Pointer/scroll scaling (--mouse-scale/--scroll-scale)
+                    // applies here, just before injection.
+                    self.scaler.apply(&mut events);
                     pending_input.append(&mut events);
                 }
                 event::ServerEvent::ClipboardTypes(types) => {
@@ -539,6 +643,8 @@ impl Connection {
         if dy != 0 {
             events.push(event::motion_event(evdev::RelativeAxisCode::REL_Y.0, dy));
         }
+        // Pointer scaling applies to datagram motion too (see DeltaScaler).
+        self.scaler.apply(&mut events);
         Self::note_output_result(
             &mut self.output_write_failing,
             output_handler.write(events).await,
@@ -752,4 +858,152 @@ impl Connection {
 
 fn is_new_connection(connect_time: &Instant) -> bool {
     Instant::now().duration_since(*connect_time) < Duration::from_secs(5)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const REL: u16 = evdev::EventType::RELATIVE.0;
+    const KEY: u16 = evdev::EventType::KEY.0;
+    const REL_X: u16 = evdev::RelativeAxisCode::REL_X.0;
+    const REL_Y: u16 = evdev::RelativeAxisCode::REL_Y.0;
+    const REL_WHEEL: u16 = evdev::RelativeAxisCode::REL_WHEEL.0;
+    const REL_HWHEEL_HI_RES: u16 = evdev::RelativeAxisCode::REL_HWHEEL_HI_RES.0;
+
+    fn rel(code: u16, value: i32) -> event::InputEvent {
+        event::InputEvent {
+            inputi32: Some(event::InputI32 {
+                type_: REL,
+                code,
+                value,
+            }),
+            inputf64: None,
+        }
+    }
+
+    /// Feeds `events` through the scaler one event at a time (per-event batches
+    /// exercise the carried remainder the hardest) and returns the values that
+    /// survived, in order.
+    fn scaled(scaler: &mut DeltaScaler, code: u16, values: &[i32]) -> Vec<i32> {
+        let mut out = Vec::new();
+        for &v in values {
+            let mut batch = vec![rel(code, v)];
+            scaler.apply(&mut batch);
+            out.extend(batch.into_iter().map(|e| e.inputi32.unwrap().value));
+        }
+        out
+    }
+
+    #[test]
+    fn half_scale_emits_one_tick_per_two_input_ticks() {
+        let mut s = DeltaScaler::new(0.5, 1.0);
+        // Per-event rounding would emit ten zeros; the remainder must carry.
+        assert_eq!(
+            scaled(&mut s, REL_X, &[1; 10]),
+            vec![1, 1, 1, 1, 1],
+            "0.5x must emit exactly one tick per two input ticks"
+        );
+        // An odd tick leaves its half carried, not lost.
+        assert_eq!(scaled(&mut s, REL_X, &[1]), Vec::<i32>::new());
+        assert_eq!(scaled(&mut s, REL_X, &[1]), vec![1]);
+    }
+
+    #[test]
+    fn fractional_scale_above_one() {
+        let mut s = DeltaScaler::new(2.5, 1.0);
+        // 2.5x alternates 2 and 3 so the average is exactly 2.5.
+        assert_eq!(scaled(&mut s, REL_X, &[1, 1, 1, 1]), vec![2, 3, 2, 3]);
+    }
+
+    #[test]
+    fn negative_deltas_scale_symmetrically() {
+        let mut s = DeltaScaler::new(0.5, 1.0);
+        // Truncation toward zero: -0.5 carries, the next -1 completes a -1 tick.
+        assert_eq!(scaled(&mut s, REL_X, &[-1, -1]), vec![-1]);
+        // Sign changes cancel in the remainder instead of drifting.
+        assert_eq!(scaled(&mut s, REL_X, &[1, -1, 1, -1]), Vec::<i32>::new());
+        assert_eq!(s.remainders[&REL_X].abs(), 0.0);
+    }
+
+    #[test]
+    fn axes_accumulate_independently() {
+        let mut s = DeltaScaler::new(0.5, 1.0);
+        // One X tick and one Y tick: each axis carries its own half, so neither
+        // emits; a second tick on either completes only that axis.
+        assert_eq!(scaled(&mut s, REL_X, &[1]), Vec::<i32>::new());
+        assert_eq!(scaled(&mut s, REL_Y, &[1]), Vec::<i32>::new());
+        assert_eq!(scaled(&mut s, REL_Y, &[1]), vec![1]);
+        assert_eq!(scaled(&mut s, REL_X, &[1]), vec![1]);
+    }
+
+    #[test]
+    fn mouse_and_scroll_scales_are_independent() {
+        let mut s = DeltaScaler::new(1.0, 2.0);
+        // Pointer untouched at 1.0, wheel (and hi-res wheel variants) doubled.
+        assert_eq!(scaled(&mut s, REL_X, &[3]), vec![3]);
+        assert_eq!(scaled(&mut s, REL_WHEEL, &[1, -1]), vec![2, -2]);
+        assert_eq!(scaled(&mut s, REL_HWHEEL_HI_RES, &[60]), vec![120]);
+    }
+
+    #[test]
+    fn no_drift_over_thousands_of_events() {
+        // 0.5x and 2.5x are exact in binary: the totals must be exact too.
+        let mut s = DeltaScaler::new(0.5, 1.0);
+        let emitted: i32 = scaled(&mut s, REL_X, &[1; 10_000]).iter().sum();
+        assert_eq!(emitted, 5_000);
+        let mut s = DeltaScaler::new(2.5, 1.0);
+        let emitted: i32 = scaled(&mut s, REL_X, &[1; 10_000]).iter().sum();
+        assert_eq!(emitted, 25_000);
+        // An inexact scale (0.1) must neither lose motion nor drift: emitted
+        // plus the still-carried remainder always equals the scaled total.
+        let mut s = DeltaScaler::new(0.1, 1.0);
+        let emitted: i32 = scaled(&mut s, REL_X, &[1; 10_000]).iter().sum();
+        let total = emitted as f64 + s.remainders[&REL_X];
+        assert!(
+            (total - 1_000.0).abs() < 1e-6,
+            "emitted {} + carried {} drifted from 1000",
+            emitted,
+            s.remainders[&REL_X]
+        );
+        assert!((999..=1000).contains(&emitted));
+    }
+
+    #[test]
+    fn scale_one_is_a_passthrough() {
+        let mut s = DeltaScaler::new(1.0, 1.0);
+        assert!(!s.active());
+        let mut batch = vec![rel(REL_X, 7), rel(REL_WHEEL, -1)];
+        s.apply(&mut batch);
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch[0].inputi32.as_ref().unwrap().value, 7);
+        assert_eq!(batch[1].inputi32.as_ref().unwrap().value, -1);
+    }
+
+    #[test]
+    fn unscaled_event_kinds_pass_through_untouched() {
+        let mut s = DeltaScaler::new(0.5, 0.5);
+        let key = event::InputEvent {
+            inputi32: Some(event::InputI32 {
+                type_: KEY,
+                code: 30,
+                value: 1,
+            }),
+            inputf64: None,
+        };
+        let abs = event::InputEvent {
+            inputi32: None,
+            inputf64: Some(event::InputF64 {
+                type_: evdev::EventType::ABSOLUTE.0,
+                code: evdev::AbsoluteAxisCode::ABS_X.0,
+                value: 0.5,
+            }),
+        };
+        // REL_Z is a relative axis but neither pointer motion nor wheel.
+        let rel_z = rel(evdev::RelativeAxisCode::REL_Z.0, 4);
+        let mut batch = vec![key, abs, rel_z];
+        s.apply(&mut batch);
+        assert_eq!(batch.len(), 3);
+        assert_eq!(batch[2].inputi32.as_ref().unwrap().value, 4);
+    }
 }

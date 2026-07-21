@@ -317,12 +317,18 @@ impl DiagnosticsMirror {
 }
 
 pub struct Rotation<O: device::output::OutputHandler> {
-    grab_tx: watch::Sender<device::GrabEvent>,
+    grab_tx: watch::Sender<device::GrabState>,
     output_handler: O,
     clients: Vec<ClientInfo>,
     /// Use the endpoint, not the fingerprint, to uniquely identify clients.
     /// This allows situations like a client reconnecting before the old socket has closed.
     current_client: Option<SocketAddr>,
+    /// Pause mode (see --pause-shortcut and toggle_pause): ALL input devices —
+    /// keyboards included — are ungrabbed, so the local machine gets raw evdev
+    /// input with monux's re-emit fully out of the way. monux keeps listening
+    /// ungrabbed so the pause chord still works; forwarding and rotation
+    /// switches are suspended while clipboard sharing continues untouched.
+    paused: bool,
     removed_current_client: Option<DefunctClientInfo>,
     /// Path of the file recording the active client's fingerprint for
     /// crash recovery (see ACTIVE_CLIENT_STATE_FILE).
@@ -380,7 +386,7 @@ pub struct Rotation<O: device::output::OutputHandler> {
 
 impl<O: device::output::OutputHandler> Rotation<O> {
     pub async fn new(
-        grab_tx: watch::Sender<device::GrabEvent>,
+        grab_tx: watch::Sender<device::GrabState>,
         output_handler: O,
         local_clipboard: Option<server::LocalClipboard>,
         config_dir: &Path,
@@ -401,6 +407,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             output_handler,
             clients: Vec::new(),
             current_client: None,
+            paused: false,
             removed_current_client: None,
             active_client_path,
             pending_resume_fingerprint,
@@ -751,6 +758,14 @@ impl<O: device::output::OutputHandler> Rotation<O> {
 
     /// Switches to the previous client (or to the server) in the arbitrary rotation.
     pub async fn prev_client(&mut self) {
+        if self.paused {
+            // Paused: switch chords are not acted on. Devices are ungrabbed,
+            // so those keystrokes also pass through to the local system, and
+            // since nothing was forwarded anywhere there's no held-key cleanup
+            // to run either.
+            debug!("Ignoring switch request: input is paused");
+            return;
+        }
         let target = self.prev_target();
         if target == self.current_client {
             // Already on the target: no switch happens, but the chord fired
@@ -773,6 +788,13 @@ impl<O: device::output::OutputHandler> Rotation<O> {
 
     /// Switches to the next client (or to the server) in the arbitrary rotation.
     pub async fn next_client(&mut self) {
+        if self.paused {
+            // Paused: switch chords are not acted on (see prev_client). This
+            // also covers remote switches via SIGUSR1: while paused the
+            // devices must stay ungrabbed regardless.
+            debug!("Ignoring switch request: input is paused");
+            return;
+        }
         let target = self.next_target();
         if target == self.current_client {
             // Already on the target: no switch happens, but the chord fired
@@ -797,6 +819,11 @@ impl<O: device::output::OutputHandler> Rotation<O> {
     /// If a matching client isn't connected, does nothing — except run the held-key
     /// cleanup, since the chord fired and its modifier releases are being consumed.
     pub async fn set_client(&mut self, fingerprint: String) {
+        if self.paused {
+            // Paused: switch chords are not acted on (see prev_client).
+            debug!("Ignoring goto request: input is paused");
+            return;
+        }
         // Resolve the target: Ok(Some(target)) switches, Err(()) means no
         // unique match (already warn-logged).
         let target: Result<Option<SocketAddr>, ()> = if fingerprint.is_empty() {
@@ -844,6 +871,64 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             Err(()) => {
                 self.release_current_target_keys().await;
             }
+        }
+    }
+
+    /// Toggles pause mode (the --pause-shortcut chord). PAUSED means ALL input
+    /// devices — keyboards included — are ungrabbed, so the local machine gets
+    /// raw evdev input with monux's uinput re-emit fully out of the way
+    /// (games, raw-input apps). monux keeps listening ungrabbed, so the pause
+    /// chord itself is still seen and resumes. While paused nothing is
+    /// forwarded to clients and rotation switches (including SIGUSR1/SIGUSR2)
+    /// are ignored; clipboard sharing continues untouched. Resuming re-grabs
+    /// per the current rotation state: keyboards always, mice iff a client is
+    /// current.
+    pub async fn toggle_pause(&mut self) {
+        if self.paused {
+            self.paused = false;
+            self.broadcast_grab_state();
+            info!(
+                "Input resumed: devices re-grabbed per rotation state ({})",
+                match self.current_client {
+                    Some(endpoint) => format!("switched to {}", endpoint),
+                    None => "local machine".to_string(),
+                }
+            );
+            notify_switch("monux resumed");
+        } else {
+            // Run the held-key cleanup on the current target FIRST so nothing
+            // sticks: the chord's modifier presses were already forwarded to
+            // it, and from here on the physical devices go raw to the local
+            // system while the virtual devices idle.
+            self.release_current_target_keys().await;
+            // Motion accumulated for the current target is moot once paused:
+            // nothing is forwarded while paused (send_input_events drops it),
+            // so don't let a stale pending frame flush to the client.
+            self.pending_motion = (0, 0, 0);
+            self.motion_dirty = false;
+            self.motion_history.clear();
+            self.paused = true;
+            self.broadcast_grab_state();
+            info!("Input paused: all devices ungrabbed, listening for the resume chord (clipboard sharing continues)");
+            notify_switch("monux paused");
+        }
+    }
+
+    /// Sends the current grab state to every device task (keyboard-class and
+    /// toggled). The state is single-sourced here from current_client and
+    /// paused, so a client drop or remote switch while paused can't leave the
+    /// devices half-grabbed: every broadcast carries both fields.
+    fn broadcast_grab_state(&self) {
+        let state = device::GrabState {
+            client_active: self.current_client.is_some(),
+            paused: self.paused,
+        };
+        if let Err(e) = self.grab_tx.send(state) {
+            // Avoid leaving devices in a bad grabbed state
+            panic!(
+                "Failed to update device grab, exiting server to avoid bad grab state: {}",
+                e
+            );
         }
     }
 
@@ -1441,6 +1526,17 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         if idle_local {
             return;
         }
+        if self.paused {
+            // Paused: devices are ungrabbed and input goes raw to the local
+            // system; we only listen (and count) here. Report separately so a
+            // paused server doesn't look like a swallowing one.
+            info!(
+                "Input status: PAUSED (all devices ungrabbed, raw local input): {} events seen and dropped ({:.1}/s)",
+                counts.physical,
+                counts.physical as f64 / secs
+            );
+            return;
+        }
         match self.current_client {
             Some(endpoint) => info!(
                 "Input status: switched to {} ({}): {} events in, {} forwarded ({:.1}/s)",
@@ -1460,16 +1556,14 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         }
         // Swallow detection: physical input arrived but had nowhere to go.
         // The event threshold avoids false positives from a consumed switch combo.
+        // (The paused case returned above: dropped input is expected there.)
         if counts.physical >= 8 {
             if self.current_client.is_some() && counts.forwarded == 0 {
                 warn!(
                     "INPUT SWALLOWED: {} physical events seen while switched to a client, but none were forwarded!",
                     counts.physical
                 );
-            } else if self.current_client.is_none()
-                && matches!(&*self.grab_tx.borrow(), device::GrabEvent::Grab)
-                && counts.emitted_local == 0
-            {
+            } else if self.current_client.is_none() && counts.emitted_local == 0 {
                 warn!(
                     "INPUT SWALLOWED: {} physical events seen while local with devices grabbed, but none were emitted to the virtual devices!",
                     counts.physical
@@ -1486,9 +1580,10 @@ impl<O: device::output::OutputHandler> Rotation<O> {
     pub fn update_diagnostics(&self) {
         let grab = format!("{:?}", *self.grab_tx.borrow());
         let mut state = format!(
-            "current_client={:?} grab={} clients={:?} removed_current_client={:?} pending_resume_fingerprint={:?} clipboard_target={:?} pending_clipboard_requests={} motion_seq={} datagrams_ok={} counts={{physical={} forwarded={} emitted_local={}}}",
+            "current_client={:?} grab={} paused={} clients={:?} removed_current_client={:?} pending_resume_fingerprint={:?} clipboard_target={:?} pending_clipboard_requests={} motion_seq={} datagrams_ok={} counts={{physical={} forwarded={} emitted_local={}}}",
             self.current_client,
             grab,
+            self.paused,
             self.clients,
             self.removed_current_client,
             self.pending_resume_fingerprint,
@@ -1691,6 +1786,13 @@ impl<O: device::output::OutputHandler> Rotation<O> {
     pub async fn send_input_events(&mut self, batch: device::InputBatch) -> Result<()> {
         let event_count = batch.events.len() as u64;
         self.status_counts.physical += event_count;
+        if self.paused {
+            // Paused: all devices are ungrabbed, so the local machine already
+            // sees this input raw. monux only keeps listening (for the pause
+            // chord) — nothing is forwarded or re-emitted.
+            keytrace_route(&batch.events, "paused drop");
+            return Ok(());
+        }
         if let Some(endpoint) = self.current_client {
             // Remote client is active, send all input to client and not to local machine.
             let events = batch.events;
@@ -1950,18 +2052,10 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             }
             None => clear_active_client(&self.active_client_path),
         }
-        let grab = if client.is_some() {
-            device::GrabEvent::Grab
-        } else {
-            device::GrabEvent::Ungrab
-        };
-        if let Err(e) = self.grab_tx.send(grab) {
-            // Avoid leaving devices in a bad grabbed state
-            panic!(
-                "Failed to update device grab, exiting server to avoid bad grab state: {}",
-                e
-            );
-        }
+        // Broadcast the grab state to ALL device tasks (keyboard-class and
+        // toggled): keyboards grab whenever input isn't paused, mice only
+        // while a client is active too.
+        self.broadcast_grab_state();
     }
 
     /// Ensures that all clients and the server have their clipboard state cleared.
@@ -2220,7 +2314,10 @@ mod tests {
     #[tokio::test]
     async fn input_status_counts_flow_and_reset() {
         let dir = temp_dir("status");
-        let (grab_tx, _grab_rx) = watch::channel(device::GrabEvent::Ungrab);
+        let (grab_tx, _grab_rx) = watch::channel(device::GrabState {
+            client_active: false,
+            paused: false,
+        });
         let (rotation_tx, _rotation_rx) = mpsc::channel(8);
         let mut rotation = Rotation::new(
             grab_tx,
@@ -2256,7 +2353,10 @@ mod tests {
     #[tokio::test]
     async fn motion_coalescing_accumulates_and_clears() {
         let dir = temp_dir("coalesce");
-        let (grab_tx, _grab_rx) = watch::channel(device::GrabEvent::Ungrab);
+        let (grab_tx, _grab_rx) = watch::channel(device::GrabState {
+            client_active: false,
+            paused: false,
+        });
         let (rotation_tx, _rotation_rx) = mpsc::channel(8);
         let mut rotation = Rotation::new(
             grab_tx,
@@ -2302,7 +2402,10 @@ mod tests {
     #[tokio::test]
     async fn switch_requests_are_debounced() {
         let dir = temp_dir("debounce");
-        let (grab_tx, _grab_rx) = watch::channel(device::GrabEvent::Ungrab);
+        let (grab_tx, _grab_rx) = watch::channel(device::GrabState {
+            client_active: false,
+            paused: false,
+        });
         let (rotation_tx, _rotation_rx) = mpsc::channel(8);
         let mut rotation = Rotation::new(
             grab_tx,
@@ -2326,7 +2429,10 @@ mod tests {
     #[tokio::test]
     async fn local_target_switches_bypass_the_debounce() {
         let dir = temp_dir("debounce-local-bypass");
-        let (grab_tx, _grab_rx) = watch::channel(device::GrabEvent::Ungrab);
+        let (grab_tx, _grab_rx) = watch::channel(device::GrabState {
+            client_active: false,
+            paused: false,
+        });
         let (rotation_tx, _rotation_rx) = mpsc::channel(8);
         let mut rotation = Rotation::new(
             grab_tx,
@@ -2355,7 +2461,10 @@ mod tests {
     #[tokio::test]
     async fn noop_switch_releases_current_target_keys() {
         let dir = temp_dir("noop-release");
-        let (grab_tx, _grab_rx) = watch::channel(device::GrabEvent::Ungrab);
+        let (grab_tx, _grab_rx) = watch::channel(device::GrabState {
+            client_active: false,
+            paused: false,
+        });
         let (rotation_tx, _rotation_rx) = mpsc::channel(8);
         let mut rotation = Rotation::new(
             grab_tx,
@@ -2388,7 +2497,10 @@ mod tests {
     #[tokio::test]
     async fn debounced_switch_still_releases_current_target_keys() {
         let dir = temp_dir("debounce-release");
-        let (grab_tx, _grab_rx) = watch::channel(device::GrabEvent::Ungrab);
+        let (grab_tx, _grab_rx) = watch::channel(device::GrabState {
+            client_active: false,
+            paused: false,
+        });
         let (rotation_tx, _rotation_rx) = mpsc::channel(8);
         let mut rotation = Rotation::new(
             grab_tx,
@@ -2421,7 +2533,10 @@ mod tests {
     #[tokio::test]
     async fn empty_local_types_update_clears_clipboard_target() {
         let dir = temp_dir("clipclear");
-        let (grab_tx, _grab_rx) = watch::channel(device::GrabEvent::Ungrab);
+        let (grab_tx, _grab_rx) = watch::channel(device::GrabState {
+            client_active: false,
+            paused: false,
+        });
         let (rotation_tx, _rotation_rx) = mpsc::channel(8);
         let mut rotation = Rotation::new(
             grab_tx,
@@ -2486,5 +2601,141 @@ mod tests {
         // Genuinely different types
         let other = vec!["image/png".to_string()];
         assert!(!types_equal(&five, &other));
+    }
+
+    /// Builds a rotation for pause tests, returning the grab-state receiver so
+    /// the broadcast reaching ALL device tasks can be asserted on.
+    async fn pause_rotation(name: &str) -> (PathBuf, Rotation<StubOutput>, watch::Receiver<device::GrabState>) {
+        let dir = temp_dir(name);
+        let (grab_tx, grab_rx) = watch::channel(device::GrabState {
+            client_active: false,
+            paused: false,
+        });
+        let (rotation_tx, _rotation_rx) = mpsc::channel(8);
+        let rotation = Rotation::new(
+            grab_tx,
+            StubOutput { written: 0, released: 0 },
+            None,
+            &dir,
+            rotation_tx,
+            None,
+            Arc::new(DiagnosticsMirror::new()),
+        )
+        .await
+        .unwrap();
+        (dir, rotation, grab_rx)
+    }
+
+    #[test]
+    fn class_grabbed_matrix() {
+        use crate::device::input::class_grabbed;
+        use crate::device::DeviceClass;
+        // Unpaused: keyboards always grabbed, mice only while a client is active.
+        assert!(class_grabbed(DeviceClass::Keyboard, &device::GrabState { client_active: false, paused: false }));
+        assert!(!class_grabbed(DeviceClass::Toggled, &device::GrabState { client_active: false, paused: false }));
+        assert!(class_grabbed(DeviceClass::Keyboard, &device::GrabState { client_active: true, paused: false }));
+        assert!(class_grabbed(DeviceClass::Toggled, &device::GrabState { client_active: true, paused: false }));
+        // Paused ungrabs EVERYTHING, keyboards included, regardless of the client.
+        assert!(!class_grabbed(DeviceClass::Keyboard, &device::GrabState { client_active: false, paused: true }));
+        assert!(!class_grabbed(DeviceClass::Toggled, &device::GrabState { client_active: false, paused: true }));
+        assert!(!class_grabbed(DeviceClass::Keyboard, &device::GrabState { client_active: true, paused: true }));
+        assert!(!class_grabbed(DeviceClass::Toggled, &device::GrabState { client_active: true, paused: true }));
+    }
+
+    #[tokio::test]
+    async fn pause_toggle_drives_ungrab_and_regrab_on_both_device_classes() {
+        use crate::device::input::class_grabbed;
+        use crate::device::DeviceClass;
+        let (dir, mut rotation, grab_rx) = pause_rotation("pause-toggle").await;
+
+        // Initial state (local target): keyboard grabbed, mouse passing through.
+        let state = *grab_rx.borrow();
+        assert!(class_grabbed(DeviceClass::Keyboard, &state));
+        assert!(!class_grabbed(DeviceClass::Toggled, &state));
+
+        // Pause: the held-key cleanup runs on the current (local) target FIRST,
+        // then the broadcast ungrabs both device classes.
+        rotation.toggle_pause().await;
+        assert!(rotation.paused);
+        assert_eq!(rotation.output_handler.released, 1);
+        let state = *grab_rx.borrow();
+        assert!(state.paused);
+        assert!(!class_grabbed(DeviceClass::Keyboard, &state));
+        assert!(!class_grabbed(DeviceClass::Toggled, &state));
+
+        // While paused, switch chords are not acted on (and nothing was
+        // forwarded, so no further cleanup runs either).
+        rotation.next_client().await;
+        rotation.prev_client().await;
+        rotation.set_client("".to_string()).await;
+        assert!(rotation.current_client.is_none());
+        assert_eq!(rotation.output_handler.released, 1);
+
+        // Resume: re-grab per the rotation state — keyboard grabbed, mouse
+        // still passing through (no client is current).
+        rotation.toggle_pause().await;
+        assert!(!rotation.paused);
+        let state = *grab_rx.borrow();
+        assert!(!state.paused);
+        assert!(class_grabbed(DeviceClass::Keyboard, &state));
+        assert!(!class_grabbed(DeviceClass::Toggled, &state));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn pause_with_client_regrabs_mice_on_resume_and_stays_ungrabbed_on_drop() {
+        use crate::device::input::class_grabbed;
+        use crate::device::DeviceClass;
+        let (dir, mut rotation, grab_rx) = pause_rotation("pause-client").await;
+        let endpoint: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        rotation.current_client = Some(endpoint);
+
+        // Pause while a client is current: the mouse class ungrabs too (pause
+        // wins over client_active), and resume re-grabs it (client current).
+        rotation.toggle_pause().await;
+        let state = *grab_rx.borrow();
+        assert!(state.paused && state.client_active);
+        assert!(!class_grabbed(DeviceClass::Keyboard, &state));
+        assert!(!class_grabbed(DeviceClass::Toggled, &state));
+        rotation.toggle_pause().await;
+        let state = *grab_rx.borrow();
+        assert!(class_grabbed(DeviceClass::Keyboard, &state));
+        assert!(class_grabbed(DeviceClass::Toggled, &state));
+
+        // Pause again, then the client drops (client removals funnel through
+        // set_and_grab_current_client): the devices must stay ungrabbed, not
+        // "re-grab for the local machine".
+        rotation.toggle_pause().await;
+        rotation.set_and_grab_current_client(None).await;
+        let state = *grab_rx.borrow();
+        assert!(state.paused && !state.client_active);
+        assert!(!class_grabbed(DeviceClass::Keyboard, &state));
+        assert!(!class_grabbed(DeviceClass::Toggled, &state));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn paused_server_drops_input_without_forwarding_or_emitting() {
+        let (dir, mut rotation, _grab_rx) = pause_rotation("pause-input").await;
+        rotation.current_client = Some("127.0.0.1:1234".parse().unwrap());
+        rotation.toggle_pause().await;
+
+        // Input seen while paused (monux keeps listening for the resume chord)
+        // is counted as physical but neither forwarded nor emitted locally.
+        rotation
+            .send_input_events(device::InputBatch {
+                events: vec![
+                    i32_event(evdev::EventType::KEY.0, 28, 1),
+                    i32_event(evdev::EventType::KEY.0, 28, 0),
+                ],
+                is_grabbed: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(rotation.status_counts.physical, 2);
+        assert_eq!(rotation.status_counts.forwarded, 0);
+        assert_eq!(rotation.status_counts.emitted_local, 0);
+        assert_eq!(rotation.output_handler.written, 0);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

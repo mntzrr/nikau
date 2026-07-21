@@ -99,6 +99,8 @@ The server runs as your normal user (in the `input` group, with `/dev/uinput` ac
 
 Switch between the server and connected clients using `LeftShift+LeftAlt+R` (next) and `LeftAlt+P` (previous), or send `SIGUSR1` / `SIGUSR2` to the server process. Shortcuts are configurable via `--shortcut` / `--shortcut-prev`. The switch fires the moment the full combo is pressed; keep holding the modifier keys and tap the last key again to cycle through further clients.
 
+Pause input handling entirely with `LeftShift+LeftAlt+P` (configurable via `--pause-shortcut`, empty string disables). While paused, monux ungrabs **all** input devices — keyboards included — so the local machine gets raw evdev input with monux's re-emit completely out of the way (useful for games and raw-input apps). monux keeps listening ungrabbed, so the pause chord still works: press it again to resume, which re-grabs per the current rotation state (keyboards always, mice only while a client is active). While paused nothing is forwarded to clients and switch chords are not acted on — since devices are ungrabbed, those keystrokes also pass through to the local system. Clipboard sharing continues untouched while paused.
+
 Every switch also shows a desktop notification (via `notify-send`), so an unexpected switch is visible immediately.
 
 > **Pick a shortcut that doesn't collide with your compositor/WM/application binds.** monux consumes only the *last* key of the combo, so if the same combo is bound elsewhere (e.g. `Alt+Shift+R` toggling your clipboard manager), pressing it fires *both* actions — and a switch you didn't mean to make looks exactly like dead keys: your input silently goes to the other machine. The notification exists to make such accidents obvious.
@@ -117,6 +119,10 @@ monux client --www <server-host-or-ip>
 ### Pointer motion rate (office vs gaming)
 
 By default the server coalesces pointer motion to **250 updates per second**: high-polling-rate mice (1000-8000 Hz) otherwise produce thousands of tiny packets per second for no visible benefit at a desk. Motion deltas are summed losslessly — the cursor ends up in exactly the same place, just updated less often, with far less network traffic and CPU use on both machines. All motion travels as unreliable QUIC datagrams: they are never retransmitted, so a WiFi blip can't stall later input or replay a stale backlog (the "cursor crawls for a second" effect); each coalesced datagram repeats the last few deltas so the client heals lost frames and the cursor position stays exact. At full rate (`--motion-hz 0`, gaming) no history is repeated — skipping a superseded frame beats healing it. Tune with `--motion-hz`, e.g. `--motion-hz 60` for maximum savings, `--motion-hz 500` for extra smoothness.
+
+### Pointer and scroll sensitivity (client)
+
+When the server's mouse and the client's machine disagree on DPI/sensitivity, scale the deltas on the client: `--mouse-scale 0.5` halves pointer motion, `--scroll-scale 2` doubles scroll steps (including hi-res wheels). Both default to `1.0` and accept values from 0.05 to 20. Fractional remainders are carried between events per axis, so small scales lose no motion over time — 0.5x emits exactly one tick per two input ticks. The scaling applies only where the client injects into its own virtual devices; the server machine's local input always stays 1:1.
 
 ## Troubleshooting
 

@@ -22,6 +22,7 @@ pub fn parse_key_combos(
     keys_next: &str,
     keys_prev: Option<&str>,
     keys_goto: Vec<String>,
+    keys_pause: Option<&str>,
 ) -> Result<KeyCombos> {
     let mut combos = vec![];
     combos.push(parse_action(keys_next, Event::SwitchNext)?);
@@ -30,6 +31,9 @@ pub fn parse_key_combos(
     }
     for kg in keys_goto.into_iter() {
         combos.push(parse_goto(&kg)?);
+    }
+    if let Some(kp) = keys_pause {
+        combos.push(parse_action(kp, Event::PauseToggle)?);
     }
     let all_keys = combos.iter().flat_map(|combo| combo.keys.clone()).collect();
     Ok(KeyCombos { combos, all_keys })
@@ -187,6 +191,12 @@ impl ComboState {
             }
         }
         return None;
+    }
+
+    /// Number of keys in this combo. Used to pick the most specific chord when
+    /// several combos complete on the same event (see handle_input_event).
+    pub(crate) fn num_keys(&self) -> usize {
+        self.combo_key_codes.len()
     }
 }
 

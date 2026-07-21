@@ -9,7 +9,7 @@ use tokio::time;
 use tracing::{debug, info, trace, warn};
 
 use crate::device::handles::{DeviceHandle, DeviceHandler};
-use crate::device::{shortcut, util, Event, GrabEvent, InputBatch};
+use crate::device::{shortcut, util, DeviceClass, Event, GrabEvent, GrabState, InputBatch};
 use crate::msgs::event;
 
 /// How long to wait before retrying a failed device grab/ungrab.
@@ -144,83 +144,84 @@ impl DeviceHandler for InputHandler {
     fn handle_device_stream(
         &mut self,
         mut stream: EventStream,
-        grab_rx: Option<watch::Receiver<GrabEvent>>,
-        mut device_info: util::DeviceInfo,
+        state_rx: watch::Receiver<GrabState>,
+        device_info: util::DeviceInfo,
+        class: DeviceClass,
     ) -> Result<DeviceHandle> {
         let config = self.config.clone();
-        let handle = if let Some(grab_rx) = grab_rx {
-            // Device has grab toggling enabled
-            task::spawn(async move {
-                read_device_or_grab_events(&mut stream, config, grab_rx, device_info).await
-            })
-        } else {
-            // Device is to be permanently grabbed
-            task::spawn(async move {
-                grab_keyboard_when_quiescent(&mut stream, &mut device_info).await;
-                read_device_events(&mut stream, config, device_info).await
-            })
-        };
+        let handle = task::spawn(async move {
+            read_device_or_grab_events(&mut stream, config, state_rx, device_info, class).await
+        });
         Ok(DeviceHandle { handle })
     }
 }
 
-async fn read_device_events(
+/// The grab target of a device class for a broadcast grab state: keyboards
+/// stay grabbed whenever input isn't paused (their combos must be swallowed),
+/// toggled devices (mice) only while a client is also active.
+pub(crate) fn class_grabbed(class: DeviceClass, state: &GrabState) -> bool {
+    if state.paused {
+        return false;
+    }
+    match class {
+        DeviceClass::Keyboard => true,
+        DeviceClass::Toggled => state.client_active,
+    }
+}
+
+/// Drives the device toward the target grab state, returning Some(target) when
+/// the transition failed and must be retried (see GRAB_RETRY_INTERVAL).
+/// Grabbing a KEYBOARD waits for the device to become quiescent first (see
+/// grab_keyboard_when_quiescent) — that helper retries the grab itself until
+/// it succeeds, so a keyboard grab never lands on the retry path here.
+async fn apply_grab_transition(
     stream: &mut EventStream,
-    mut handler_config: HandlerConfig,
-    device_info: util::DeviceInfo,
-) {
-    let mut input_events_batch = Vec::new();
-    let mut combo_events_batch = Vec::new();
-    loop {
-        match stream.next_event().await {
-            Ok(event) => {
-                handle_input_event(
-                    stream,
-                    &mut handler_config,
-                    event,
-                    &device_info,
-                    &mut input_events_batch,
-                    &mut combo_events_batch,
-                )
-                .await
-            }
-            Err(e) => {
-                // Common when the device has been unplugged.
-                // We'll frequently get this error just as inotify is telling us the file is deleted.
-                // Exit the reader: retrying a dead fd spins at 100% CPU and
-                // floods the log until the inotify handler aborts this task.
-                // The watch's Deleted handler cleans up the device handle.
-                info!(
-                    "Got an error event for {:?}, removing device (might be unplugged?): {}",
-                    stream.device().name().unwrap_or("(Unnamed device)"),
-                    e
-                );
-                return;
-            }
-        }
+    device_info: &mut util::DeviceInfo,
+    class: DeviceClass,
+    target: bool,
+) -> Option<bool> {
+    let ok = if target && class == DeviceClass::Keyboard {
+        grab_keyboard_when_quiescent(stream, device_info).await;
+        true
+    } else {
+        handle_grab_event(
+            stream,
+            device_info,
+            if target {
+                GrabEvent::Grab
+            } else {
+                GrabEvent::Ungrab
+            },
+        )
+    };
+    if ok {
+        None
+    } else {
+        Some(target)
     }
 }
 
 async fn read_device_or_grab_events(
     stream: &mut EventStream,
     mut handler_config: HandlerConfig,
-    mut grab_rx: watch::Receiver<GrabEvent>,
+    mut state_rx: watch::Receiver<GrabState>,
     mut device_info: util::DeviceInfo,
+    class: DeviceClass,
 ) {
     let mut input_events_batch = Vec::new();
     let mut combo_events_batch = Vec::new();
     // Apply the current grab state right away: this device may have been (re)added
-    // while a client is already active, so we can't wait for the next switch.
-    // If the (un)grab fails, keep retrying in the background instead of giving up
-    // on the device: without the grab, input leaks to the local system while also
-    // being routed onwards by monux.
+    // while a client is already active or while input is paused, so we can't wait
+    // for the next state change. If the (un)grab fails, keep retrying in the
+    // background instead of giving up on the device: without the grab, input
+    // leaks to the local system while also being routed onwards by monux.
     let mut retry_interval = time::interval(GRAB_RETRY_INTERVAL);
     let mut pending_grab = {
-        let current = *grab_rx.borrow_and_update();
-        if handle_grab_event(stream, &mut device_info, current) {
+        let target = class_grabbed(class, &state_rx.borrow_and_update());
+        if target == device_info.is_grabbed {
             None
         } else {
-            Some(current)
+            apply_grab_transition(stream, &mut device_info, class, target).await
         }
     };
     loop {
@@ -245,8 +246,8 @@ async fn read_device_or_grab_events(
                     }
                 }
             }
-            grab = grab_rx.changed() => {
-                if let Err(e) = grab {
+            state = state_rx.changed() => {
+                if let Err(e) = state {
                     // Sender was dropped, shouldn't happen: exit to avoid looping forever.
                     warn!(
                         "Error on grab watch for {:?}, removing device: {}",
@@ -255,21 +256,21 @@ async fn read_device_or_grab_events(
                     );
                     return
                 }
-                let current = *grab_rx.borrow_and_update();
-                pending_grab = if handle_grab_event(stream, &mut device_info, current) {
-                    None
-                } else {
-                    Some(current)
-                };
+                let target = class_grabbed(class, &state_rx.borrow_and_update());
+                // Skip states that don't change this class's target (e.g. a
+                // client switch is irrelevant to an already-grabbed keyboard).
+                if target != device_info.is_grabbed || pending_grab.is_some() {
+                    pending_grab =
+                        apply_grab_transition(stream, &mut device_info, class, target).await;
+                }
             }
             _ = retry_interval.tick(), if pending_grab.is_some() => {
-                let current = pending_grab.unwrap();
-                if handle_grab_event(stream, &mut device_info, current) {
-                    pending_grab = None;
-                } else {
+                let target = pending_grab.unwrap();
+                pending_grab = apply_grab_transition(stream, &mut device_info, class, target).await;
+                if pending_grab.is_some() {
                     warn!(
-                        "Retrying {:?} for {:?} in {:?}",
-                        current,
+                        "Retrying {} for {:?} in {:?}",
+                        if target { "grab" } else { "ungrab" },
                         stream.device().name(),
                         GRAB_RETRY_INTERVAL
                     );
@@ -324,6 +325,7 @@ async fn handle_input_event(
         // Check whether this event completes a key combo, which creates an additional event.
         // No short-circuit: Ensure that all combo_states have a chance to be updated
         let mut any_consume = false;
+        let mut fired: Vec<(usize, Event)> = Vec::new();
         for cs in c.combo_states.iter_mut() {
             match cs.check_combo(&event) {
                 shortcut::ComboAction::ConsumeEvent => {
@@ -332,9 +334,24 @@ async fn handle_input_event(
                 shortcut::ComboAction::PassEvent => {}
                 shortcut::ComboAction::ConsumeEventAndEmitAction(action) => {
                     any_consume = true;
-                    combo_events_batch.push(action);
+                    fired.push((cs.num_keys(), action));
                 }
             }
+        }
+        if !fired.is_empty() {
+            // Several combos can complete on the same event when one chord's
+            // keys are a subset of another's (e.g. the default pause chord
+            // LeftShift+LeftAlt+P and the default prev-switch chord LeftAlt+P):
+            // only the most specific (longest) chord(s) fire their action, so
+            // pausing doesn't also switch clients. Shorter chords still fired
+            // internally above, so their key releases stay consumed as usual.
+            let max_keys = fired.iter().map(|(n, _)| *n).max().expect("fired is non-empty");
+            combo_events_batch.extend(
+                fired
+                    .into_iter()
+                    .filter(|(n, _)| *n == max_keys)
+                    .map(|(_, action)| action),
+            );
         }
         if any_consume {
             debug!(

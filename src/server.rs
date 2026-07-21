@@ -11,7 +11,7 @@ use tracing::{debug, error, trace, warn};
 
 use crate::clipboard::data::ClipboardData;
 use crate::clipboard::server::LocalClipboard;
-use crate::device::{output, Event, GrabEvent};
+use crate::device::{output, Event, GrabState};
 use crate::msgs::{bulk, event, shared};
 use crate::network::{approval, transport};
 use crate::rotation;
@@ -19,7 +19,7 @@ use crate::rotation;
 pub async fn run_server_events_loop<O: output::OutputHandler>(
     config_dir: PathBuf,
     mut event_rx: mpsc::Receiver<Event>,
-    grab_tx: watch::Sender<GrabEvent>,
+    grab_tx: watch::Sender<GrabState>,
     output_handler: O,
     max_clipboard_size_bytes: u64,
     max_uncompressed_size_bytes: u64,
@@ -86,6 +86,9 @@ pub async fn run_server_events_loop<O: output::OutputHandler>(
                     }
                     Event::SwitchTo(fingerprint) => {
                         rotation.set_client(fingerprint).await;
+                    }
+                    Event::PauseToggle => {
+                        rotation.toggle_pause().await;
                     }
                 }
             },

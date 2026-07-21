@@ -19,15 +19,17 @@ pub trait DeviceHandler: Send + 'static {
     fn handle_device_stream(
         &mut self,
         events: EventStream,
-        grab_rx: Option<watch::Receiver<device::GrabEvent>>,
+        state_rx: watch::Receiver<device::GrabState>,
         device_info: util::DeviceInfo,
+        class: device::DeviceClass,
     ) -> Result<DeviceHandle>;
 }
 
 pub struct DeviceHandles<H: DeviceHandler> {
     /// Devices which support one or more keys specified in client switch key combos.
-    /// These devices are always grabbed at the server so that we can consistently
-    /// grab/"swallow" the key combo input when the local server is the active target.
+    /// These devices are always grabbed at the server (unless input is paused) so
+    /// that we can consistently grab/"swallow" the key combo input when the local
+    /// server is the active target.
     always_grabbed_devices: HashMap<PathBuf, DeviceHandle>,
 
     /// Devices which don't support one or more key combo keys, such as mice.
@@ -37,8 +39,8 @@ pub struct DeviceHandles<H: DeviceHandler> {
 
     handler: H,
 
-    /// Method for subscribing devices to grab events
-    grab_tx: watch::Sender<device::GrabEvent>,
+    /// Method for subscribing devices to grab state broadcasts
+    grab_tx: watch::Sender<device::GrabState>,
 
     /// All distinct keys used in client switch key combos, for internal accounting.
     all_combo_keys: HashSet<KeyCode>,
@@ -47,7 +49,7 @@ pub struct DeviceHandles<H: DeviceHandler> {
 impl<H: DeviceHandler> DeviceHandles<H> {
     pub fn new(
         handler: H,
-        grab_tx: watch::Sender<device::GrabEvent>,
+        grab_tx: watch::Sender<device::GrabState>,
         all_combo_keys: HashSet<KeyCode>,
     ) -> DeviceHandles<H> {
         DeviceHandles {
@@ -69,27 +71,30 @@ impl<H: DeviceHandler> DeviceHandles<H> {
                 device.name().unwrap_or("(Unnamed device)")
             );
         }
-        if supports_any_keys {
+        // Both device classes subscribe to the grab-state broadcast: a pause
+        // must ungrab keyboards too, not just toggled devices.
+        let class = if supports_any_keys {
             // This device supports one or more keys configured for client switch key combinations.
             // We should grab/route its input via monux so that we can omit keypresses from the combos.
-            let join_handle = self.handler.handle_device_stream(
-                start_device_stream(device, path)?,
-                None,
-                device_info,
-            )?;
-            self.always_grabbed_devices
-                .insert(path.clone(), join_handle);
+            device::DeviceClass::Keyboard
         } else {
             // This device doesn't support keys used in key combinations (e.g. a mouse).
             // When the server is the active input, we can ungrab the device,
             // letting its input pass through directly.
-            let join_handle = self.handler.handle_device_stream(
-                start_device_stream(device, path)?,
-                Some(self.grab_tx.subscribe()),
-                device_info,
-            )?;
-            self.toggled_devices.insert(path.clone(), join_handle);
-        }
+            device::DeviceClass::Toggled
+        };
+        let join_handle = self.handler.handle_device_stream(
+            start_device_stream(device, path)?,
+            self.grab_tx.subscribe(),
+            device_info,
+            class,
+        )?;
+        match class {
+            device::DeviceClass::Keyboard => {
+                self.always_grabbed_devices.insert(path.clone(), join_handle)
+            }
+            device::DeviceClass::Toggled => self.toggled_devices.insert(path.clone(), join_handle),
+        };
         Ok(())
     }
 

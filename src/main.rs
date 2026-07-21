@@ -95,6 +95,13 @@ struct ServerArgs {
     #[arg(long, value_name = "key1,key2,key3=[fingerprint-prefix]")]
     shortcut_goto: Option<Vec<String>>,
 
+    /// Keyboard shortcut for pausing/resuming input handling. While paused,
+    /// ALL input devices (keyboards included) are ungrabbed so the local
+    /// machine gets raw input with monux's re-emit out of the way (games,
+    /// raw-input apps); press the chord again to resume. Empty string disables.
+    #[arg(long, default_value = "leftshift,leftalt,p", value_name = "key1,key2,key3")]
+    pause_shortcut: String,
+
     /// Substring or regular expression for selecting specific devices to monitor,
     /// argument can be repeated for multiple filters
     #[arg(long, value_name = "device-name-pattern")]
@@ -163,6 +170,18 @@ struct ClientArgs {
     #[arg(long)]
     www: bool,
 
+    /// Multiplier applied to pointer motion deltas before injecting them on
+    /// this machine, for compensating DPI/sensitivity differences with the
+    /// server's mouse. Sub-tick fractions are carried between events, so small
+    /// scales lose no motion over time.
+    #[arg(long, default_value = "1.0", value_name = "scale", value_parser = parse_input_scale)]
+    mouse_scale: f64,
+
+    /// Multiplier applied to scroll wheel deltas (including the hi-res wheel
+    /// axes) before injecting them on this machine.
+    #[arg(long, default_value = "1.0", value_name = "scale", value_parser = parse_input_scale)]
+    scroll_scale: f64,
+
     /// Disable the automatic background update (on by default): a daily check
     /// at low CPU priority, then an automatic restart into the new binary.
     /// The session resumes automatically on reconnect.
@@ -176,6 +195,22 @@ struct UpdateArgs {
     /// server protocol-compatibility gate
     #[arg(long)]
     force: bool,
+}
+
+/// Accepted range for --mouse-scale/--scroll-scale: wide enough for genuine
+/// DPI/sensitivity mismatches, narrow enough to catch typos.
+const MIN_INPUT_SCALE: f64 = 0.05;
+const MAX_INPUT_SCALE: f64 = 20.0;
+
+/// clap value parser for the client's --mouse-scale/--scroll-scale flags.
+fn parse_input_scale(s: &str) -> std::result::Result<f64, String> {
+    match s.parse::<f64>() {
+        Ok(v) if v.is_finite() && (MIN_INPUT_SCALE..=MAX_INPUT_SCALE).contains(&v) => Ok(v),
+        _ => Err(format!(
+            "scale must be a number between {} and {}",
+            MIN_INPUT_SCALE, MAX_INPUT_SCALE
+        )),
+    }
 }
 
 /// Listens for SIGUSR1 and SIGUSR2, treating them as "switch to next client" and "switch to prev client" respectively.
@@ -394,6 +429,12 @@ fn main() -> Result<()> {
                     &args.shortcut,
                     args.shortcut_prev.as_deref(),
                     args.shortcut_goto.unwrap_or(vec![]),
+                    // An empty --pause-shortcut disables pause/resume.
+                    if args.pause_shortcut.trim().is_empty() {
+                        None
+                    } else {
+                        Some(args.pause_shortcut.as_str())
+                    },
                     args.device.unwrap_or(vec![]),
                     args.exit_secs,
                     verifier,
@@ -472,6 +513,12 @@ fn main() -> Result<()> {
                 .max_clipboard_size_kb
                 .checked_mul(1024)
                 .context("--max-clipboard-size-kb is too large")?;
+            if args.mouse_scale != 1.0 || args.scroll_scale != 1.0 {
+                info!(
+                    "Scaling injected input: pointer motion x{}, scroll x{}",
+                    args.mouse_scale, args.scroll_scale
+                );
+            }
             rt.block_on(async {
                 client(
                     config_dir,
@@ -480,6 +527,8 @@ fn main() -> Result<()> {
                     max_clipboard_size_bytes,
                     mode,
                     from_discovery,
+                    args.mouse_scale,
+                    args.scroll_scale,
                 )
                 .await
             })?;
@@ -606,6 +655,7 @@ async fn server(
     keys_next: &str,
     keys_prev: Option<&str>,
     keys_goto: Vec<String>,
+    keys_pause: Option<&str>,
     device_filters: Vec<Regex>,
     exit_secs: Option<u32>,
     verifier: Arc<approval::MonuxCertVerification<'static>>,
@@ -640,10 +690,16 @@ async fn server(
     let signals = Signals::new([signal::SIGUSR1, signal::SIGUSR2, signal::SIGHUP])?;
     std::thread::spawn(move || handle_signals(signals, event_tx2, diagnostics2));
 
-    let (grab_tx, _grab_rx) = watchchan::channel(monux::device::GrabEvent::Ungrab);
+    let (grab_tx, _grab_rx) = watchchan::channel(monux::device::GrabState {
+        client_active: false,
+        paused: false,
+    });
     let grab_tx2 = grab_tx.clone();
 
-    let key_combos = shortcut::parse_key_combos(keys_next, keys_prev, keys_goto)?;
+    let key_combos = shortcut::parse_key_combos(keys_next, keys_prev, keys_goto, keys_pause)?;
+    if let Some(kp) = keys_pause {
+        info!("Pause/resume shortcut: {} (ungrabs ALL devices; press again to resume)", kp);
+    }
     let input_handler = input::InputHandler::new(&key_combos, event_tx)?;
 
     let watch_handle = task::spawn(async move {
@@ -774,6 +830,8 @@ async fn client(
     max_clipboard_size_bytes: u64,
     mode: NetworkMode,
     from_discovery: bool,
+    mouse_scale: f64,
+    scroll_scale: f64,
 ) -> Result<()> {
     // Try to set up virtual devices up-front - exit early if we can't access uinput
     let mut output_handler = output::uinput::VirtualUInputDevices::new()
@@ -809,6 +867,8 @@ async fn client(
                 &mut output_handler,
                 mode,
                 &config_dir,
+                mouse_scale,
+                scroll_scale,
             ) => {
                 // client::run only returns on failure (its loop never exits otherwise).
                 if let Err(e) = run_result {

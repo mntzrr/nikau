@@ -15,6 +15,34 @@ pub enum GrabEvent {
     Ungrab,
 }
 
+/// Broadcast grab state for ALL input devices, single-sourced by the rotation
+/// loop. Every device task subscribes and derives its own grab target from its
+/// DeviceClass, so a state that must reach keyboards and mice alike (pause)
+/// can't leave one class behind.
+#[derive(Clone, Copy, Debug)]
+pub struct GrabState {
+    /// A remote client currently owns the input. Toggled devices (mice) stay
+    /// grabbed exactly while this is true.
+    pub client_active: bool,
+    /// Input is paused (see --pause-shortcut): EVERYTHING is ungrabbed,
+    /// keyboards included, so the local machine gets raw evdev input with
+    /// monux's re-emit fully out of the way (games, raw-input apps). monux
+    /// keeps listening ungrabbed, so the pause chord itself still works.
+    pub paused: bool,
+}
+
+/// How a device's grab is managed (see DeviceHandles).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DeviceClass {
+    /// Keyboard-class: the device supports one or more switch/pause combo keys,
+    /// so it stays grabbed whenever input isn't paused — combos must be
+    /// swallowed consistently when the local machine is the active target.
+    Keyboard,
+    /// Toggled (e.g. mice): grabbed only while a client is active (and input
+    /// isn't paused); otherwise its input passes through to the local system.
+    Toggled,
+}
+
 /// Key codes to trace through the input pipeline, parsed once from
 /// MONUX_TRACE_KEYS (e.g. "28,42,56"). For catching where a specific key dies
 /// in the wild: every stage logs traced keys at INFO with a KEYTRACE prefix.
@@ -53,4 +81,7 @@ pub enum Event {
     SwitchPrev,
     /// Activate the client with matching cert fingerprint, or the server if the string is empty
     SwitchTo(String),
+    /// Toggle pause mode: ungrab ALL input devices (keyboards included) so the
+    /// local machine gets raw input, or re-grab per the rotation state.
+    PauseToggle,
 }
