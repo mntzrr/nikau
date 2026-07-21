@@ -631,12 +631,14 @@ impl<O: device::output::OutputHandler> Rotation<O> {
     }
 
     /// Runs the same held-key cleanup on the CURRENT target that a real switch
-    /// runs on the old one, for a switch request dropped by SWITCH_DEBOUNCE.
+    /// runs on the old one, for a chord that fired without producing a switch:
+    /// dropped by SWITCH_DEBOUNCE, already on the target, or an unmatched goto.
     /// The user pressed the full chord intending to switch: the chord's
     /// modifier presses were forwarded to the current target, but ComboState
     /// consumes their releases once the chord fires (see device::shortcut), so
     /// without this the target would keep the chord's modifiers logically
-    /// pressed until each is tapped again.
+    /// pressed until each is tapped again — presenting as dead keys (e.g.
+    /// Enter) since every keypress becomes a modifier combo.
     async fn release_current_target_keys(&mut self) {
         match self.current_client {
             Some(endpoint) => {
@@ -733,6 +735,14 @@ impl<O: device::output::OutputHandler> Rotation<O> {
     /// Switches to the previous client (or to the server) in the arbitrary rotation.
     pub async fn prev_client(&mut self) {
         let target = self.prev_target();
+        if target == self.current_client {
+            // Already on the target: no switch happens, but the chord fired
+            // and ComboState consumes the chord keys' releases, so the
+            // modifiers it forwarded must be cleaned up here instead.
+            debug!("Ignoring switch request: already on the target");
+            self.release_current_target_keys().await;
+            return;
+        }
         if !self.switch_allowed(target) {
             info!(
                 "Ignoring switch request: a switch happened less than {:?} ago",
@@ -747,6 +757,14 @@ impl<O: device::output::OutputHandler> Rotation<O> {
     /// Switches to the next client (or to the server) in the arbitrary rotation.
     pub async fn next_client(&mut self) {
         let target = self.next_target();
+        if target == self.current_client {
+            // Already on the target: no switch happens, but the chord fired
+            // and ComboState consumes the chord keys' releases, so the
+            // modifiers it forwarded must be cleaned up here instead.
+            debug!("Ignoring switch request: already on the target");
+            self.release_current_target_keys().await;
+            return;
+        }
         if !self.switch_allowed(target) {
             info!(
                 "Ignoring switch request: a switch happened less than {:?} ago",
@@ -759,11 +777,14 @@ impl<O: device::output::OutputHandler> Rotation<O> {
     }
 
     /// Switches to the specified client by fingerprint, or to the server if the fingerprint is empty.
-    /// If a matching client isn't connected, does nothing.
+    /// If a matching client isn't connected, does nothing — except run the held-key
+    /// cleanup, since the chord fired and its modifier releases are being consumed.
     pub async fn set_client(&mut self, fingerprint: String) {
-        if fingerprint.is_empty() {
+        // Resolve the target: Ok(Some(target)) switches, Err(()) means no
+        // unique match (already warn-logged).
+        let target: Result<Option<SocketAddr>, ()> = if fingerprint.is_empty() {
             // Empty fingerprint means "go to server"
-            self.update_current_client(None).await;
+            Ok(None)
         } else {
             // Find the matching client, if any. Allow "abcd123" to match client with "abcd12345[...]"
             let matching_clients: Vec<&ClientInfo> = self
@@ -777,20 +798,34 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                         "Missing client with fingerprint {}, doing nothing",
                         fingerprint
                     );
+                    Err(())
                 }
-                1 => {
-                    let endpoint = matching_clients
+                1 => Ok(Some(
+                    matching_clients
                         .first()
                         .expect("matching_clients has len=1")
-                        .endpoint;
-                    self.update_current_client(Some(endpoint)).await;
-                }
+                        .endpoint,
+                )),
                 _ => {
                     warn!(
                         "Multiple clients match fingerprint {}, doing nothing: {:?}",
                         fingerprint, matching_clients
                     );
+                    Err(())
                 }
+            }
+        };
+        match target {
+            Ok(target) if target != self.current_client => {
+                self.update_current_client(target).await;
+            }
+            Ok(_) => {
+                // Already on the target (no-op switch).
+                debug!("Ignoring goto request: already on the target");
+                self.release_current_target_keys().await;
+            }
+            Err(()) => {
+                self.release_current_target_keys().await;
             }
         }
     }
@@ -2294,6 +2329,39 @@ mod tests {
         // client-target switch.
         assert!(rotation.switch_allowed(None));
         assert!(!rotation.switch_allowed(Some(endpoint)));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn noop_switch_releases_current_target_keys() {
+        let dir = temp_dir("noop-release");
+        let (grab_tx, _grab_rx) = watch::channel(device::GrabEvent::Ungrab);
+        let (rotation_tx, _rotation_rx) = mpsc::channel(8);
+        let mut rotation = Rotation::new(
+            grab_tx,
+            StubOutput { written: 0, released: 0 },
+            None,
+            &dir,
+            rotation_tx,
+            None,
+            Arc::new(DiagnosticsMirror::new()),
+        )
+        .await
+        .unwrap();
+
+        // With no clients connected, every next/prev lands on the current
+        // target (local): a no-op switch. The chord still fired, so the held
+        // modifiers it forwarded must be released on the current target.
+        rotation.next_client().await;
+        assert_eq!(rotation.output_handler.released, 1);
+        rotation.prev_client().await;
+        assert_eq!(rotation.output_handler.released, 2);
+        // Same for goto switches that don't switch: unmatched fingerprint,
+        // and goto-local while already local.
+        rotation.set_client("deadbeef".to_string()).await;
+        assert_eq!(rotation.output_handler.released, 3);
+        rotation.set_client("".to_string()).await;
+        assert_eq!(rotation.output_handler.released, 4);
         let _ = fs::remove_dir_all(&dir);
     }
 
