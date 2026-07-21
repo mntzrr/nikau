@@ -13,10 +13,41 @@ use tracing::info;
 
 const DEFAULT_REPO: &str = "https://github.com/mntzrr/monux.git";
 /// Commit this binary was built from, set by build.rs ("<sha>" or "<sha>-dirty").
-const CURRENT_REVISION: &str = env!("MONUX_GIT_SHA");
+pub const CURRENT_REVISION: &str = env!("MONUX_GIT_SHA");
 
-pub fn run(force: bool) -> Result<()> {
-    let repo = std::env::var("MONUX_UPDATE_REPO").unwrap_or_else(|_| DEFAULT_REPO.to_string());
+/// The repo updates are pulled from (MONUX_UPDATE_REPO overrides for testing).
+pub fn repo_url() -> String {
+    std::env::var("MONUX_UPDATE_REPO").unwrap_or_else(|_| DEFAULT_REPO.to_string())
+}
+
+/// The commit currently published at the repo's HEAD (cheap update check; no
+/// clone needed).
+pub fn latest_remote_sha(repo: &str) -> Result<String> {
+    let out = Command::new("git")
+        .args(["ls-remote", repo, "HEAD"])
+        .output()
+        .context("Failed to run git: is it installed?")?;
+    if !out.status.success() {
+        bail!("git ls-remote {} failed", repo);
+    }
+    let stdout = String::from_utf8(out.stdout)?;
+    stdout
+        .split_whitespace()
+        .next()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .with_context(|| format!("git ls-remote {} returned no HEAD", repo))
+}
+
+/// Whether the remote HEAD sha means there's an update for a build with the
+/// given revision ("<sha>" or "<sha>-dirty"; "unknown" never auto-updates).
+pub fn is_newer_remote(remote_sha: &str, current_revision: &str) -> bool {
+    let current_base = current_revision.trim_end_matches("-dirty");
+    current_base != "unknown" && !current_base.is_empty() && !remote_sha.starts_with(current_base)
+}
+
+pub fn run(force: bool, low_priority: bool) -> Result<()> {
+    let repo = repo_url();
     let src_dir = match std::env::var_os("MONUX_UPDATE_CACHE") {
         Some(dir) => PathBuf::from(dir),
         None => home::home_dir()
@@ -67,7 +98,16 @@ pub fn run(force: bool) -> Result<()> {
         "Building and installing to {} (this can take a few minutes)...",
         root.join("bin/monux").display()
     );
-    let status = Command::new(cargo)
+    let mut cmd = if low_priority {
+        // Background auto-updates compile at the lowest CPU scheduling
+        // priority, so a build can't stall interactive input on this machine.
+        let mut c = Command::new("nice");
+        c.args(["-n", "19"]).arg(cargo);
+        c
+    } else {
+        Command::new(cargo)
+    };
+    let status = cmd
         .arg("install")
         .arg("--path")
         .arg(&src_dir)
@@ -152,4 +192,33 @@ fn git_output(dir: &Path, args: &[&str]) -> Result<String> {
         bail!("git {:?} failed in {}", args, dir.display());
     }
     Ok(String::from_utf8(out.stdout)?.trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_check_comparison() {
+        // Different commit: update available.
+        assert!(is_newer_remote(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbb"
+        ));
+        // Remote HEAD is our commit (possibly with more context): up to date.
+        assert!(!is_newer_remote(
+            "bbbbbbbbbbbbcccccccccccccccccccccccc",
+            "bbbbbbbbbbbb"
+        ));
+        // Dirty build compares against its base sha.
+        assert!(!is_newer_remote(
+            "bbbbbbbbbbbbcccccccccccccccccccccccc",
+            "bbbbbbbbbbbb-dirty"
+        ));
+        // Unknown build revision: never auto-update.
+        assert!(!is_newer_remote(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "unknown"
+        ));
+    }
 }

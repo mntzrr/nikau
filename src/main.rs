@@ -107,6 +107,12 @@ struct ServerArgs {
     /// (e.g. for gaming with a high-polling-rate mouse).
     #[arg(long, default_value_t = 125, value_name = "hz")]
     motion_hz: u32,
+
+    /// Automatically check for updates and install them in the background
+    /// (daily, at low CPU priority). Never restarts the running session;
+    /// you'll get a desktop notification when a restart is due.
+    #[arg(long)]
+    auto_update: bool,
 }
 
 #[derive(Args)]
@@ -130,6 +136,12 @@ struct ClientArgs {
     /// The default is low-latency tuning for local networks.
     #[arg(long)]
     www: bool,
+
+    /// Automatically check for updates and install them in the background
+    /// (daily, at low CPU priority). Never restarts the running session;
+    /// you'll get a desktop notification when a restart is due.
+    #[arg(long)]
+    auto_update: bool,
 }
 
 #[derive(Args)]
@@ -194,7 +206,7 @@ fn main() -> Result<()> {
             maybe_elevate("to persist system settings")?;
             return monux::setup::run();
         }
-        Commands::Update(args) => return monux::update::run(args.force),
+        Commands::Update(args) => return monux::update::run(args.force, false),
         _ => {}
     }
 
@@ -217,6 +229,9 @@ fn main() -> Result<()> {
             }
             let server_lock = single_instance::acquire("server")?;
             settle_after_takeover(&server_lock);
+            if args.auto_update {
+                rt.spawn(monux::autoupdate::run());
+            }
             let fingerprint = Arc::new(Mutex::new(None));
             let verifier = approval::MonuxCertVerification::new(
                 "server",
@@ -270,6 +285,9 @@ fn main() -> Result<()> {
         Commands::Client(args) => {
             let client_lock = single_instance::acquire("client")?;
             settle_after_takeover(&client_lock);
+            if args.auto_update {
+                rt.spawn(monux::autoupdate::run());
+            }
             // When no host is given, the server address comes from mDNS discovery,
             // which allows re-discovering it after repeated connection failures.
             let from_discovery = args.host.is_none();

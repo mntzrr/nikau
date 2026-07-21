@@ -1,3 +1,4 @@
+pub mod autoupdate;
 pub mod client;
 pub mod clipboard;
 pub mod device;

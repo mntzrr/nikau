@@ -61,6 +61,10 @@ To pick up the new version, restart the processes — the session then heals its
 
 Active-session resumption survives server restarts for up to an hour (see `active_client` in `~/.config/monux`).
 
+### Automatic updates
+
+Pass `--auto-update` to `monux server` and/or `monux client` to have them check the GitHub repo once shortly after startup and then daily. When a newer commit appears, it is rebuilt and installed in the background at low CPU priority — the running session is never interrupted and never restarted on its own. When an update is installed you get a desktop notification; restart the process whenever convenient (the session resumes automatically, see above). Auto-update trusts the configured GitHub repo and this machine's git setup implicitly; leave it off if you prefer to review changes first.
+
 ## Usage
 
 Run the server on the machine with the physical input devices:
