@@ -112,7 +112,7 @@ monux client --www <server-host-or-ip>
 
 ### Pointer motion rate (office vs gaming)
 
-By default the server coalesces pointer motion to **125 updates per second**: high-polling-rate mice (1000-8000 Hz) otherwise produce thousands of tiny packets per second for no visible benefit at a desk. Motion deltas are summed losslessly — the cursor ends up in exactly the same place, just updated less often, with far less network traffic and CPU use on both machines. Pure motion is sent as loss-tolerant QUIC datagrams regardless of rate. Tune with `--motion-hz`, e.g. `--motion-hz 0` to forward every event as it comes (gaming) or `--motion-hz 60` for maximum savings.
+By default the server coalesces pointer motion to **250 updates per second**: high-polling-rate mice (1000-8000 Hz) otherwise produce thousands of tiny packets per second for no visible benefit at a desk. Motion deltas are summed losslessly — the cursor ends up in exactly the same place, just updated less often, with far less network traffic and CPU use on both machines. Coalesced motion travels the reliable ordered stream (at this rate it's cheap, and losing an accumulated delta would show as a cursor jump on a lossy link). At full rate (`--motion-hz 0`, gaming) motion instead goes as loss-tolerant QUIC datagrams, where skipping a superseded frame beats retransmitting it. Tune with `--motion-hz`, e.g. `--motion-hz 60` for maximum savings, `--motion-hz 500` for extra smoothness.
 
 ## Troubleshooting
 

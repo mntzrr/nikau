@@ -103,9 +103,9 @@ struct ServerArgs {
     /// Target rate for forwarding pointer motion, in updates per second. Motion
     /// deltas are coalesced (summed losslessly) between updates: the cursor ends
     /// up in the same place with far less network and CPU load. The default of
-    /// 125 is plenty for office work; set 0 to forward every event as it comes
+    /// 250 is plenty for office work; set 0 to forward every event as it comes
     /// (e.g. for gaming with a high-polling-rate mouse).
-    #[arg(long, default_value_t = 125, value_name = "hz")]
+    #[arg(long, default_value_t = 250, value_name = "hz")]
     motion_hz: u32,
 
     /// Automatically check for updates and install them in the background

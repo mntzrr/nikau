@@ -1210,11 +1210,10 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         }
         self.motion_dirty = false;
         let (dx, dy, source_count) = std::mem::replace(&mut self.pending_motion, (0, 0, 0));
-        let endpoint = match self.current_client {
-            Some(endpoint) => endpoint,
+        if self.current_client.is_none() {
             // Switched away meanwhile; the pending deltas are moot.
-            None => return,
-        };
+            return;
+        }
         let mut events = Vec::with_capacity(2);
         if dx != 0 {
             events.push(motion_event(evdev::RelativeAxisCode::REL_X.0, dx));
@@ -1225,20 +1224,18 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         if events.is_empty() {
             return;
         }
-        match self.try_send_motion_datagram(&endpoint, events) {
-            MotionSend::Sent => {
-                self.status_counts.forwarded += source_count;
-            }
-            MotionSend::Fallback(events) => {
-                if let Err(e) = self
-                    .send_event_to_remote_client(event::ServerEvent::Input(events))
-                    .await
-                {
-                    warn!("Failed to forward coalesced motion: {:?}", e);
-                } else {
-                    self.status_counts.forwarded += source_count;
-                }
-            }
+        // Coalesced flushes go over the ordered stream, not datagrams: at the
+        // flush rate the stream is cheap, and losing a whole accumulated delta
+        // (e.g. on a congested 2.4 GHz link) shows as a visible cursor jump.
+        // Datagrams stay for the full-rate path (--motion-hz 0), where one lost
+        // frame out of thousands is invisible.
+        if let Err(e) = self
+            .send_event_to_remote_client(event::ServerEvent::Input(events))
+            .await
+        {
+            warn!("Failed to forward coalesced motion: {:?}", e);
+        } else {
+            self.status_counts.forwarded += source_count;
         }
     }
 
@@ -1337,15 +1334,17 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                 if self.motion_flush_interval.is_some() {
                     // Office-mode coalescing (--motion-hz): sum the deltas into
                     // the accumulator; the flush timer forwards them at the
-                    // configured rate. Lossless for the cursor position, far
-                    // less network/CPU load than one message per 8kHz poll.
+                    // configured rate over the ordered stream. Lossless for the
+                    // cursor position, far less network/CPU load than one
+                    // message per 8kHz poll.
                     self.accumulate_motion(&events);
                     return Ok(());
                 }
-                // High-rate pointer motion goes over unreliable/unordered QUIC
-                // datagrams: a lost motion update is instantly superseded by the
-                // next one, so skipping it beats stalling all later input behind
-                // a stream retransmission (the cause of visible micro-stutter).
+                // Full-rate motion (--motion-hz 0) goes over unreliable/unordered
+                // QUIC datagrams: a lost motion update is instantly superseded by
+                // the next one, so skipping it beats stalling all later input
+                // behind a stream retransmission (the cause of visible
+                // micro-stutter).
                 match self.try_send_motion_datagram(&endpoint, events) {
                     MotionSend::Sent => {
                         self.status_counts.forwarded += event_count;
