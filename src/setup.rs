@@ -46,12 +46,13 @@ fn sysctl_buf_conf_content() -> String {
 
 pub fn run() -> Result<()> {
     if unsafe { libc::geteuid() } != 0 {
-        // sudo resets PATH, so 'sudo monux setup' often fails with
-        // "command not found": print the full invocation that works.
+        // Reaching here non-root means auto-elevation was opted out of
+        // (MONUX_NO_ELEVATE). sudo resets PATH, so 'sudo monux setup' often
+        // fails with "command not found": print the full invocation that works.
         let exe = std::env::current_exe()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "monux".to_string());
-        bail!("monux setup persists system settings and needs root. Run it with: sudo {} setup", exe);
+        bail!("monux setup persists system settings and needs root. Run it with: sudo {} setup (or re-run without MONUX_NO_ELEVATE to elevate automatically)", exe);
     }
 
     let mut failures = 0;

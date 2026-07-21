@@ -39,8 +39,8 @@ enum Commands {
     Client(ClientArgs),
 
     /// Persists machine-local settings that optimize this machine for local KVM
-    /// (input device access, /dev/uinput permissions, WiFi power saving).
-    /// Requires root: run with 'sudo monux setup'.
+    /// (input device access, /dev/uinput permissions, WiFi power saving,
+    /// UDP socket buffers). Re-executes with sudo automatically.
     Setup,
 
     /// Updates monux to the latest version from GitHub, rebuilding from source
@@ -166,7 +166,10 @@ fn main() -> Result<()> {
 
     // Setup and update don't need the config dir, devices, or the async runtime.
     match &cli.command {
-        Commands::Setup => return monux::setup::run(),
+        Commands::Setup => {
+            maybe_elevate("to persist system settings")?;
+            return monux::setup::run();
+        }
         Commands::Update(args) => return monux::update::run(args.force),
         _ => {}
     }
@@ -185,7 +188,7 @@ fn main() -> Result<()> {
             unreachable!("setup and update are handled before runtime initialization")
         }
         Commands::Server(args) => {
-            maybe_elevate()?;
+            maybe_elevate("for reliable input + clipboard")?;
             if args.port == 0 {
                 bail!("--port 0 (ephemeral port) is not supported: the mDNS advertisement must match the actual listen port");
             }
@@ -342,19 +345,20 @@ fn settle_after_takeover(lock: &single_instance::InstanceLock) {
     }
 }
 
-/// The server runs most reliably as root: as the session user with the
-/// Wayland clipboard active, aggressive clipboard managers can stall input on
-/// some compositors. Rather than making the user type 'sudo -E monux server',
-/// re-exec with sudo -E, which preserves the session environment so clipboard
-/// sharing keeps working. Opt out with MONUX_NO_ELEVATE=1 (e.g. for
-/// 'WAYLAND_DISPLAY= monux server' to intentionally disable the clipboard).
-fn maybe_elevate() -> Result<()> {
+/// The server and setup need root: as the session user with the Wayland
+/// clipboard active, aggressive clipboard managers can stall input on some
+/// compositors, and setup persists system settings. Rather than making the
+/// user type 'sudo -E monux ...', re-exec with sudo -E, which preserves the
+/// session environment so clipboard sharing keeps working. Opt out with
+/// MONUX_NO_ELEVATE=1 (e.g. for 'WAYLAND_DISPLAY= monux server' to
+/// intentionally disable the clipboard).
+fn maybe_elevate(reason: &str) -> Result<()> {
     if unsafe { libc::geteuid() } == 0 || std::env::var_os("MONUX_NO_ELEVATE").is_some() {
         return Ok(());
     }
     let exe = std::env::current_exe()
         .context("Failed to find our own executable for sudo re-exec")?;
-    info!("Re-executing with sudo for reliable input + clipboard (MONUX_NO_ELEVATE=1 to opt out)...");
+    info!("Re-executing with sudo {} (MONUX_NO_ELEVATE=1 to opt out)...", reason);
     let status = std::process::Command::new("sudo")
         .arg("-E")
         .arg(&exe)
