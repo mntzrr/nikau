@@ -38,6 +38,8 @@ cargo install --path . --root ~/.local
 
 The repository includes `.cargo/config.toml` with `target-cpu=native`, so the binary is automatically optimized for the machine you build it on.
 
+To uninstall later: `./uninstall.sh` removes the binary, the `/usr/local/bin` link, and the system settings persisted by `monux setup` (udev rules, uinput module load, WiFi powersave and UDP buffer configs), and asks before removing `~/.config/monux` (identity keypair and peer approvals).
+
 After installation, the binary is available as `monux` in `~/.local/bin`, which is in `PATH` by default on systemd-based distros and in most shell profiles (unlike `~/.cargo/bin`). If your shell doesn't find it, add `export PATH="$HOME/.local/bin:$PATH"` to your shell's rc file.
 
 ### If you want a portable binary
