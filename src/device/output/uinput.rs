@@ -4,9 +4,10 @@ use evdev::{
     uinput, AbsInfo, AbsoluteAxisCode, AttributeSet, EvdevEnum, EventSummary, KeyCode, MiscCode,
     RelativeAxisCode,
 };
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, trace, warn};
 
 use crate::device::output::{OutputHandler, VIRTUAL_DEVICE_NAME_PREFIX};
@@ -35,8 +36,14 @@ pub struct VirtualUInputDevices {
     mouse_device: uinput::VirtualDevice,
     touchpad_device: uinput::VirtualDevice,
 
-    /// Currently held keys/buttons, so they can be released on deactivation/disconnect.
-    pressed_keys: HashSet<u16>,
+    /// Currently held keys/buttons with when each press was emitted, so they
+    /// can be released on deactivation/disconnect and so delivery anomalies
+    /// (duplicated presses, catch-up bursts) can be logged.
+    pressed_keys: HashMap<u16, Instant>,
+    /// When the last key event was emitted; used to detect catch-up bursts
+    /// (a large batch of key events arriving right after a gap = stall flush,
+    /// which presents to the user as repeated characters).
+    last_key_event_at: Option<Instant>,
 }
 
 impl VirtualUInputDevices {
@@ -90,7 +97,8 @@ impl VirtualUInputDevices {
             keyboard_device,
             mouse_device,
             touchpad_device,
-            pressed_keys: HashSet::new(),
+            pressed_keys: HashMap::new(),
+            last_key_event_at: None,
         };
         info!("Created virtual uinput devices: keyboard, mouse, touchpad");
         Ok(ret)
@@ -247,7 +255,7 @@ impl OutputHandler for VirtualUInputDevices {
         );
         let mut releases: Vec<event::InputEvent> = self
             .pressed_keys
-            .iter()
+            .keys()
             .map(|code| event::InputEvent {
                 inputi32: Some(event::InputI32 {
                     type_: evdev::EventType::KEY.0,
@@ -297,15 +305,54 @@ impl OutputHandler for VirtualUInputDevices {
             return Ok(());
         }
 
-        // Track held keys/buttons so release_all() can unstick them later.
+        // Track held keys/buttons so release_all() can unstick them later, and
+        // log delivery anomalies that present as spurious repeated characters:
+        // duplicated presses (event delivered twice) and catch-up bursts (a
+        // backlog flushed after a stall).
+        let mut key_events_in_batch = 0u32;
         for (e, _dest) in &events {
             if e.event_type() == evdev::EventType::KEY {
-                if e.value() == 0 {
-                    self.pressed_keys.remove(&e.code());
-                } else {
-                    self.pressed_keys.insert(e.code());
+                key_events_in_batch += 1;
+                match e.value() {
+                    0 => {
+                        if let Some(since) = self.pressed_keys.remove(&e.code()) {
+                            let held = since.elapsed();
+                            if held > Duration::from_millis(600) {
+                                debug!(
+                                    "Key {} was held {:.1}s before its release arrived (delivery delay?)",
+                                    e.code(),
+                                    held.as_secs_f32()
+                                );
+                            }
+                        }
+                    }
+                    1 => {
+                        if self.pressed_keys.insert(e.code(), Instant::now()).is_some() {
+                            warn!(
+                                "Duplicate press for key {} with no release in between (event duplicated?)",
+                                e.code()
+                            );
+                        }
+                    }
+                    // value == 2: auto-repeat, keep the original press timestamp
+                    _ => {}
                 }
             }
+        }
+        if key_events_in_batch >= 12 {
+            if let Some(last) = self.last_key_event_at {
+                let gap = last.elapsed();
+                if gap > Duration::from_millis(1500) {
+                    info!(
+                        "Input burst: {} key events delivered after a {:.1}s gap (catch-up after a stall? presents as repeated characters)",
+                        key_events_in_batch,
+                        gap.as_secs_f32()
+                    );
+                }
+            }
+        }
+        if key_events_in_batch > 0 {
+            self.last_key_event_at = Some(Instant::now());
         }
 
         // Collect stats on how many events apply to each device
