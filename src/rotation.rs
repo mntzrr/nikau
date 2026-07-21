@@ -178,6 +178,23 @@ fn is_pure_pointer_motion(events: &[event::InputEvent]) -> bool {
         })
 }
 
+/// Logs any traced key events (MONUX_TRACE_KEYS) in this batch with the
+/// routing decision taken, so a dying keypress can be followed through the
+/// pipeline in the wild.
+fn keytrace_route(events: &[event::InputEvent], decision: &str) {
+    const EV_KEY: u16 = evdev::EventType::KEY.0;
+    for e in events {
+        if let Some(i) = &e.inputi32 {
+            if i.type_ == EV_KEY && device::key_traced(i.code) {
+                info!(
+                    "KEYTRACE route: {} code={} value={}",
+                    decision, i.code, i.value
+                );
+            }
+        }
+    }
+}
+
 pub struct ClipboardUpdateSourceArgs {
     pub source: Option<SocketAddr>,
     pub types: Vec<String>,
@@ -1677,6 +1694,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         if let Some(endpoint) = self.current_client {
             // Remote client is active, send all input to client and not to local machine.
             let events = batch.events;
+            keytrace_route(&events, "forward to client");
             if is_pure_pointer_motion(&events) {
                 if self.motion_flush_interval.is_some() {
                     // Office-mode coalescing (--motion-hz): sum the deltas into
@@ -1727,12 +1745,14 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         } else if batch.is_grabbed {
             // Local machine is active and device is grabbed, write input to local virtual devices.
             // For example, we grab keyboards so that we can skip sending switch combos to the local system.
+            keytrace_route(&batch.events, "emit local");
             self.output_handler.write(batch.events).await?;
             self.status_counts.emitted_local += event_count;
             Ok(())
         } else {
             // Local machine is active and device isn't grabbed (passthrough), drop input event.
             // For example, we don't grab mice/touchpads since they aren't relevant to switch combos.
+            keytrace_route(&batch.events, "passthrough drop");
             // If we send their input to the handler, the input is duplicated between the passthrough
             // and the virtual device.
             Ok(())

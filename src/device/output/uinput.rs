@@ -349,14 +349,24 @@ impl OutputHandler for VirtualUInputDevices {
                             // Repeat for a key we never saw pressed (e.g. held
                             // across a switch): this target never got the press,
                             // so drop the repeat instead of injecting it.
-                            trace!(
-                                "Dropping auto-repeat for key {} with no matching press",
-                                e.code()
-                            );
+                            if crate::device::key_traced(e.code()) {
+                                info!(
+                                    "KEYTRACE uinput: dropping auto-repeat for key {} with no matching press",
+                                    e.code()
+                                );
+                            } else {
+                                trace!(
+                                    "Dropping auto-repeat for key {} with no matching press",
+                                    e.code()
+                                );
+                            }
                             continue;
                         }
                     }
                 }
+            }
+            if e.event_type() == evdev::EventType::KEY && crate::device::key_traced(e.code()) {
+                info!("KEYTRACE uinput: emit key {} value {}", e.code(), e.value());
             }
             filtered_events.push((e, dest));
         }

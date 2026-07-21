@@ -293,6 +293,15 @@ async fn handle_input_event(
         } else {
             input_events_batch.push(convert_device_event(event, stream.device(), device_info))
         }
+        if event.event_type() == EventType::KEY && crate::device::key_traced(event.code()) {
+            info!(
+                "KEYTRACE capture: code={} value={} consumed={} device={:?}",
+                event.code(),
+                event.value(),
+                any_consume,
+                stream.device().name().unwrap_or("(Unnamed device)")
+            );
+        }
     }
 }
 

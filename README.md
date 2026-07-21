@@ -126,10 +126,12 @@ If input (e.g. the Enter key) stops registering on the server machine while `mon
 2. Check the 10-second heartbeat lines in the log: `Input status: local (Ungrab): N events in, M emitted locally`. They show whether monux sees your keystrokes at all, and where they went.
 3. `hyprctl devices | grep -i 'monux virtual'` — are the virtual keyboard/mouse still there? (The startup log lists their `/dev/input/eventN` nodes.)
 4. `sudo libinput debug-events` — does the kernel see the physical key presses?
+5. For a recurring dead key, restart the server with tracing: `MONUX_TRACE_KEYS=28 monux server` (28 = Enter; comma-separate more codes). Every pipeline stage then logs `KEYTRACE` lines: `capture` (the physical device delivered it, and whether a combo consumed it), `route` (forward to client / emit local / passthrough drop), `uinput` (emitted to the virtual device, or a repeat dropped). Where the trail stops is where the bug lives.
 
 **Reading the evidence:**
 
 - `INPUT SWALLOWED: ...` — monux sees your keys but they have nowhere to go (grab state vs switch state mismatch). Report the log.
+- `KEYTRACE capture` appears but no `KEYTRACE route`/`uinput` follows → the rotation loop stalled before routing (pair with the SIGHUP dump). `route: emit local` + `uinput: emit` appear but apps see nothing → the virtual device/compositor side (`hyprctl` checks above). `capture: consumed=true` for a key that isn't in your shortcut → report your `--shortcut`/`--shortcut-goto` config.
 - **Repeated characters on the client** — the client log distinguishes the mechanisms: `Duplicate press for key N` means the same press was delivered twice (event duplication), `Input burst: N key events delivered after a gap` means what you typed during a stall arrived at once when it cleared, and `Key N was held Ns before its release arrived` (debug level) marks delayed releases. Repeats that coincide with freeze warnings share the same root cause.
 - Keys visible in `libinput debug-events` and the heartbeat's *emitted* counter rises, but apps see nothing, and `hyprctl devices` lacks the virtual keyboard → the compositor dropped the virtual device. `hyprctl reload` recovers it; report it.
 - `Clipboard paste storm` or `Serving paste request ... took Ns` warnings coinciding with freezes → a clipboard manager (`wl-clip-persist`, `wl-paste --watch`) is hammering monux's clipboard serving. Tame or remove it.
