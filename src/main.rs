@@ -2,7 +2,7 @@ use std::fs;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -194,6 +194,30 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
         _ = sigterm.recv() => {}
+    }
+}
+
+/// Client variant of shutdown_signal: additionally resolves on SIGUSR1, SIGUSR2
+/// and SIGHUP. Those switch clients or dump diagnostics on the server (see
+/// handle_signals), but have no such meaning on a client — where their default
+/// action kills the process outright, skipping the cleanup that releases held
+/// keys on the virtual devices (they'd stay pressed until kernel teardown).
+/// Dying cleanly beats dying dirty.
+async fn client_shutdown_signal() {
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("Failed to install SIGTERM handler");
+    let mut sigusr1 = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
+        .expect("Failed to install SIGUSR1 handler");
+    let mut sigusr2 = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined2())
+        .expect("Failed to install SIGUSR2 handler");
+    let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        .expect("Failed to install SIGHUP handler");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = sigterm.recv() => {}
+        _ = sigusr1.recv() => {}
+        _ = sigusr2.recv() => {}
+        _ = sighup.recv() => {}
     }
 }
 
@@ -646,6 +670,15 @@ async fn server(
     Ok(())
 }
 
+/// A failed connection that had survived beyond this was a healthy session: its
+/// loss is a fresh network event, not a persistent failure — it neither counts
+/// toward mDNS re-discovery nor keeps the reconnect backoff elevated.
+const HEALTHY_SESSION: Duration = Duration::from_secs(60);
+
+/// Cap for the reconnect backoff: the first retry after a failure is immediate,
+/// then the delay doubles (1s, 2s, ...) up to this.
+const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(5);
+
 async fn client(
     config_dir: PathBuf,
     connect_addr: SocketAddr,
@@ -668,12 +701,17 @@ async fn client(
 
     let mut connect_addr = connect_addr;
     let mut consecutive_failures = 0u32;
+    // Delay before the next reconnect attempt: the first retry after a failure
+    // is immediate, then the delay doubles per failure (1s, 2s, ...) up to
+    // MAX_RECONNECT_BACKOFF. A lost healthy session resets it to immediate.
+    let mut reconnect_backoff = Duration::ZERO;
     // Keep one set of signal handlers registered across reconnect attempts.
-    let shutdown = shutdown_signal();
+    let shutdown = client_shutdown_signal();
     tokio::pin!(shutdown);
 
     loop {
         info!("Connecting to server: {}", connect_addr);
+        let connected_at = Instant::now();
         tokio::select! {
             run_result = client::run(
                 &connect_addr,
@@ -699,7 +737,14 @@ async fn client(
                 if let Err(e) = output_handler.release_all().await {
                     warn!("Failed to release held keys after connection loss: {:?}", e);
                 }
-                consecutive_failures += 1;
+                if connected_at.elapsed() > HEALTHY_SESSION {
+                    // The lost connection was a healthy session: start over with
+                    // a clean failure count and an immediate retry.
+                    consecutive_failures = 0;
+                    reconnect_backoff = Duration::ZERO;
+                } else {
+                    consecutive_failures += 1;
+                }
                 if from_discovery && consecutive_failures >= 3 {
                     // The discovered address may be stale (server restarted elsewhere,
                     // DHCP lease change, ...): try discovering the server again.
@@ -727,8 +772,14 @@ async fn client(
                     }
                     consecutive_failures = 0;
                 }
-                // Wait a bit before retrying. Often happens when waiting for server to approve the cert.
-                time::sleep(Duration::from_secs(5)).await
+                // Back off before retrying (immediate on the first failure);
+                // the next delay doubles, capped at MAX_RECONNECT_BACKOFF.
+                time::sleep(reconnect_backoff).await;
+                reconnect_backoff = if reconnect_backoff.is_zero() {
+                    Duration::from_secs(1)
+                } else {
+                    (reconnect_backoff * 2).min(MAX_RECONNECT_BACKOFF)
+                };
             },
             _ = &mut shutdown => {
                 // Same cleanup as the connection-loss path, then exit.

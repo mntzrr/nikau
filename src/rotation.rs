@@ -18,9 +18,12 @@ use crate::clipboard::{data, server};
 use crate::device;
 use crate::msgs::{bulk, event};
 
-/// If the selected client reconnects within 10 seconds of being removed, then reselect it automatically.
-/// This is intended to help with fast recovery following networking flakes.
-const REMOVED_CLIENT_RECOVERY_DEADLINE: Duration = Duration::from_secs(10);
+/// If the selected client reconnects within this long after being removed, then reselect it
+/// automatically. This is intended to help with fast recovery following networking flakes.
+/// Sized against the LAN QUIC idle timeout (transport.rs): a client that only learns of the
+/// drop via the 25s idle timeout needs ~25s to detect it plus an immediate first reconnect
+/// attempt; 45s leaves margin for a couple of backoff steps on top of that worst case.
+const REMOVED_CLIENT_RECOVERY_DEADLINE: Duration = Duration::from_secs(45);
 
 /// Name of the file (inside the config dir) recording the fingerprint of the
 /// client currently switched active. Written on every switch to a client and
@@ -136,10 +139,11 @@ enum MotionSend {
 }
 
 /// How many recent coalesced motion deltas each datagram repeats (see
-/// MotionDatagram.history). At the default 250 Hz flush rate, 8 frames cover
-/// a 32 ms loss burst — far longer than a typical WiFi blip — for ~80 extra
-/// bytes per datagram. Full-rate mode sends no redundancy (lost = skipped).
-const MOTION_HISTORY_LEN: usize = 8;
+/// MotionDatagram.history). At the default 250 Hz flush rate, 32 frames cover
+/// a 128 ms loss burst — far longer than a typical WiFi blip — for ~300 extra
+/// bytes per datagram (each frame is ≤10 postcard bytes). Full-rate mode sends
+/// no redundancy (lost = skipped).
+const MOTION_HISTORY_LEN: usize = 32;
 
 /// Returns true if the batch consists solely of relative X/Y pointer motion,
 /// which is safe to send over unreliable datagrams: each update is a delta that
@@ -444,11 +448,6 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         bulk_send: SendStream,
         conn: quinn::Connection,
     ) {
-        // Sort clients by their endpoints as an arbitrary consistent order across sessions
-        let idx = match self.clients.binary_search_by(|c| c.endpoint.cmp(&endpoint)) {
-            Ok(idx) => idx,
-            Err(idx) => idx,
-        };
         // Dedicated writer task for this client's bulk stream: clipboard payloads
         // can be megabytes, and writing them inline would stall input forwarding
         // for the whole rotation. The task also keeps each header glued to its
@@ -470,17 +469,23 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                 }
             });
         }
-        self.clients.insert(
-            idx,
-            ClientInfo {
-                endpoint,
-                fingerprint: fingerprint.clone(),
-                events_send,
-                bulk_tx,
-                conn,
-                datagrams_ok: true,
-            },
-        );
+        let info = ClientInfo {
+            endpoint,
+            fingerprint: fingerprint.clone(),
+            events_send,
+            bulk_tx,
+            conn,
+            datagrams_ok: true,
+        };
+        // Clients stay sorted by endpoint as an arbitrary consistent order across
+        // sessions. An identical endpoint can already be present when a reconnect
+        // lands before the old connection's removal: update that entry in place
+        // instead of inserting a duplicate (a later removal would clear only the
+        // first copy, leaving a dead one behind).
+        match self.clients.binary_search_by(|c| c.endpoint.cmp(&endpoint)) {
+            Ok(idx) => self.clients[idx] = info,
+            Err(idx) => self.clients.insert(idx, info),
+        }
 
         info!(
             "Added client {} @ {} to rotation: {}",

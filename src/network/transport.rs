@@ -20,12 +20,14 @@ const KEEPALIVE_MILLIS: u64 = 2000;
 /// This is the delay between a client losing connection and a server ungrabbing its input devices.
 /// It must be a healthy multiple of KEEPALIVE_MILLIS: with only 3s here, a single dropped or
 /// delayed WiFi packet (interference, client power-save, brief CPU stall) severed otherwise
-/// healthy connections. 10s tolerates ~4 consecutive lost keepalives, while still ungrabbing
-/// reasonably quickly when a client really dies.
-const TIMEOUT_MILLIS: u32 = 10_000;
+/// healthy connections. 25s tolerates ~12 consecutive lost keepalives, so multi-second WiFi
+/// black holes pass as invisible stalls. The tradeoff: a genuinely dead connection now takes
+/// up to 25s to detect, during which forwarded input is silently lost and devices stay
+/// grabbed (a degraded-link indicator is planned separately).
+const TIMEOUT_MILLIS: u32 = 25_000;
 
 /// WWW-mode idle timeout: internet paths can stall much longer than LAN ones,
-/// so the LAN-grade 3s timeout would sever otherwise-healthy connections.
+/// so the LAN-grade timeout would sever otherwise-healthy connections.
 const WWW_TIMEOUT_MILLIS: u32 = 30_000;
 
 /// WWW-mode keepalive: frequent enough to hold NAT/firewall state open,

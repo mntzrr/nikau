@@ -83,6 +83,10 @@ struct Connection {
     /// Whether writes to the virtual input devices are currently failing
     /// (see note_output_result).
     output_write_failing: bool,
+    /// True until this connection has been switched active once. The clipboard
+    /// re-announcement on activation (see the Switch handler) only fires on the
+    /// FIRST activation of each connection — i.e. on a fresh (re)connect.
+    fresh_activation: bool,
 }
 
 impl Connection {
@@ -198,6 +202,7 @@ impl Connection {
                 last_motion_seq: 0,
                 motion_applied_mask: 0,
                 output_write_failing: false,
+                fresh_activation: true,
             },
             connect_time,
         ))
@@ -403,6 +408,13 @@ impl Connection {
                         if e.enabled { "active" } else { "inactive" }
                     );
                     self.active = e.enabled;
+                    // The local-clipboard announcement below fires on
+                    // deactivation, and on the FIRST activation of each
+                    // connection (fresh_activation); capture and clear the flag.
+                    let first_activation = e.enabled && self.fresh_activation;
+                    if e.enabled {
+                        self.fresh_activation = false;
+                    }
                     if !e.enabled {
                         // This client was deactivated: release any held keys so they
                         // don't stay stuck on the virtual devices.
@@ -413,10 +425,23 @@ impl Connection {
                     }
                     if let Some(local_clipboard) = &mut local_clipboard {
                         if let Some(types) = &local_clipboard.get_local_clipboard_types() {
-                            if !e.enabled && !types.is_empty() {
+                            if (!e.enabled || first_activation) && !types.is_empty() {
                                 // We're being disabled and we have a clipboard from a local app.
                                 // It may be from when we were disabled, or from a prior enabled session. That's fine.
                                 // Keep announcing the local clipboard until/unless it gets overridden by a new one from the server.
+                                //
+                                // The first activation of a connection RE-announces it too:
+                                // when a drop makes the server clear the rotation's clipboard
+                                // state, a clipboard copied before the drop would otherwise
+                                // silently vanish. This cannot resurrect a stale clipboard
+                                // over a genuinely newer one: the server announces any
+                                // clipboard owned elsewhere when it adds the client, before
+                                // switching it active on this ordered stream, and that
+                                // announcement replaces our local types (set_remote_clipboard).
+                                // Still holding local types at the first activation therefore
+                                // means the rotation has nothing newer. Later activations on
+                                // the same connection don't re-announce: the
+                                // deactivate/activate handoff keeps the rotation current there.
                                 let types = types.join(" ");
                                 debug!("Sending clipboard types to server: {}", types);
                                 let msg =
