@@ -23,7 +23,7 @@ const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("MONUX_GIT_SH
 #[derive(Parser)]
 #[command(
     author,
-    version = VERSION,
+    version = format!("{} (protocol {})", VERSION, monux::msgs::shared::PROTOCOL_VERSION),
     about,
     long_about = format!(
         "{}\n\nWire protocol version: {}",

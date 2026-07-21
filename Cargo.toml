@@ -17,7 +17,7 @@ async-trait = "0.1"
 atty = "0.2"
 bit-vec = "0.9"
 bytes = "1.4"
-clap = { version = "4.4", features = ["derive"] }
+clap = { version = "4.4", features = ["derive", "string"] }
 evdev = { version = "0.13", features = ["tokio"] }
 hex = "0.4"
 home = "0.5"
