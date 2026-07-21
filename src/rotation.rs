@@ -44,10 +44,14 @@ const ACTIVE_CLIENT_MAX_AGE: Duration = Duration::from_secs(3600);
 /// connection and data source on the compositor, so bursts are collapsed.
 const CLIPBOARD_UPDATE_DEBOUNCE: Duration = Duration::from_millis(300);
 
-/// Minimum spacing between processed rotation switches (next/prev). When the
-/// rotation loop is briefly blocked (e.g. a network hiccup delaying a write),
-/// every frustrated shortcut press queues another switch; without a debounce
-/// they then execute back-to-back and the rotation ends up on a random side.
+/// Minimum spacing between processed rotation switches TO A CLIENT (next/prev).
+/// When the rotation loop is briefly blocked (e.g. a network hiccup delaying a
+/// write), every frustrated shortcut press queues another switch; without a
+/// debounce they then execute back-to-back and the rotation ends up on a random
+/// side. Switches back to the LOCAL machine are exempt: they ungrab the input
+/// devices, so they are the escape hatch and must always work — a debounced
+/// switch-away presents as dead keys with the client keeping the grab (see
+/// switch_allowed).
 const SWITCH_DEBOUNCE: Duration = Duration::from_millis(500);
 
 /// Channels for communicating with a connected client.
@@ -666,12 +670,8 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         }
     }
 
-    /// Switches to the previous client (or to the server) in the arbitrary rotation.
-    pub async fn prev_client(&mut self) {
-        if self.switch_debounced() {
-            self.release_current_target_keys().await;
-            return;
-        }
+    /// Computes the target of a previous-client switch (None = local machine).
+    fn prev_target(&self) -> Option<SocketAddr> {
         if let Some(current_client) = &self.current_client {
             // Currently on remote machine, find its entry in the list and go to the prev one
             let idx = match self
@@ -683,25 +683,19 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             };
             if idx == 0 {
                 // At start of vec or vec is empty - switch to local machine
-                self.update_current_client(None).await;
+                None
             } else {
                 // Go to prev entry in vec
-                self.update_current_client(self.clients.get(idx - 1).map(|c| c.endpoint))
-                    .await;
+                self.clients.get(idx - 1).map(|c| c.endpoint)
             }
         } else {
             // Currently on local machine, go to last entry on vec (if any)
-            self.update_current_client(self.clients.last().map(|c| c.endpoint))
-                .await;
+            self.clients.last().map(|c| c.endpoint)
         }
     }
 
-    /// Switches to the next client (or to the server) in the arbitrary rotation.
-    pub async fn next_client(&mut self) {
-        if self.switch_debounced() {
-            self.release_current_target_keys().await;
-            return;
-        }
+    /// Computes the target of a next-client switch (None = local machine).
+    fn next_target(&self) -> Option<SocketAddr> {
         if let Some(current_client) = &self.current_client {
             // Currently on remote machine, find its entry in the list and go to the next one
             let idx = match self
@@ -712,13 +706,56 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                 Err(idx) => idx,
             };
             // Go to next entry in vec, or fall back to local machine if vec is empty or we're off the end
-            self.update_current_client(self.clients.get(idx + 1).map(|c| c.endpoint))
-                .await;
+            self.clients.get(idx + 1).map(|c| c.endpoint)
         } else {
             // Currently on local machine, go to first entry on vec (if any)
-            self.update_current_client(self.clients.first().map(|c| c.endpoint))
-                .await;
+            self.clients.first().map(|c| c.endpoint)
         }
+    }
+
+    /// Decides whether a next/prev switch to `target` may run now, recording
+    /// the switch time when it may. A switch back to the LOCAL machine always
+    /// runs: it ungrabs the input devices, so it's the escape hatch and must
+    /// never be debounced away — a dropped switch-away presents as dead keys
+    /// with the client keeping the grab, and keystrokes meant to kill the
+    /// server then land on the client instead. Switches to a client are
+    /// debounced (see SWITCH_DEBOUNCE).
+    fn switch_allowed(&mut self, target: Option<SocketAddr>) -> bool {
+        match target {
+            None => {
+                self.last_switch_at = Some(Instant::now());
+                true
+            }
+            Some(_) => !self.switch_debounced(),
+        }
+    }
+
+    /// Switches to the previous client (or to the server) in the arbitrary rotation.
+    pub async fn prev_client(&mut self) {
+        let target = self.prev_target();
+        if !self.switch_allowed(target) {
+            info!(
+                "Ignoring switch request: a switch happened less than {:?} ago",
+                SWITCH_DEBOUNCE
+            );
+            self.release_current_target_keys().await;
+            return;
+        }
+        self.update_current_client(target).await;
+    }
+
+    /// Switches to the next client (or to the server) in the arbitrary rotation.
+    pub async fn next_client(&mut self) {
+        let target = self.next_target();
+        if !self.switch_allowed(target) {
+            info!(
+                "Ignoring switch request: a switch happened less than {:?} ago",
+                SWITCH_DEBOUNCE
+            );
+            self.release_current_target_keys().await;
+            return;
+        }
+        self.update_current_client(target).await;
     }
 
     /// Switches to the specified client by fingerprint, or to the server if the fingerprint is empty.
@@ -2232,6 +2269,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_target_switches_bypass_the_debounce() {
+        let dir = temp_dir("debounce-local-bypass");
+        let (grab_tx, _grab_rx) = watch::channel(device::GrabEvent::Ungrab);
+        let (rotation_tx, _rotation_rx) = mpsc::channel(8);
+        let mut rotation = Rotation::new(
+            grab_tx,
+            StubOutput { written: 0, released: 0 },
+            None,
+            &dir,
+            rotation_tx,
+            None,
+            Arc::new(DiagnosticsMirror::new()),
+        )
+        .await
+        .unwrap();
+
+        let endpoint: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        // Record a fresh switch: an immediate switch to a client is debounced...
+        assert!(!rotation.switch_debounced());
+        assert!(!rotation.switch_allowed(Some(endpoint)));
+        // ...but a switch back to the local machine (the ungrab escape hatch)
+        // always runs, and re-arms the debounce window for the next
+        // client-target switch.
+        assert!(rotation.switch_allowed(None));
+        assert!(!rotation.switch_allowed(Some(endpoint)));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn debounced_switch_still_releases_current_target_keys() {
         let dir = temp_dir("debounce-release");
         let (grab_tx, _grab_rx) = watch::channel(device::GrabEvent::Ungrab);
@@ -2248,21 +2314,19 @@ mod tests {
         .await
         .unwrap();
 
-        // The first switch request is processed (with no clients connected the
-        // rotation stays on the local machine). A re-fire within
-        // SWITCH_DEBOUNCE — e.g. the user pressing the full chord again while
-        // cycling rapidly — is dropped by the debounce...
-        rotation.next_client().await;
-        assert_eq!(rotation.output_handler.released, 0);
-        rotation.next_client().await;
+        // A switch to a client within SWITCH_DEBOUNCE of the last switch is
+        // dropped by the debounce (a ClientInfo can't be fabricated in a unit
+        // test, so this drives the same two calls next_client makes for a
+        // dropped client-target switch)...
+        rotation.last_switch_at = Some(Instant::now());
+        let endpoint: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        assert!(!rotation.switch_allowed(Some(endpoint)));
+        rotation.release_current_target_keys().await;
         // ...but the current target (here the local machine) must still get
         // the same held-key cleanup a real switch runs on the old target: the
         // chord's modifier presses were forwarded to it, and ComboState
         // consumes their releases once the chord fires.
         assert_eq!(rotation.output_handler.released, 1);
-        // Same for the prev direction.
-        rotation.prev_client().await;
-        assert_eq!(rotation.output_handler.released, 2);
         let _ = fs::remove_dir_all(&dir);
     }
 
