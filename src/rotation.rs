@@ -21,15 +21,16 @@ use crate::msgs::{bulk, event};
 const REMOVED_CLIENT_RECOVERY_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Name of the file (inside the config dir) recording the fingerprint of the
-/// client currently switched active. Written on every switch to a client,
-/// removed on switch back to the local machine and on graceful shutdown.
-/// When the server exits unexpectedly (crash, kill -9) the file survives, and
-/// the next server instance uses it to re-activate that client on reconnect.
+/// client currently switched active. Written on every switch to a client and
+/// removed on switch back to the local machine. It deliberately survives
+/// shutdown, graceful or not: the next server instance uses it to re-activate
+/// that client when it reconnects, making restarts (e.g. after an update)
+/// seamless. Staleness is bounded by ACTIVE_CLIENT_MAX_AGE.
 pub const ACTIVE_CLIENT_STATE_FILE: &str = "active_client";
 
 /// How old the active-client state may be before it is ignored on startup.
-/// Crash recovery is expected to happen soon after the crash; resuming a
-/// days-old session would be surprising.
+/// Resumption is expected soon after the previous stop (crash or update);
+/// resuming a days-old session would be surprising.
 const ACTIVE_CLIENT_MAX_AGE: Duration = Duration::from_secs(3600);
 
 /// Minimum spacing between processed clipboard source updates. Clipboard
@@ -277,7 +278,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         let pending_resume_fingerprint = load_pending_resume(&active_client_path);
         if let Some(pending) = &pending_resume_fingerprint {
             info!(
-                "A client ({}) was active when the server last exited unexpectedly; it will be re-activated when it reconnects",
+                "A client ({}) was active when the server last stopped; it will be re-activated when it reconnects",
                 pending
             );
         }
@@ -440,13 +441,14 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             }
         }
 
-        // Crash recovery: this client was active when the previous server
-        // instance exited unexpectedly. Re-activate it immediately.
+        // Session resumption: this client was active when the previous server
+        // instance stopped (crash or intentional restart, e.g. after an update).
+        // Re-activate it immediately.
         if let Some(pending) = &self.pending_resume_fingerprint {
             if *pending == fingerprint {
                 self.pending_resume_fingerprint = None;
                 info!(
-                    "Resuming session: re-activating client {} that was active before the unexpected server exit",
+                    "Resuming session: re-activating client {} that was active when the previous server stopped",
                     endpoint
                 );
                 self.update_current_client(Some(endpoint)).await;

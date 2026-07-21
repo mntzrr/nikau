@@ -479,9 +479,6 @@ async fn server(
 
     let (rotation_tx, rotation_rx) = mpsc::channel::<rotation::RotationEvent>(256);
     let rotation_tx2 = rotation_tx.clone();
-    // Path of the active-client state file, cleared on graceful shutdown below
-    // so that only an unexpected exit leaves a session to resume.
-    let active_client_path = rotation::active_client_state_path(&config_dir);
     let server_events_handle = task::spawn(async move {
         server::run_server_events_loop(
             config_dir,
@@ -543,12 +540,13 @@ async fn server(
             },
             _timeout = time::sleep(Duration::from_secs(exit_secs as u64)) => {
                 info!("Exiting automatically as requested (--exit-secs={})", exit_secs);
-                rotation::clear_active_client(&active_client_path);
             },
             _signal = shutdown_signal() => {
                 // Dropping _mdns_registration here sends the mDNS goodbye.
-                // Graceful shutdown: no session to resume on the next start.
-                rotation::clear_active_client(&active_client_path);
+                // The active-client state file is deliberately left in place:
+                // a restart (e.g. after 'monux update') resumes the session
+                // automatically when the client reconnects (bounded by
+                // ACTIVE_CLIENT_MAX_AGE).
                 info!("Shutting down...");
                 return Ok(());
             },
@@ -566,8 +564,10 @@ async fn server(
             },
             _signal = shutdown_signal() => {
                 // Dropping _mdns_registration here sends the mDNS goodbye.
-                // Graceful shutdown: no session to resume on the next start.
-                rotation::clear_active_client(&active_client_path);
+                // The active-client state file is deliberately left in place:
+                // a restart (e.g. after 'monux update') resumes the session
+                // automatically when the client reconnects (bounded by
+                // ACTIVE_CLIENT_MAX_AGE).
                 info!("Shutting down...");
                 return Ok(());
             },

@@ -52,6 +52,15 @@ monux update
 
 This pulls the latest source from GitHub into `~/.cache/monux/src`, rebuilds it on this machine (with `target-cpu=native`), and installs over the existing binary. Run it on each machine (server and clients), then restart any running `monux server` / `monux client` to pick up the new version. `monux --version` prints the commit the binary was built from, so you can check that all machines match.
 
+Updating never disrupts a running session: the processes keep their in-memory binary while the file on disk is replaced, so you can update mid-session.
+
+To pick up the new version, restart the processes — the session then heals itself:
+
+- **Server:** start `monux server` again however you normally run it (the new instance asks the old one to shut down and takes over). Clients reconnect within a few seconds, and the machine that was active is re-activated automatically — no client-side steps needed.
+- **Client:** run `monux update` on the client machine and restart the client there (e.g. over SSH). It reconnects and resumes by itself.
+
+Active-session resumption survives server restarts for up to an hour (see `active_client` in `~/.config/monux`).
+
 ## Usage
 
 Run the server on the machine with the physical input devices:
