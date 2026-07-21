@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -122,6 +123,21 @@ impl Connection {
         // a refused handshake too is what unblocks the gate after the server
         // upgrades ahead of us.
         crate::update::record_server_protocol_version(config_dir, server_version);
+        if server_version > shared::PROTOCOL_VERSION {
+            // The server upgraded ahead of us: this connection is about to be
+            // refused, so don't wait for the daily check — wake the
+            // auto-updater now (once per process; the handshake retries would
+            // otherwise re-hint every few seconds).
+            static UPDATE_HINTED: AtomicBool = AtomicBool::new(false);
+            if !UPDATE_HINTED.swap(true, Ordering::SeqCst) {
+                info!(
+                    "The server runs a newer monux (protocol v{} > v{})",
+                    server_version,
+                    shared::PROTOCOL_VERSION
+                );
+                crate::autoupdate::hint_update_available();
+            }
+        }
         transport::ensure_compatible_version(server_version)?;
 
         let (mut bulk_send, mut bulk_recv) = conn

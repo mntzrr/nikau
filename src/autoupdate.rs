@@ -10,6 +10,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use tokio::sync::Notify;
 use tracing::{debug, error, info, warn};
 
 use crate::update;
@@ -25,6 +26,18 @@ const RESTART_DELAY: Duration = Duration::from_secs(20);
 /// Set when an automatic restart is due after a background update; main
 /// re-execs the new binary once the graceful shutdown completes.
 static RESTART_AFTER_EXIT: AtomicBool = AtomicBool::new(false);
+
+/// Process-global hint that an update is probably available (e.g. the client
+/// saw a newer protocol version on the server). Wakes the check loop early
+/// instead of waiting for the daily tick.
+static UPDATE_HINT: Notify = Notify::const_new();
+
+/// Hints that an update is probably available; the auto-update loop (when
+/// running) checks immediately rather than at the next interval. Cheap and
+/// coalescing: repeated hints collapse into at most one extra check.
+pub fn hint_update_available() {
+    UPDATE_HINT.notify_one();
+}
 
 /// Test hook: override the startup delay (seconds).
 fn initial_delay() -> Duration {
@@ -78,7 +91,12 @@ fn schedule_restart() {
 /// recorded protocol version — updates that would break compatibility with
 /// the server are skipped. Servers pass None: they lead protocol upgrades.
 pub async fn run(gate_config_dir: Option<std::path::PathBuf>) {
-    tokio::time::sleep(initial_delay()).await;
+    tokio::select! {
+        _ = tokio::time::sleep(initial_delay()) => {}
+        _ = UPDATE_HINT.notified() => {
+            info!("Update hint received; checking for updates now");
+        }
+    }
     // Test hook: pretend an update was installed, exercising the automatic
     // restart without a rebuild. Fires once per boot lineage (the re-exec'd
     // image has MONUX_RESTARTED set) and skips the real update loop entirely.
@@ -142,7 +160,12 @@ pub async fn run(gate_config_dir: Option<std::path::PathBuf>) {
                 debug!("monux update check failed (offline?): {:?}", e);
             }
         }
-        tokio::time::sleep(check_interval()).await;
+        tokio::select! {
+            _ = tokio::time::sleep(check_interval()) => {}
+            _ = UPDATE_HINT.notified() => {
+                info!("Update hint received; checking for updates now");
+            }
+        }
     }
 }
 
