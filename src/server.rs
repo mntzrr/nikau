@@ -223,6 +223,9 @@ async fn handle_connection(
         .accept_bi()
         .await
         .context("Failed to initialize bulk stream")?;
+    // Clipboard bulk yields to the events stream (priority 0) when the
+    // connection is congested, so a big transfer can't starve input.
+    let _ = bulk_send.set_priority(-1);
 
     // Receive the version a second time, on the bulk stream.
     // Sending some data is required to initialize the bulk stream, so let's just repeat ourselves.

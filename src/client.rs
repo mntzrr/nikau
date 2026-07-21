@@ -74,8 +74,10 @@ struct Connection {
     /// Connection handle for receiving unreliable QUIC datagrams carrying
     /// high-rate pointer motion (see MotionDatagram).
     quinn_conn: quinn::Connection,
-    /// Newest applied motion datagram sequence number; older ones are dropped.
+    /// Newest applied motion frame sequence number (see MotionDatagram::apply).
     last_motion_seq: u64,
+    /// Bitmap of which of the last 64 motion frames have been applied.
+    motion_applied_mask: u64,
 }
 
 impl Connection {
@@ -126,6 +128,9 @@ impl Connection {
             .open_bi()
             .await
             .context("Failed to initialize bulk stream")?;
+        // Clipboard bulk yields to the events stream (priority 0) when the
+        // connection is congested, so a big transfer can't starve input.
+        let _ = bulk_send.set_priority(-1);
 
         // Exchange versions again via the bulk stream.
         // This is required in order to initialize the bulk stream,
@@ -149,6 +154,7 @@ impl Connection {
                 next_fetch_id: 0,
                 quinn_conn: conn,
                 last_motion_seq: 0,
+                motion_applied_mask: 0,
             },
             connect_time,
         ))
@@ -388,10 +394,8 @@ impl Connection {
         Ok(())
     }
 
-    /// Applies a pointer-motion datagram, dropping stale ones. Datagrams are
-    /// unreliable and unordered: each carries only REL_X/REL_Y deltas that are
-    /// superseded by the next update, so applying an out-of-order one would
-    /// just add jitter.
+    /// Applies a pointer-motion datagram, healing lost frames from the repeated
+    /// history and skipping ones already applied (see MotionDatagram::apply).
     async fn handle_motion_datagram<O: output::OutputHandler>(
         &mut self,
         bytes: &[u8],
@@ -403,21 +407,29 @@ impl Connection {
             // We're not the switched-active client; the datagram raced a switch.
             return Ok(());
         }
-        if msg.seq <= self.last_motion_seq {
-            trace!(
-                "Dropping stale motion datagram seq={} (last applied {})",
-                msg.seq,
-                self.last_motion_seq
-            );
+        if msg.history.is_empty() {
+            // Never sent by a monux server; applying it would needlessly age
+            // out still-healable frames.
             return Ok(());
         }
-        self.last_motion_seq = msg.seq;
-        trace!(
-            "Applying motion datagram seq={} ({} events)",
-            msg.seq,
-            msg.events.len()
-        );
-        output_handler.write(msg.events).await
+        let applied = msg.apply(self.last_motion_seq, self.motion_applied_mask);
+        self.last_motion_seq = applied.last_seq;
+        self.motion_applied_mask = applied.applied_mask;
+        let (dx, dy) = applied.delta;
+        if dx == 0 && dy == 0 {
+            // Stale datagram, or one carrying only already-applied frames.
+            trace!("Motion datagram seq={} contributed nothing new", msg.seq);
+            return Ok(());
+        }
+        trace!("Applying motion datagram seq={}: dx={} dy={}", msg.seq, dx, dy);
+        let mut events = Vec::with_capacity(2);
+        if dx != 0 {
+            events.push(event::motion_event(evdev::RelativeAxisCode::REL_X.0, dx));
+        }
+        if dy != 0 {
+            events.push(event::motion_event(evdev::RelativeAxisCode::REL_Y.0, dy));
+        }
+        output_handler.write(events).await
     }
 
     async fn handle_bulk_data_or_messages(

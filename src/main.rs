@@ -101,10 +101,11 @@ struct ServerArgs {
     www: bool,
 
     /// Target rate for forwarding pointer motion, in updates per second. Motion
-    /// deltas are coalesced (summed losslessly) between updates: the cursor ends
-    /// up in the same place with far less network and CPU load. The default of
-    /// 250 is plenty for office work; set 0 to forward every event as it comes
-    /// (e.g. for gaming with a high-polling-rate mouse).
+    /// deltas are coalesced (summed losslessly) between updates and sent as
+    /// unreliable datagrams with recent deltas repeated, so WiFi loss neither
+    /// stalls nor misplaces the cursor. The default of 250 is plenty for
+    /// office work; set 0 to forward every event as it comes (e.g. for gaming
+    /// with a high-polling-rate mouse).
     #[arg(long, default_value_t = 250, value_name = "hz")]
     motion_hz: u32,
 

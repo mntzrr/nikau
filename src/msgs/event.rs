@@ -58,18 +58,96 @@ impl std::fmt::Display for SwitchEvent {
 
 // InputEvent
 
-/// A pointer-motion batch sent from server to client as a QUIC datagram
-/// (unreliable, unordered). Motion updates are stale the moment a newer one
-/// exists, so skipping a lost datagram beats stalling all later input behind
-/// a stream retransmission. Only pure REL_X/REL_Y batches use this path;
-/// everything else (keys, buttons, wheel, absolute axes) stays on the ordered
-/// events stream.
+/// Pointer motion sent from server to client as a QUIC datagram (unreliable,
+/// unordered). Motion is stale the moment a newer update exists, so dropping a
+/// lost datagram beats stalling later input behind a stream retransmission;
+/// and since deltas sum commutatively, carrying recent deltas redundantly lets
+/// the receiver heal losses without any retransmission backlog. Only pure
+/// REL_X/REL_Y deltas use this path; everything else (keys, buttons, wheel,
+/// absolute axes) stays on the ordered events stream.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct MotionDatagram {
-    /// Per-connection sequence number; the client drops datagrams that arrive
-    /// older than the newest one it has already applied.
+    /// Per-connection sequence number of the newest frame in `history`.
     pub seq: u64,
-    pub events: Vec<InputEvent>,
+    /// Newest-first per-frame motion deltas: `history[0]` is frame `seq`,
+    /// `history[1]` is frame `seq - 1`, and so on. Coalesced mode
+    /// (--motion-hz) repeats up to a few recent frames so the client can heal
+    /// lost ones; full-rate mode sends a single entry (lost = skipped).
+    pub history: Vec<(i32, i32)>,
+}
+
+/// How far back (in frames) the receiver tracks application: frames older
+/// than `last_seq - MOTION_APPLY_WINDOW` can no longer be healed.
+pub const MOTION_APPLY_WINDOW: u64 = 64;
+
+/// Outcome of merging a MotionDatagram into the receiver's applied state.
+pub struct MotionApply {
+    /// Sequence of the newest frame known so far.
+    pub last_seq: u64,
+    /// Bit i = frame `last_seq - i` has been applied (bit 0 = newest).
+    pub applied_mask: u64,
+    /// Sum of deltas this datagram newly contributed (already-applied frames
+    /// are skipped, missing ones in `history` are healed).
+    pub delta: (i32, i32),
+}
+
+impl MotionDatagram {
+    /// Merges this datagram into the receiver state (`last_seq`, `applied_mask`),
+    /// returning the updated state plus the deltas to emit. Deltas are
+    /// commutative, so frames may be applied in any order; applying each frame
+    /// exactly once always yields the correct cursor position.
+    pub fn apply(&self, last_seq: u64, applied_mask: u64) -> MotionApply {
+        let mut last = last_seq;
+        let mut mask = applied_mask;
+        if self.seq > last {
+            let shift = self.seq - last;
+            mask = if shift >= MOTION_APPLY_WINDOW {
+                0
+            } else {
+                mask << shift
+            };
+            last = self.seq;
+        }
+        let mut dx = 0i32;
+        let mut dy = 0i32;
+        for (i, &(fx, fy)) in self.history.iter().enumerate() {
+            // history[i] carries frame seq - i. Frame numbers start at 1.
+            let Some(frame_seq) = self.seq.checked_sub(i as u64) else {
+                break;
+            };
+            if frame_seq == 0 {
+                break;
+            }
+            // last >= self.seq >= frame_seq, so the age can't underflow.
+            let age = last - frame_seq;
+            if age >= MOTION_APPLY_WINDOW {
+                continue;
+            }
+            let bit = 1u64 << age;
+            if mask & bit == 0 {
+                mask |= bit;
+                dx = dx.saturating_add(fx);
+                dy = dy.saturating_add(fy);
+            }
+        }
+        MotionApply {
+            last_seq: last,
+            applied_mask: mask,
+            delta: (dx, dy),
+        }
+    }
+}
+
+/// Builds a single relative-axis input event (for coalesced motion flushes).
+pub fn motion_event(code: u16, value: i32) -> InputEvent {
+    InputEvent {
+        inputi32: Some(InputI32 {
+            type_: evdev::EventType::RELATIVE.0,
+            code,
+            value,
+        }),
+        inputf64: None,
+    }
 }
 
 /// An input event to be written to a virtual device indicated by the target.
@@ -195,5 +273,105 @@ impl<'a> std::fmt::Display for ClipboardTypes<'a> {
             )
             .as_str(),
         )
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn datagram(seq: u64, history: &[(i32, i32)]) -> MotionDatagram {
+        MotionDatagram {
+            seq,
+            history: history.to_vec(),
+        }
+    }
+
+    #[test]
+    fn apply_sequential() {
+        let d = datagram(1, &[(1, 2)]);
+        let r = d.apply(0, 0);
+        assert_eq!(r.last_seq, 1);
+        assert_eq!(r.applied_mask, 0b1);
+        assert_eq!(r.delta, (1, 2));
+        // Next frame in order.
+        let d = datagram(2, &[(3, 4)]);
+        let r = d.apply(r.last_seq, r.applied_mask);
+        assert_eq!(r.last_seq, 2);
+        assert_eq!(r.applied_mask, 0b11);
+        assert_eq!(r.delta, (3, 4));
+    }
+
+    #[test]
+    fn apply_heals_gap_from_history() {
+        // Applied frame 1, then a datagram for frame 4 arrives carrying 4,3,2.
+        let first = datagram(1, &[(1, 0)]).apply(0, 0);
+        let d = datagram(4, &[(4, 0), (3, 0), (2, 0)]);
+        let r = d.apply(first.last_seq, first.applied_mask);
+        assert_eq!(r.last_seq, 4);
+        assert_eq!(r.applied_mask, 0b1111);
+        // Frames 2, 3 and 4 are newly applied; frame 1 is not repeated.
+        assert_eq!(r.delta, (4 + 3 + 2, 0));
+    }
+
+    #[test]
+    fn apply_skips_already_applied() {
+        // Duplicate delivery of the same datagram applies nothing twice.
+        let d = datagram(2, &[(3, 4), (1, 2)]);
+        let r1 = d.apply(0, 0);
+        assert_eq!(r1.delta, (4, 6));
+        let r2 = d.apply(r1.last_seq, r1.applied_mask);
+        assert_eq!(r2.delta, (0, 0));
+        assert_eq!(r2.applied_mask, r1.applied_mask);
+    }
+
+    #[test]
+    fn apply_out_of_order_datagram_heals_older_frame() {
+        // Frames 1 and 3 applied (2 was lost); a late datagram for frame 2
+        // still heals it, because deltas commute.
+        let d1 = datagram(1, &[(1, 0)]);
+        let r1 = d1.apply(0, 0);
+        let d3 = datagram(3, &[(3, 0)]);
+        let r3 = d3.apply(r1.last_seq, r1.applied_mask);
+        assert_eq!(r3.applied_mask, 0b101);
+        let d2 = datagram(2, &[(2, 5)]);
+        let r2 = d2.apply(r3.last_seq, r3.applied_mask);
+        assert_eq!(r2.last_seq, 3);
+        assert_eq!(r2.applied_mask, 0b111);
+        assert_eq!(r2.delta, (2, 5));
+    }
+
+    #[test]
+    fn apply_forgets_far_history_on_large_jump() {
+        // A jump beyond the tracking window forgets the old state; only the
+        // carried history is applied (older losses are unhealable).
+        let r = datagram(1, &[(1, 0)]).apply(0, 0);
+        let d = datagram(100, &[(100, 0), (99, 0)]);
+        let r = d.apply(r.last_seq, r.applied_mask);
+        assert_eq!(r.last_seq, 100);
+        assert_eq!(r.applied_mask, 0b11);
+        assert_eq!(r.delta, (199, 0));
+    }
+
+    #[test]
+    fn apply_ignores_frames_beyond_the_window() {
+        // A very old carrier whose frames all fall outside the window heals
+        // nothing.
+        let r = datagram(100, &[(100, 0)]).apply(0, 0);
+        let d = datagram(36, &[(36, 1)]);
+        let r = d.apply(r.last_seq, r.applied_mask);
+        assert_eq!(r.last_seq, 100);
+        assert_eq!(r.delta, (0, 0));
+    }
+
+    #[test]
+    fn apply_history_never_underflows_frame_numbers() {
+        // More history entries than frames exist: stop at frame 1.
+        let d = datagram(2, &[(2, 0), (1, 0), (0, 0)]);
+        let r = d.apply(0, 0);
+        assert_eq!(r.last_seq, 2);
+        assert_eq!(r.applied_mask, 0b11);
+        assert_eq!(r.delta, (3, 0));
     }
 }

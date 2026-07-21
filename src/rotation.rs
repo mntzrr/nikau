@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -126,21 +126,18 @@ pub struct AddClientArgs {
 /// Outcome of a pointer-motion datagram send attempt.
 enum MotionSend {
     Sent,
-    /// The events weren't sent as a datagram; send them over the stream instead.
-    Fallback(Vec<event::InputEvent>),
+    /// The peer can't do datagrams (permanently disabled); use the stream.
+    Fallback,
+    /// Not queued right now (see SendDatagramError::TooLarge); the caller
+    /// keeps the deltas pending and retries on the next opportunity.
+    Retry,
 }
 
-/// Builds a single relative-axis input event (for coalesced motion flushes).
-fn motion_event(code: u16, value: i32) -> event::InputEvent {
-    event::InputEvent {
-        inputi32: Some(event::InputI32 {
-            type_: evdev::EventType::RELATIVE.0,
-            code,
-            value,
-        }),
-        inputf64: None,
-    }
-}
+/// How many recent coalesced motion deltas each datagram repeats (see
+/// MotionDatagram.history). At the default 250 Hz flush rate, 8 frames cover
+/// a 32 ms loss burst — far longer than a typical WiFi blip — for ~80 extra
+/// bytes per datagram. Full-rate mode sends no redundancy (lost = skipped).
+const MOTION_HISTORY_LEN: usize = 8;
 
 /// Returns true if the batch consists solely of relative X/Y pointer motion,
 /// which is safe to send over unreliable datagrams: each update is a delta that
@@ -266,6 +263,11 @@ pub struct Rotation<O: device::output::OutputHandler> {
     pending_motion: (i32, i32, u64),
     /// Whether pending_motion holds unsent deltas.
     motion_dirty: bool,
+    /// Recently flushed motion deltas, newest first. Each coalesced datagram
+    /// repeats up to MOTION_HISTORY_LEN of them so the client can heal frames
+    /// lost on the wire (see MotionDatagram.history). Cleared on every switch:
+    /// deltas flushed to one client are moot for another.
+    motion_history: VecDeque<(i32, i32)>,
     /// Flush interval for motion coalescing; None = forward every batch
     /// immediately (e.g. --motion-hz 0 for gaming).
     motion_flush_interval: Option<Duration>,
@@ -310,6 +312,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             status_window_start: Instant::now(),
             pending_motion: (0, 0, 0),
             motion_dirty: false,
+            motion_history: VecDeque::new(),
             motion_flush_interval,
             last_switch_at: None,
         })
@@ -1210,25 +1213,48 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         }
         self.motion_dirty = false;
         let (dx, dy, source_count) = std::mem::replace(&mut self.pending_motion, (0, 0, 0));
-        if self.current_client.is_none() {
+        let endpoint = match self.current_client {
+            Some(c) => c,
             // Switched away meanwhile; the pending deltas are moot.
+            None => return,
+        };
+        if dx == 0 && dy == 0 {
             return;
         }
+        // Coalesced flushes go as datagrams, not over the ordered stream: a
+        // reliable stream retransmits and replays stale motion in order after
+        // a WiFi blip, which presents as the cursor sluggishly replaying a
+        // backlog. Datagrams never retransmit, and quinn drops the oldest
+        // queued datagram when its buffer is full, so no stale-motion backlog
+        // can ever pile up. Lost frames are healed position-losslessly via the
+        // repeated history (see MotionDatagram).
+        let mut history = Vec::with_capacity(MOTION_HISTORY_LEN + 1);
+        history.push((dx, dy));
+        history.extend(self.motion_history.iter().copied());
+        match self.try_send_motion_datagram(&endpoint, history) {
+            MotionSend::Sent => {
+                self.motion_history.push_front((dx, dy));
+                self.motion_history.truncate(MOTION_HISTORY_LEN);
+                self.status_counts.forwarded += source_count;
+                return;
+            }
+            MotionSend::Retry => {
+                // Keep the deltas pending; they retry (with any newer motion
+                // accumulated on top) at the next flush opportunity.
+                self.pending_motion = (dx, dy, source_count);
+                self.motion_dirty = true;
+                return;
+            }
+            MotionSend::Fallback => {}
+        }
+        // Stream fallback (peer can't do datagrams): ordered and lossless.
         let mut events = Vec::with_capacity(2);
         if dx != 0 {
-            events.push(motion_event(evdev::RelativeAxisCode::REL_X.0, dx));
+            events.push(event::motion_event(evdev::RelativeAxisCode::REL_X.0, dx));
         }
         if dy != 0 {
-            events.push(motion_event(evdev::RelativeAxisCode::REL_Y.0, dy));
+            events.push(event::motion_event(evdev::RelativeAxisCode::REL_Y.0, dy));
         }
-        if events.is_empty() {
-            return;
-        }
-        // Coalesced flushes go over the ordered stream, not datagrams: at the
-        // flush rate the stream is cheap, and losing a whole accumulated delta
-        // (e.g. on a congested 2.4 GHz link) shows as a visible cursor jump.
-        // Datagrams stay for the full-rate path (--motion-hz 0), where one lost
-        // frame out of thousands is invisible.
         if let Err(e) = self
             .send_event_to_remote_client(event::ServerEvent::Input(events))
             .await
@@ -1239,48 +1265,47 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         }
     }
 
-    /// Attempts to send a pure pointer-motion batch as a QUIC datagram.
-    /// Returns MotionSend::Fallback with the events if they should go over the
-    /// ordered events stream instead (peer can't do datagrams, the datagram is
-    /// too big, or the send buffer is momentarily full).
+    /// Attempts to send a motion frame as a QUIC datagram. `history` is
+    /// newest-first: entry 0 is this frame, followed by recent frames for
+    /// loss healing (see MotionDatagram). Fallback means the peer can't do
+    /// datagrams at all (permanently); Retry means the send buffer is
+    /// momentarily full and the caller should keep the deltas pending.
     fn try_send_motion_datagram(
         &mut self,
         endpoint: &SocketAddr,
-        events: Vec<event::InputEvent>,
+        history: Vec<(i32, i32)>,
     ) -> MotionSend {
         let idx = match self.clients.binary_search_by(|c| c.endpoint.cmp(endpoint)) {
             Ok(idx) => idx,
-            Err(_) => return MotionSend::Fallback(events),
+            Err(_) => return MotionSend::Fallback,
         };
         if !self.clients[idx].datagrams_ok {
-            return MotionSend::Fallback(events);
+            return MotionSend::Fallback;
         }
-        self.motion_seq = self.motion_seq.wrapping_add(1);
-        let msg = event::MotionDatagram {
-            seq: self.motion_seq,
-            events,
-        };
+        let seq = self.motion_seq.wrapping_add(1);
+        let msg = event::MotionDatagram { seq, history };
         let serialized = match postcard::to_stdvec(&msg) {
             Ok(s) => s,
             Err(e) => {
                 error!("Failed to serialize motion datagram: {:?}", e);
-                return MotionSend::Fallback(msg.events);
+                return MotionSend::Fallback;
             }
         };
-        let event_count = msg.events.len();
+        let history_len = msg.history.len();
         match self.clients[idx].conn.send_datagram(Bytes::from(serialized)) {
             Ok(()) => {
+                self.motion_seq = seq;
                 if !self.motion_datagram_announced {
                     self.motion_datagram_announced = true;
                     info!(
-                        "Sending pointer motion to {} as QUIC datagrams (lost updates are skipped, not retransmitted)",
+                        "Sending pointer motion to {} as QUIC datagrams (lost frames are healed from repeated history, not retransmitted)",
                         endpoint
                     );
                 }
                 trace!(
-                    "Sent motion datagram seq={} ({} events) to {}",
+                    "Sent motion datagram seq={} ({} frames) to {}",
                     self.motion_seq,
-                    event_count,
+                    history_len,
                     endpoint
                 );
                 MotionSend::Sent
@@ -1291,15 +1316,22 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                     endpoint, e
                 );
                 self.clients[idx].datagrams_ok = false;
-                MotionSend::Fallback(msg.events)
+                MotionSend::Fallback
+            }
+            Err(e @ SendDatagramError::TooLarge) => {
+                // Unreachable for our tiny frames; treated as "not queued" so
+                // the caller keeps the deltas pending rather than losing them.
+                trace!("Motion datagram to {} not queued ({}), retrying later", endpoint, e);
+                MotionSend::Retry
             }
             Err(e) => {
-                // Blocked (send buffer full) or TooLarge: use the stream this time.
+                // ConnectionLost: stream-write instead; a dead connection
+                // fails there properly and removes the client.
                 trace!(
                     "Motion datagram to {} not sent ({}), using the stream",
                     endpoint, e
                 );
-                MotionSend::Fallback(msg.events)
+                MotionSend::Fallback
             }
         }
     }
@@ -1329,12 +1361,12 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         self.status_counts.physical += event_count;
         if let Some(endpoint) = self.current_client {
             // Remote client is active, send all input to client and not to local machine.
-            let mut events = batch.events;
+            let events = batch.events;
             if is_pure_pointer_motion(&events) {
                 if self.motion_flush_interval.is_some() {
                     // Office-mode coalescing (--motion-hz): sum the deltas into
                     // the accumulator; the flush timer forwards them at the
-                    // configured rate over the ordered stream. Lossless for the
+                    // configured rate as datagrams. Lossless for the
                     // cursor position, far less network/CPU load than one
                     // message per 8kHz poll.
                     self.accumulate_motion(&events);
@@ -1344,13 +1376,30 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                 // QUIC datagrams: a lost motion update is instantly superseded by
                 // the next one, so skipping it beats stalling all later input
                 // behind a stream retransmission (the cause of visible
-                // micro-stutter).
-                match self.try_send_motion_datagram(&endpoint, events) {
+                // micro-stutter). The batch is pure REL_X/REL_Y, so summing it
+                // into one frame is lossless.
+                let mut dx = 0i32;
+                let mut dy = 0i32;
+                for e in &events {
+                    if let Some(i) = &e.inputi32 {
+                        if i.code == evdev::RelativeAxisCode::REL_X.0 {
+                            dx = dx.saturating_add(i.value);
+                        } else {
+                            dy = dy.saturating_add(i.value);
+                        }
+                    }
+                }
+                match self.try_send_motion_datagram(&endpoint, vec![(dx, dy)]) {
                     MotionSend::Sent => {
                         self.status_counts.forwarded += event_count;
                         return Ok(());
                     }
-                    MotionSend::Fallback(returned_events) => events = returned_events,
+                    MotionSend::Retry => {
+                        // Send buffer full: skip this update entirely; the next
+                        // poll supersedes it (full-rate motion is lossy by design).
+                        return Ok(());
+                    }
+                    MotionSend::Fallback => {}
                 }
             }
             // Ordering: coalesced motion must reach the client before this
@@ -1542,9 +1591,11 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                 warn!("Failed to release held keys on local virtual devices: {:?}", e);
             }
         }
-        // Motion accumulated for the previous target is moot after a switch.
+        // Motion accumulated (or already flushed) for the previous target is
+        // moot after a switch.
         self.pending_motion = (0, 0, 0);
         self.motion_dirty = false;
+        self.motion_history.clear();
         self.current_client = client;
         // Record which client is active (or none) so that an unexpected exit
         // mid-session can be recovered on the next server start. This is the

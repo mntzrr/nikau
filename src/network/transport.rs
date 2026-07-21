@@ -252,6 +252,14 @@ fn verify_socket_buf(fd: libc::c_int, opt: libc::c_int, sysctl: &str) {
 fn transport_config(mode: NetworkMode) -> Arc<TransportConfig> {
     let mut transport_config = TransportConfig::default();
 
+    // Pointer motion rides unreliable QUIC datagrams. Keep the send buffer
+    // small: quinn discards the OLDEST queued datagrams to make space when
+    // it's full, so a congested link can never accumulate a backlog of stale
+    // motion to replay later — the newest position always wins. 2 KiB holds
+    // ~15 coalesced frames (~60 ms at 250 Hz), far more than a healthy link
+    // ever queues.
+    transport_config.datagram_send_buffer_size(2048);
+
     match mode {
         NetworkMode::Local => {
             // Ask the peer to acknowledge every ack-eliciting packet with minimal delay.
