@@ -6,6 +6,7 @@ use evdev::{
 };
 use std::collections::HashSet;
 use std::os::fd::AsRawFd;
+use std::path::PathBuf;
 use tracing::{debug, info, trace, warn};
 
 use crate::device::output::{OutputHandler, VIRTUAL_DEVICE_NAME_PREFIX};
@@ -93,6 +94,33 @@ impl VirtualUInputDevices {
         };
         info!("Created virtual uinput devices: keyboard, mouse, touchpad");
         Ok(ret)
+    }
+
+    /// Paths of the /dev/input event nodes backing our virtual devices.
+    /// Logged at startup and given to the device watcher, which raises an
+    /// error if one of them ever disappears mid-session (a broken virtual
+    /// keyboard is one way input goes dead while devices are grabbed).
+    pub fn device_nodes(&mut self) -> Vec<PathBuf> {
+        [
+            &mut self.keyboard_device,
+            &mut self.mouse_device,
+            &mut self.touchpad_device,
+        ]
+        .into_iter()
+        .flat_map(|dev| {
+            dev.enumerate_dev_nodes_blocking()
+                .map(|nodes| {
+                    nodes
+                        .filter_map(|res| res.ok())
+                        .filter(|p| {
+                            p.file_name()
+                                .is_some_and(|n| n.to_string_lossy().starts_with("event"))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        })
+        .collect()
     }
 
     fn route_event(&self, event: evdev::InputEvent) -> Option<EventDest> {

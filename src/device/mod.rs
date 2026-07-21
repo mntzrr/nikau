@@ -29,4 +29,6 @@ pub enum Event {
     SwitchPrev,
     /// Activate the client with matching cert fingerprint, or the server if the string is empty
     SwitchTo(String),
+    /// Dump full internal state to the log (sent on SIGHUP, for troubleshooting)
+    DumpDiagnostics,
 }

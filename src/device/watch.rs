@@ -6,7 +6,7 @@ use evdev::{Device, EventType, KeyCode};
 use notify::Watcher;
 use regex::Regex;
 use tokio::sync::mpsc;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::device::{handles, output, util};
 
@@ -25,6 +25,7 @@ struct DeviceEvent {
 pub async fn watch_loop<H: handles::DeviceHandler>(
     mut device_handles: handles::DeviceHandles<H>,
     device_filters: Vec<Regex>,
+    virtual_nodes: Vec<PathBuf>,
 ) -> Result<()> {
     // Start watch for new and removed devices BEFORE scanning current devices.
     let (device_event_tx, mut device_event_rx): (
@@ -63,7 +64,7 @@ pub async fn watch_loop<H: handles::DeviceHandler>(
     // Start handler to consume new/removed device events
     loop {
         if let Some(event) = device_event_rx.recv().await {
-            handle_device_event(&mut device_handles, &device_filters, event).await;
+            handle_device_event(&mut device_handles, &device_filters, &virtual_nodes, event).await;
         } else {
             // Channel lost, exit
             return Ok(());
@@ -74,6 +75,7 @@ pub async fn watch_loop<H: handles::DeviceHandler>(
 async fn handle_device_event<H: handles::DeviceHandler>(
     device_handles: &mut handles::DeviceHandles<H>,
     device_filters: &Vec<Regex>,
+    virtual_nodes: &[PathBuf],
     event: DeviceEvent,
 ) {
     trace!("Device file event: {:?}", event);
@@ -111,6 +113,16 @@ async fn handle_device_event<H: handles::DeviceHandler>(
             };
         }
         DeviceEventKind::Deleted => {
+            if virtual_nodes.contains(&event.path) {
+                // One of OUR virtual devices disappeared mid-session: any input
+                // we emit now goes nowhere, which presents as dead keyboard/
+                // mouse while devices are grabbed. There is no recovery path
+                // short of recreating the devices, so make this loud.
+                error!(
+                    "Our own virtual device node {} vanished! Emitted input has nowhere to go until monux restarts",
+                    event.path.to_string_lossy()
+                );
+            }
             if let Some(device_handle) = device_handles.remove(&event.path) {
                 info!("Removing device: {}", event.path.to_string_lossy());
                 device_handle.handle.abort();

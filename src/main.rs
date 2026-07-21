@@ -17,10 +17,13 @@ use monux::device::{handles, input, output, shortcut, watch, Event};
 use monux::network::{approval, transport::NetworkMode};
 use monux::{client, clipboard, discovery, logging, rotation, server, single_instance};
 
+/// Version string including the git revision (see build.rs).
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("MONUX_GIT_SHA"));
+
 #[derive(Parser)]
 #[command(
     author,
-    version = concat!(env!("CARGO_PKG_VERSION"), "+", env!("MONUX_GIT_SHA")),
+    version = VERSION,
     about,
     long_about = None
 )]
@@ -129,6 +132,7 @@ struct UpdateArgs {
 }
 
 /// Listens for SIGUSR1 and SIGUSR2, treating them as "switch to next client" and "switch to prev client" respectively.
+/// SIGHUP dumps the server's internal state to the log for troubleshooting.
 fn handle_signals(mut signals: Signals, out: mpsc::Sender<Event>) {
     let mut iter = signals.into_iter();
     loop {
@@ -141,6 +145,11 @@ fn handle_signals(mut signals: Signals, out: mpsc::Sender<Event>) {
             Some(signal::SIGUSR2) => {
                 if let Err(e) = out.blocking_send(Event::SwitchPrev) {
                     error!("Failed to submit SwitchPrev event for SIGUSR2: {:?}", e);
+                }
+            }
+            Some(signal::SIGHUP) => {
+                if let Err(e) = out.blocking_send(Event::DumpDiagnostics) {
+                    error!("Failed to submit DumpDiagnostics event for SIGHUP: {:?}", e);
                 }
             }
             other => {
@@ -163,6 +172,8 @@ async fn shutdown_signal() {
 fn main() -> Result<()> {
     logging::init_logging();
     let cli = Cli::parse();
+    // Record the exact build in the log: invaluable when diagnosing bug reports.
+    info!("monux v{} starting", VERSION);
 
     // Setup and update don't need the config dir, devices, or the async runtime.
     match &cli.command {
@@ -408,16 +419,25 @@ async fn server(
     mode: NetworkMode,
 ) -> Result<()> {
     // Try to set up virtual devices up-front - exit early if we can't access uinput
-    let output_handler = output::uinput::VirtualUInputDevices::new()
+    let mut output_handler = output::uinput::VirtualUInputDevices::new()
         .context("Failed to create virtual devices for output, possible solutions:
 - Add your user to the 'input' group and log back in: 'sudo usermod -aG input $USER'
 - Enable uinput and/or evdev in the kernel, check for /dev/uinput and /dev/input/
 - As a fallback, run as root with 'sudo -E monux server ...' (-E keeps clipboard support)")?;
+    let virtual_nodes = output_handler.device_nodes();
+    info!(
+        "Virtual device nodes: {}",
+        virtual_nodes
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
 
     let (event_tx, event_rx): (mpsc::Sender<Event>, mpsc::Receiver<Event>) = mpsc::channel(256);
 
     let event_tx2 = event_tx.clone();
-    let signals = Signals::new([signal::SIGUSR1, signal::SIGUSR2])?;
+    let signals = Signals::new([signal::SIGUSR1, signal::SIGUSR2, signal::SIGHUP])?;
     std::thread::spawn(|| handle_signals(signals, event_tx2));
 
     let (grab_tx, _grab_rx) = watchchan::channel(monux::device::GrabEvent::Ungrab);
@@ -429,7 +449,7 @@ async fn server(
     let watch_handle = task::spawn(async move {
         let device_handles =
             handles::DeviceHandles::new(input_handler, grab_tx, key_combos.all_keys);
-        watch::watch_loop(device_handles, device_filters)
+        watch::watch_loop(device_handles, device_filters, virtual_nodes)
             .await
             .context(
                 "Failed to listen to any input devices, possible solutions:

@@ -6,6 +6,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use tokio::sync::{mpsc, watch};
 use tokio::task;
+use tokio::time;
 use tracing::{debug, error, trace, warn};
 
 use crate::clipboard::data::ClipboardData;
@@ -34,6 +35,11 @@ pub async fn run_server_events_loop<O: output::OutputHandler>(
 
     let mut rotation =
         rotation::Rotation::new(grab_tx, output_handler, local_clipboard, &config_dir, rotation_tx).await?;
+    // Input-flow heartbeat: makes "user is typing but nothing arrives anywhere"
+    // visible in the log, instead of silent (the dead-Enter investigations).
+    let mut status_tick = time::interval(Duration::from_secs(10));
+    // Skip the immediate first tick; the first heartbeat lands 10s in.
+    status_tick.tick().await;
     loop {
         tokio::select! {
             // Listen and forward rotation events to rotation
@@ -65,8 +71,14 @@ pub async fn run_server_events_loop<O: output::OutputHandler>(
                     Event::SwitchTo(fingerprint) => {
                         rotation.set_client(fingerprint).await;
                     }
+                    Event::DumpDiagnostics => {
+                        rotation.dump_diagnostics();
+                    }
                 }
-            }
+            },
+            _ = status_tick.tick() => {
+                rotation.log_input_status();
+            },
         }
     }
 }

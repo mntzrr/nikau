@@ -44,6 +44,9 @@ struct PreparedCopyState {
     /// Populated in the background (see spawn_fetch), never by blocking the
     /// dispatch thread.
     clipboard_data: ClipboardCache,
+    /// Paste (Send) request count within the current one-second window, for
+    /// detecting clipboard-manager storms (see the Send handler).
+    send_stats: std::sync::Arc<std::sync::Mutex<(std::time::Instant, u32)>>,
 }
 
 /// Runs a clipboard data fetch on the current (background) thread, using a
@@ -147,6 +150,24 @@ impl_dispatch_source!(State, |state: &mut Self, source: data_control::Source, ev
                 return;
             }
 
+            // Storm detection: clipboard managers (wl-clip-persist, wl-paste
+            // --watch) can fire dozens of paste requests per second. Warn once
+            // per window so freeze reports can be correlated with storms.
+            {
+                let mut stats = prepared_state.send_stats.lock().unwrap();
+                if stats.0.elapsed() >= std::time::Duration::from_secs(1) {
+                    *stats = (std::time::Instant::now(), 0);
+                }
+                stats.1 += 1;
+                if stats.1 == 20 {
+                    warn!(
+                        "Clipboard paste storm: 20 paste requests within {:.1}s (a clipboard manager is hammering us; correlate with input freezes)",
+                        stats.0.elapsed().as_secs_f32()
+                    );
+                }
+            }
+            debug!("Serving paste request for type {}", mime_type);
+
             // Serve the paste on a background thread (fetch + write). The
             // dispatch thread must never block here: a slow fetch (remote
             // clipboard over a slow link) or a slow paste reader would
@@ -176,6 +197,7 @@ fn serve_send(
     max_uncompressed_size_bytes: u64,
     clipboard_data: ClipboardCache,
 ) {
+    let started = std::time::Instant::now();
     let bytes = {
         let cached = clipboard_data.lock().unwrap().clone();
         match cached {
@@ -197,6 +219,7 @@ fn serve_send(
             }
         }
     };
+    let byte_count = bytes.len();
     if let Err(err) = write_paste_fd(fd, &bytes) {
         if err.kind() == io::ErrorKind::BrokenPipe {
             // The paste requester closed the pipe before we could serve it
@@ -205,6 +228,17 @@ fn serve_send(
         } else {
             error!("Failed to write clipboard data: {}", err);
         }
+    }
+    // Slow serves are the freeze suspect: if a paste takes this long, any
+    // backpressure on the compositor connection lasted at least as long.
+    let elapsed = started.elapsed();
+    if elapsed > std::time::Duration::from_secs(1) {
+        warn!(
+            "Serving paste request for type {} took {:.1}s ({} bytes)",
+            mime_type,
+            elapsed.as_secs_f32(),
+            byte_count
+        );
     }
 }
 
@@ -320,6 +354,7 @@ fn write_clipboard(
             config_dir: config_dir.clone(),
             max_uncompressed_size_bytes,
             clipboard_data: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            send_stats: std::sync::Arc::new(std::sync::Mutex::new((std::time::Instant::now(), 0))),
         });
         // Pre-fetch the primary mime type in the background so the cache is
         // warm before the first paste request arrives (skipping our own

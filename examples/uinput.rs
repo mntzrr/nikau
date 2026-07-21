@@ -59,7 +59,7 @@ async fn main() -> Result<()> {
     let (grab_tx, _grab_rx) = tokio_watch::channel(GrabEvent::Ungrab);
     let handles = handles::DeviceHandles::new(StubHandler {}, grab_tx, HashSet::<KeyCode>::new());
     let handler = task::spawn(async move {
-        if let Err(e) = watch::watch_loop(handles, devices).await {
+        if let Err(e) = watch::watch_loop(handles, devices, Vec::new()).await {
             error!("Input device watch failure: {:?}", e);
         }
     });

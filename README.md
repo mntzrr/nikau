@@ -97,6 +97,25 @@ monux client --www <server-host-or-ip>
 
 `--www` uses conservative QUIC settings (default congestion control and RTT estimation) and skips socket QoS flags.
 
+## Troubleshooting
+
+If input (e.g. the Enter key) stops registering on the server machine while `monux server` runs, the server log tells you what monux sees. The first log line records the exact build (`monux v0.3.3+<sha> starting`) — always include it when reporting.
+
+**While the freeze is happening** (switch to a TTY or SSH in):
+
+1. `pgrep -f 'monux server' | xargs -r sudo kill -HUP` — dumps the server's full internal state (switch state, grab state, clients, clipboard owner, counters) to its log. SIGHUP is safe; it only logs.
+2. Check the 10-second heartbeat lines in the log: `Input status: local (Ungrab): N events in, M emitted locally`. They show whether monux sees your keystrokes at all, and where they went.
+3. `hyprctl devices | grep -i 'monux virtual'` — are the virtual keyboard/mouse still there? (The startup log lists their `/dev/input/eventN` nodes.)
+4. `sudo libinput debug-events` — does the kernel see the physical key presses?
+
+**Reading the evidence:**
+
+- `INPUT SWALLOWED: ...` — monux sees your keys but they have nowhere to go (grab state vs switch state mismatch). Report the log.
+- Keys visible in `libinput debug-events` and the heartbeat's *emitted* counter rises, but apps see nothing, and `hyprctl devices` lacks the virtual keyboard → the compositor dropped the virtual device. `hyprctl reload` recovers it; report it.
+- `Clipboard paste storm` or `Serving paste request ... took Ns` warnings coinciding with freezes → a clipboard manager (`wl-clip-persist`, `wl-paste --watch`) is hammering monux's clipboard serving. Tame or remove it.
+- `Our own virtual device node ... vanished` → the virtual devices were destroyed mid-session; restart monux.
+- Freeze windows that self-heal after seconds-to-a-minute point at a blocking wait that timed out — check whether they line up with clipboard warnings above.
+
 ## License
 
 This project is licensed under the AGPLv3 (or later versions) and is copyright Nicholas Parker.

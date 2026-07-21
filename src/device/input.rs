@@ -300,7 +300,7 @@ fn handle_grab_event(
 ) -> bool {
     match grab {
         GrabEvent::Grab => {
-            debug!(
+            info!(
                 "Grabbing device: {:?}",
                 stream.device().name().unwrap_or("(Unnamed device)")
             );
@@ -316,7 +316,7 @@ fn handle_grab_event(
             return true;
         }
         GrabEvent::Ungrab => {
-            debug!(
+            info!(
                 "Ungrabbing device: {:?}",
                 stream.device().name().unwrap_or("(Unnamed device)")
             );

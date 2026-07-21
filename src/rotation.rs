@@ -187,6 +187,19 @@ pub struct ClipboardSendContentArgs {
     pub data: data::ClipboardData,
 }
 
+/// Input-flow counters for the current status window (see log_input_status).
+/// They exist to make "the user is typing but nothing arrives anywhere"
+/// observable instead of silent.
+#[derive(Default)]
+struct InputCounts {
+    /// Physical events read from local devices.
+    physical: u64,
+    /// Events forwarded to the remote client.
+    forwarded: u64,
+    /// Events emitted to local virtual devices.
+    emitted_local: u64,
+}
+
 pub struct Rotation<O: device::output::OutputHandler> {
     grab_tx: watch::Sender<device::GrabEvent>,
     output_handler: O,
@@ -224,6 +237,10 @@ pub struct Rotation<O: device::output::OutputHandler> {
     motion_seq: u64,
     /// Set once we've logged that pointer motion is using QUIC datagrams.
     motion_datagram_announced: bool,
+    /// Input-flow counters for the current status window (see log_input_status).
+    status_counts: InputCounts,
+    /// When the current status window started.
+    status_window_start: Instant,
 }
 
 impl<O: device::output::OutputHandler> Rotation<O> {
@@ -258,6 +275,8 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             last_clipboard_update: None,
             motion_seq: 0,
             motion_datagram_announced: false,
+            status_counts: InputCounts::default(),
+            status_window_start: Instant::now(),
         })
     }
 
@@ -1014,6 +1033,86 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         }
     }
 
+    /// Periodic INFO snapshot of input flow, plus warnings for the two ways
+    /// input can silently die: grabbed locally but nothing emitted, or a client
+    /// is active but nothing is forwarded. Called on a timer from the server
+    /// events loop; counters reset each call.
+    pub fn log_input_status(&mut self) {
+        let counts = std::mem::take(&mut self.status_counts);
+        let secs = self.status_window_start.elapsed().as_secs_f64().max(0.1);
+        self.status_window_start = Instant::now();
+        let grab = format!("{:?}", *self.grab_tx.borrow());
+        // Stay silent when completely idle on the local machine: a freeze
+        // window always has non-zero counts, so silence loses no evidence.
+        let idle_local = self.current_client.is_none()
+            && counts.physical == 0
+            && counts.forwarded == 0
+            && counts.emitted_local == 0;
+        if idle_local {
+            return;
+        }
+        match self.current_client {
+            Some(endpoint) => info!(
+                "Input status: switched to {} ({}): {} events in, {} forwarded ({:.1}/s)",
+                endpoint,
+                grab,
+                counts.physical,
+                counts.forwarded,
+                counts.forwarded as f64 / secs
+            ),
+            None => info!(
+                "Input status: local ({}): {} events in, {} emitted locally ({:.1}/s)",
+                grab,
+                counts.physical,
+                counts.emitted_local,
+                counts.emitted_local as f64 / secs
+            ),
+        }
+        // Swallow detection: physical input arrived but had nowhere to go.
+        // The event threshold avoids false positives from a consumed switch combo.
+        if counts.physical >= 8 {
+            if self.current_client.is_some() && counts.forwarded == 0 {
+                warn!(
+                    "INPUT SWALLOWED: {} physical events seen while switched to a client, but none were forwarded!",
+                    counts.physical
+                );
+            } else if self.current_client.is_none()
+                && matches!(&*self.grab_tx.borrow(), device::GrabEvent::Grab)
+                && counts.emitted_local == 0
+            {
+                warn!(
+                    "INPUT SWALLOWED: {} physical events seen while local with devices grabbed, but none were emitted to the virtual devices!",
+                    counts.physical
+                );
+            }
+        }
+    }
+
+    /// Full state dump to the log, triggered via Event::DumpDiagnostics (SIGHUP).
+    /// Captures everything relevant to "input is dead" reports in one place.
+    pub fn dump_diagnostics(&self) {
+        let grab = format!("{:?}", *self.grab_tx.borrow());
+        info!(
+            "Diagnostics dump (SIGHUP): current_client={:?} grab={} clients={:?} removed_current_client={:?} pending_resume_fingerprint={:?} clipboard_target={:?} pending_clipboard_requests={} motion_seq={} datagrams_ok={} counts={{physical={} forwarded={} emitted_local={}}}",
+            self.current_client,
+            grab,
+            self.clients,
+            self.removed_current_client,
+            self.pending_resume_fingerprint,
+            self.clipboard_target,
+            self.pending_clipboard_requests.len(),
+            self.motion_seq,
+            self.clients
+                .iter()
+                .map(|c| format!("{}:{}", c.endpoint, c.datagrams_ok))
+                .collect::<Vec<_>>()
+                .join(", "),
+            self.status_counts.physical,
+            self.status_counts.forwarded,
+            self.status_counts.emitted_local,
+        );
+    }
+
     /// Attempts to send a pure pointer-motion batch as a QUIC datagram.
     /// Returns MotionSend::Fallback with the events if they should go over the
     /// ordered events stream instead (peer can't do datagrams, the datagram is
@@ -1100,6 +1199,8 @@ impl<O: device::output::OutputHandler> Rotation<O> {
 
     /// Handles an input event collected from the server.
     pub async fn send_input_events(&mut self, batch: device::InputBatch) -> Result<()> {
+        let event_count = batch.events.len() as u64;
+        self.status_counts.physical += event_count;
         if let Some(endpoint) = self.current_client {
             // Remote client is active, send all input to client and not to local machine.
             let mut events = batch.events;
@@ -1109,16 +1210,23 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                 // next one, so skipping it beats stalling all later input behind
                 // a stream retransmission (the cause of visible micro-stutter).
                 match self.try_send_motion_datagram(&endpoint, events) {
-                    MotionSend::Sent => return Ok(()),
+                    MotionSend::Sent => {
+                        self.status_counts.forwarded += event_count;
+                        return Ok(());
+                    }
                     MotionSend::Fallback(returned_events) => events = returned_events,
                 }
             }
             self.send_event_to_remote_client(event::ServerEvent::Input(events))
-                .await
+                .await?;
+            self.status_counts.forwarded += event_count;
+            Ok(())
         } else if batch.is_grabbed {
             // Local machine is active and device is grabbed, write input to local virtual devices.
             // For example, we grab keyboards so that we can skip sending switch combos to the local system.
-            self.output_handler.write(batch.events).await
+            self.output_handler.write(batch.events).await?;
+            self.status_counts.emitted_local += event_count;
+            Ok(())
         } else {
             // Local machine is active and device isn't grabbed (passthrough), drop input event.
             // For example, we don't grab mice/touchpads since they aren't relevant to switch combos.
@@ -1554,6 +1662,56 @@ mod tests {
         fs::write(&path, "deadbeef").unwrap();
         clear_active_client(&path);
         assert!(!path.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Stub output handler that just counts what it's asked to write.
+    struct StubOutput {
+        written: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl device::output::OutputHandler for StubOutput {
+        async fn release_all(&mut self) -> Result<()> {
+            Ok(())
+        }
+        async fn write(&mut self, events: Vec<event::InputEvent>) -> Result<()> {
+            self.written += events.len();
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn input_status_counts_flow_and_reset() {
+        let dir = temp_dir("status");
+        let (grab_tx, _grab_rx) = watch::channel(device::GrabEvent::Ungrab);
+        let (rotation_tx, _rotation_rx) = mpsc::channel(8);
+        let mut rotation = Rotation::new(
+            grab_tx,
+            StubOutput { written: 0 },
+            None,
+            &dir,
+            rotation_tx,
+        )
+        .await
+        .unwrap();
+
+        let batch = device::InputBatch {
+            events: vec![
+                i32_event(evdev::EventType::KEY.0, 28, 1),
+                i32_event(evdev::EventType::KEY.0, 28, 0),
+            ],
+            is_grabbed: true,
+        };
+        rotation.send_input_events(batch).await.unwrap();
+        assert_eq!(rotation.status_counts.physical, 2);
+        assert_eq!(rotation.status_counts.emitted_local, 2);
+        assert_eq!(rotation.output_handler.written, 2);
+
+        // The status log resets the window for the next interval.
+        rotation.log_input_status();
+        assert_eq!(rotation.status_counts.physical, 0);
+        assert_eq!(rotation.status_counts.emitted_local, 0);
         let _ = fs::remove_dir_all(&dir);
     }
 
