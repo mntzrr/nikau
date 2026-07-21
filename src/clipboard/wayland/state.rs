@@ -136,9 +136,26 @@ impl_dispatch_device!(State, wl_seat::WlSeat, |state: &mut Self, event, seat: &w
             let offer = if let Some(offer) = id.map(data_control::Offer::from) {
                 offer
             } else {
-                // Offer revoked: ensure any prior offer is cleaned up
-                if let Some(old_offer_data) = seat_data.regular_offer.take() {
+                // Offer revoked (the owning app exited and no clipboard manager
+                // persisted it): clean up the prior offer and tell upstream the
+                // clipboard is gone. Without this the tracked clipboard target
+                // goes stale and every fetch fails against the dead selection.
+                // Guarded on actually holding an offer: revocations arriving
+                // after our own ignored advertisements carry nothing, and
+                // reporting those would clear a healthy target.
+                let had_offer = if let Some(old_offer_data) = seat_data.regular_offer.take() {
                     old_offer_data.offer.destroy();
+                    true
+                } else {
+                    false
+                };
+                if had_offer {
+                    if let Some(tx) = &state.regular_types_tx {
+                        debug!("wayland clipboard offer revoked, notifying upstream");
+                        if let Err(e) = tx.send(vec![]) {
+                            error!("Failed to notify upstream of cleared clipboard: {}", e);
+                        }
+                    }
                 }
                 return;
             };

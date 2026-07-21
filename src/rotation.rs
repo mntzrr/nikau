@@ -613,6 +613,17 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         max_size_bytes: u64,
     ) -> Result<()> {
         debug!("Announcing new clipboard source: source={:?} current={:?} with max_size_bytes={} has types={:?}", source, self.current_client, max_size_bytes, types);
+        // A local update with no types means the compositor revoked the
+        // selection (the owning app exited and no clipboard manager persisted
+        // it): the tracked target is stale and must stop being announced, or
+        // every fetch against it fails. Clear right away, bypassing the
+        // debounce, and reset its timestamp so a clipboard manager re-owning
+        // the content immediately after isn't debounced away.
+        if source.is_none() && types.is_empty() {
+            self.last_clipboard_update = None;
+            self.clipboard_clear().await;
+            return Ok(());
+        }
         // Debounce machine-paced bursts: clipboard managers (wl-clip-persist,
         // wl-paste --watch) can turn one copy into dozens of source updates per
         // second, and each processed update costs a fresh wayland connection
@@ -656,7 +667,9 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         Ok(())
     }
 
-    /// Routes a request for clipboard content to a remote client or a local application
+    /// Routes a request for clipboard content to a remote client or a local application.
+    /// Fetches that can't be served get an immediate empty reply, so the
+    /// requester's paste fails fast instead of waiting out its fetch timeout.
     async fn clipboard_request_content(
         &mut self,
         request_source: ClipboardRequestSource,
@@ -669,6 +682,11 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         let target = match &self.clipboard_target {
             Some(c) => c,
             None => {
+                if let ClipboardRequestSource::Remote(client) = &request_source {
+                    let client = *client;
+                    self.reply_empty_clipboard_fetch(&client, requested_type, request_id.unwrap_or(0))
+                        .await;
+                }
                 bail!(
                     "No clipboard types available: request from {} for requested type {}",
                     request_source,
@@ -678,6 +696,11 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         };
         // Sanity check: Is the requested type among the list of supported types?
         if !target.types.contains(&requested_type.to_string()) {
+            if let ClipboardRequestSource::Remote(client) = &request_source {
+                let client = *client;
+                self.reply_empty_clipboard_fetch(&client, requested_type, request_id.unwrap_or(0))
+                    .await;
+            }
             bail!(
                 "Requested clipboard type {} from source {} isn't among available types: {:?}",
                 requested_type,
@@ -751,6 +774,10 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                 Ok(true) => {}
                 Ok(false) => {
                     if let Some(client) = on_behalf_of {
+                        // The owning peer is gone: fail the requester's fetch
+                        // fast instead of letting it wait out its timeout.
+                        self.reply_empty_clipboard_fetch(&client, requested_type, request_id.unwrap_or(0))
+                            .await;
                         warn!(
                             "Unable to send request for clipboard to {} on behalf of {}: not connected (clients: {:?})",
                             clipboard_source,
@@ -791,7 +818,11 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             };
             let local_clipboard = match &self.local_clipboard {
                 Some(c) => c,
-                None => bail!("Fetch for local server clipboard but server clipboard is disabled"),
+                None => {
+                    self.reply_empty_clipboard_fetch(request_client, requested_type, request_id)
+                        .await;
+                    bail!("Fetch for local server clipboard but server clipboard is disabled");
+                }
             };
             let reader = local_clipboard.reader_handle();
             // Look up the requesting client's bulk queue before spawning.
@@ -819,7 +850,11 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             let request_client = *request_client;
             let requested_type = requested_type.to_string();
             task::spawn(async move {
-                match server::LocalClipboard::read(
+                // A failed read (clipboard gone, hung source app) still gets an
+                // immediate reply — empty content — so the requester's paste
+                // completes right away instead of waiting out its fetch
+                // timeout. The next paste simply re-requests.
+                let (content, data_type) = match server::LocalClipboard::read(
                     &reader,
                     &requested_type,
                     max_size_bytes,
@@ -827,39 +862,81 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                 )
                 .await
                 {
-                    Ok((content, data_type)) => {
-                        let msg = bulk::ServerBulk::ClipboardHeader(bulk::ServerClipboardHeader {
-                            requested_type: &requested_type,
-                            data_type: data_type.as_ref().map(|t| t.as_str()),
-                            content_len_bytes: content.len() as u64,
-                            request_id,
-                        });
-                        match postcard::to_stdvec_cobs(&msg) {
-                            Ok(mut bytes) => {
-                                bytes.extend_from_slice(&content);
-                                if bulk_tx.send(bytes).is_err() {
-                                    warn!(
-                                        "Unable to send server clipboard data to {}: bulk queue closed",
-                                        request_client
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                error!("Failed to serialize clipboard header: {:?}", e);
-                            }
-                        }
-                    }
-                    // No reply is sent: as before, the requester's fetch times
-                    // out and it can retry later.
+                    Ok(ok) => ok,
                     Err(e) => {
                         warn!(
                             "Failed to read server clipboard for {}: {:?}",
                             request_client, e
                         );
+                        (Vec::new(), None)
+                    }
+                };
+                let msg = bulk::ServerBulk::ClipboardHeader(bulk::ServerClipboardHeader {
+                    requested_type: &requested_type,
+                    data_type: data_type.as_ref().map(|t| t.as_str()),
+                    content_len_bytes: content.len() as u64,
+                    request_id,
+                });
+                match postcard::to_stdvec_cobs(&msg) {
+                    Ok(mut bytes) => {
+                        bytes.extend_from_slice(&content);
+                        if bulk_tx.send(bytes).is_err() {
+                            warn!(
+                                "Unable to send server clipboard data to {}: bulk queue closed",
+                                request_client
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to serialize clipboard header: {:?}", e);
                     }
                 }
             });
             Ok(())
+        }
+    }
+
+    /// Replies to a remote client's clipboard fetch with empty content, so its
+    /// paste completes (with nothing) immediately instead of waiting out its
+    /// fetch timeout. Sent whenever a fetch can't be served: the clipboard is
+    /// gone, the requested type isn't offered, or the owning peer is gone.
+    /// Best-effort: an unconnected requester simply gets nothing, as before.
+    async fn reply_empty_clipboard_fetch(
+        &self,
+        request_client: &SocketAddr,
+        requested_type: &str,
+        request_id: u64,
+    ) {
+        let bulk_tx = match self
+            .clients
+            .binary_search_by(|c| c.endpoint.cmp(request_client))
+        {
+            Ok(idx) => self
+                .clients
+                .get(idx)
+                .expect("missing request_client")
+                .bulk_tx
+                .clone(),
+            Err(_idx) => return,
+        };
+        let msg = bulk::ServerBulk::ClipboardHeader(bulk::ServerClipboardHeader {
+            requested_type,
+            data_type: None,
+            content_len_bytes: 0,
+            request_id,
+        });
+        match postcard::to_stdvec_cobs(&msg) {
+            Ok(bytes) => {
+                if bulk_tx.send(bytes).is_err() {
+                    warn!(
+                        "Unable to send empty clipboard reply to {}: bulk queue closed",
+                        request_client
+                    );
+                }
+            }
+            Err(e) => {
+                error!("Failed to serialize empty clipboard header: {:?}", e);
+            }
         }
     }
 
@@ -1980,6 +2057,47 @@ mod tests {
         // queued frustrated press after a stall) is dropped.
         assert!(!rotation.switch_debounced());
         assert!(rotation.switch_debounced());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn empty_local_types_update_clears_clipboard_target() {
+        let dir = temp_dir("clipclear");
+        let (grab_tx, _grab_rx) = watch::channel(device::GrabEvent::Ungrab);
+        let (rotation_tx, _rotation_rx) = mpsc::channel(8);
+        let mut rotation = Rotation::new(
+            grab_tx,
+            StubOutput { written: 0 },
+            None,
+            &dir,
+            rotation_tx,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let types = vec!["text/plain".to_string()];
+        rotation
+            .clipboard_update_source(None, types.clone(), 1024)
+            .await
+            .unwrap();
+        assert!(rotation.clipboard_target.is_some());
+
+        // The compositor revoked the selection (owner exited, nothing
+        // persisted it): the tracked target must be cleared immediately...
+        rotation
+            .clipboard_update_source(None, vec![], 1024)
+            .await
+            .unwrap();
+        assert!(rotation.clipboard_target.is_none());
+
+        // ...and the debounce timestamp is reset, so a clipboard manager
+        // re-owning the content right after is processed, not debounced away.
+        rotation
+            .clipboard_update_source(None, types, 1024)
+            .await
+            .unwrap();
+        assert!(rotation.clipboard_target.is_some());
         let _ = fs::remove_dir_all(&dir);
     }
 
