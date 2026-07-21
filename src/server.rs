@@ -218,7 +218,7 @@ async fn handle_connection(
         None;
     loop {
         tokio::select! {
-            event_result = events_recv.read_chunk(1024, true) => {
+            event_result = events_recv.read_chunk(16384, true) => {
                 let resp = event_result
                     .context("Lost client events connection")?
                     .context("Client closed events connection")?;

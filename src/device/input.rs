@@ -238,7 +238,13 @@ async fn handle_input_event(
         // Flush events to be handled by the client as a group
         if !input_events_batch.is_empty() {
             let event = Event::Input(InputBatch {
-                events: std::mem::replace(input_events_batch, Vec::new()),
+                // Preserve the allocation: batches reach a steady-state size
+                // within a few frames, so regrowing from Vec::new() per flush
+                // is wasted churn at high report rates.
+                events: std::mem::replace(
+                    input_events_batch,
+                    Vec::with_capacity(input_events_batch.capacity()),
+                ),
                 is_grabbed: device_info.is_grabbed,
             });
             if let Err(e) = c.event_tx.send(event).await {
@@ -247,7 +253,10 @@ async fn handle_input_event(
         }
         // Follow original events with event(s) from combo completion(s)
         if !combo_events_batch.is_empty() {
-            let batch = std::mem::replace(combo_events_batch, Vec::new());
+            let batch = std::mem::replace(
+                combo_events_batch,
+                Vec::with_capacity(combo_events_batch.capacity()),
+            );
             for combo_event in batch {
                 if let Err(e) = c.event_tx.send(combo_event).await {
                     warn!("Error sending combo events for routing: {:?}", e);

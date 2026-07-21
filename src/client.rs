@@ -190,7 +190,7 @@ impl Connection {
                         local_clipboard.set_local_clipboard().await;
                     }
                 },
-                event_result = self.events_recv.read_chunk(1024, true) => {
+                event_result = self.events_recv.read_chunk(16384, true) => {
                     // Incoming data may contain one or more messages, but I've never seen fragments of messages.
                     let resp = event_result
                         .with_context(|| if is_new_connection(connect_time) {
@@ -227,7 +227,7 @@ impl Connection {
         } else {
             // Local clipboard disabled: Don't select on local clipboard events
             tokio::select! {
-                event_result = self.events_recv.read_chunk(1024, true) => {
+                event_result = self.events_recv.read_chunk(16384, true) => {
                     // Incoming data may contain one or more messages, but I've never seen fragments of messages.
                     let resp = event_result
                         .with_context(|| if is_new_connection(connect_time) {

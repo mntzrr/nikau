@@ -39,9 +39,6 @@ const SOCKET_BUF_SIZE: libc::c_int = 2 * 1024 * 1024;
 /// Linux socket priority for interactive/low-latency traffic.
 const SOCKET_PRIORITY: libc::c_int = 6;
 
-/// DSCP EF (Expedited Forwarding) TOS value, for low-latency forwarding.
-const SOCKET_TOS: libc::c_int = 0xb8;
-
 /// Network profile for the QUIC transport.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum NetworkMode {
@@ -122,6 +119,11 @@ fn create_socket(bind_addr: SocketAddr, mode: NetworkMode) -> Result<std::net::U
             libc::SO_RCVBUF,
             &SOCKET_BUF_SIZE,
         )?;
+        // The kernel silently clamps these to net.core.{w,r}mem_max (~208 KiB
+        // on a stock system), inviting drops during clipboard bursts. Verify
+        // what we actually got and point at the fix if clamped.
+        verify_socket_buf(fd, libc::SO_SNDBUF, "net.core.wmem_max");
+        verify_socket_buf(fd, libc::SO_RCVBUF, "net.core.rmem_max");
 
         #[cfg(target_os = "linux")]
         {
@@ -132,13 +134,9 @@ fn create_socket(bind_addr: SocketAddr, mode: NetworkMode) -> Result<std::net::U
                     libc::SO_PRIORITY,
                     &SOCKET_PRIORITY,
                 )?;
-
-                let (level, opt) = if bind_addr.is_ipv6() {
-                    (libc::IPPROTO_IPV6, libc::IPV6_TCLASS)
-                } else {
-                    (libc::IPPROTO_IP, libc::IP_TOS)
-                };
-                setsockopt(fd, level, opt, &SOCKET_TOS)?;
+                // Note: no DSCP mark here. quinn-udp sets the ECN codepoint via a
+                // per-packet cmsg, which overrides any socket-level IP_TOS/IPV6_TCLASS,
+                // so a setsockopt DSCP mark would be dead code.
             }
         }
         Ok(())
@@ -225,6 +223,32 @@ fn setsockopt<T>(
     Ok(())
 }
 
+/// Warns if the kernel clamped a socket buffer below the requested size.
+/// Linux doubles the granted value internally, so a healthy readback is at
+/// least the request; anything less means net.core.*mem_max clamped it.
+fn verify_socket_buf(fd: libc::c_int, opt: libc::c_int, sysctl: &str) {
+    let mut value: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    let ret = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            opt,
+            &mut value as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if ret != 0 {
+        return;
+    }
+    if value < SOCKET_BUF_SIZE {
+        warn!(
+            "UDP socket buffer clamped to {} bytes (wanted {}): raise {} (e.g. via 'sudo monux setup') to avoid drops during clipboard bursts",
+            value, SOCKET_BUF_SIZE, sysctl
+        );
+    }
+}
+
 fn transport_config(mode: NetworkMode) -> Arc<TransportConfig> {
     let mut transport_config = TransportConfig::default();
 
@@ -239,7 +263,7 @@ fn transport_config(mode: NetworkMode) -> Arc<TransportConfig> {
             ack_config.reordering_threshold(VarInt::from_u32(0));
 
             transport_config
-                //.max_concurrent_bidi_streams(2_u8.into()) // events + bulk
+                .max_concurrent_bidi_streams(2_u8.into()) // events + bulk
                 .max_concurrent_uni_streams(0_u8.into()) // we only use bidirectional streams
                 .keep_alive_interval(Some(Duration::from_millis(KEEPALIVE_MILLIS)))
                 .max_idle_timeout(Some(IdleTimeout::from(VarInt::from_u32(TIMEOUT_MILLIS))))
@@ -251,7 +275,7 @@ fn transport_config(mode: NetworkMode) -> Arc<TransportConfig> {
         }
         NetworkMode::Www => {
             transport_config
-                //.max_concurrent_bidi_streams(2_u8.into()) // events + bulk
+                .max_concurrent_bidi_streams(2_u8.into()) // events + bulk
                 .max_concurrent_uni_streams(0_u8.into()) // we only use bidirectional streams
                 .keep_alive_interval(Some(Duration::from_millis(WWW_KEEPALIVE_MILLIS)))
                 .max_idle_timeout(Some(IdleTimeout::from(VarInt::from_u32(WWW_TIMEOUT_MILLIS))));
