@@ -121,6 +121,23 @@ pub fn run(force: bool, low_priority: bool, protocol_constraint: Option<u64>) ->
 
     let root = install_root();
     let cargo = find_cargo()?;
+    // Clean staging leftovers from previously killed installs.
+    if let Ok(entries) = std::fs::read_dir(&root) {
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".monux-install-staging-")
+            {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+    // Install into a staging dir on the same filesystem, then rename the
+    // binary into place atomically. 'cargo install' copies into bin/ in
+    // place, so a kill mid-copy could leave a truncated monux binary;
+    // rename(2) of a complete file replaces atomically instead.
+    let staging = root.join(format!(".monux-install-staging-{}", std::process::id()));
     info!(
         "Building and installing to {} (this can take a few minutes)...",
         root.join("bin/monux").display()
@@ -139,13 +156,19 @@ pub fn run(force: bool, low_priority: bool, protocol_constraint: Option<u64>) ->
         .arg("--path")
         .arg(&src_dir)
         .arg("--root")
-        .arg(&root)
+        .arg(&staging)
         .arg("--force")
         .status()
         .context("Failed to run cargo install")?;
     if !status.success() {
+        let _ = std::fs::remove_dir_all(&staging);
         bail!("cargo install failed");
     }
+    place_binary_atomically(
+        &staging.join("bin").join("monux"),
+        &root.join("bin").join("monux"),
+    )?;
+    let _ = std::fs::remove_dir_all(&staging);
     info!(
         "Updated monux to {} at {}. Restart any running monux server/client to pick it up.",
         latest,
@@ -217,6 +240,25 @@ fn install_root() -> PathBuf {
     home::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".local")
+}
+
+/// Moves the staged binary onto its final path via rename(2), which replaces
+/// atomically on the same filesystem: a kill at any point leaves either the
+/// old or the new binary intact, never a partial one. The staging dir lives
+/// inside the install root, so the two paths are always on the same
+/// filesystem (renames across filesystems would fail rather than copy).
+fn place_binary_atomically(from: &Path, to: &Path) -> Result<()> {
+    if let Some(parent) = to.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create {}", parent.display()))?;
+    }
+    std::fs::rename(from, to).with_context(|| {
+        format!(
+            "Failed to move {} into place at {}",
+            from.display(),
+            to.display()
+        )
+    })
 }
 
 /// cargo from PATH if runnable, else the rustup default location (PATH can be
@@ -318,6 +360,25 @@ mod tests {
         // A later handshake overwrites (e.g. the server upgraded).
         record_server_protocol_version(&dir, 8);
         assert_eq!(server_protocol_constraint(&dir), Some(8));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn place_binary_atomically_replaces_the_target() {
+        let dir =
+            std::env::temp_dir().join(format!("monux-test-atomic-place-{}", std::process::id()));
+        let staging = dir.join("staging");
+        let bin = dir.join("root").join("bin");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        let from = staging.join("monux");
+        let to = bin.join("monux");
+        std::fs::write(&from, b"new-binary").unwrap();
+        std::fs::write(&to, b"old-binary").unwrap();
+        place_binary_atomically(&from, &to).unwrap();
+        // The target is replaced wholesale and the staged file is consumed.
+        assert_eq!(std::fs::read(&to).unwrap(), b"new-binary");
+        assert!(!from.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

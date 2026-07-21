@@ -36,8 +36,18 @@ fi
 
 # Install into ~/.local/bin: present in PATH by default on systemd-based
 # distros and in most shell profiles, unlike ~/.cargo/bin.
+# Install to a staging dir on the same filesystem first, then move into
+# place atomically: a kill mid-'cargo install' would otherwise leave a
+# truncated binary in ~/.local/bin.
 echo "Installing monux..."
-cargo install --path . --root "$HOME/.local" --force
+rm -rf "$HOME"/.local/.monux-install-staging.* 2>/dev/null || true
+staging=$(mktemp -d "$HOME/.local/.monux-install-staging.XXXXXX")
+trap 'rm -rf "$staging"' EXIT
+cargo install --path . --root "$staging" --force
+mkdir -p "$HOME/.local/bin"
+mv -f "$staging/bin/monux" "$HOME/.local/bin/monux"
+rm -rf "$staging"
+trap - EXIT
 
 # Remove stale copies from previous install locations/names, so they can't
 # shadow the new one depending on PATH order.
