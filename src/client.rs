@@ -804,6 +804,7 @@ impl Connection {
                         // Read the clipboard data from the local application.
                         // On read failure or timeout, reply with an empty header so that the requester just sets nothing.
                         // The read must always answer within the 5s fetch timeout on the requester side.
+                        let started = Instant::now();
                         let (local_clipboard_data, data_type) = match tokio::time::timeout(
                             Duration::from_secs(CLIPBOARD_SERVE_TIMEOUT_SECS),
                             client::LocalClipboard::read(&reader, &requested_type, max_size_bytes, request_client),
@@ -820,6 +821,24 @@ impl Connection {
                                 (Vec::new(), None)
                             }
                         };
+                        // Symmetric with the writer's "Serving paste request
+                        // ... took Ns": makes stalls attributable to the
+                        // serving side.
+                        let elapsed = started.elapsed();
+                        if local_clipboard_data.is_empty() {
+                            debug!(
+                                "Served clipboard fetch for {} in {:.1}s (empty)",
+                                requested_type,
+                                elapsed.as_secs_f32()
+                            );
+                        } else {
+                            debug!(
+                                "Served clipboard fetch for {} in {:.1}s ({} bytes)",
+                                requested_type,
+                                elapsed.as_secs_f32(),
+                                local_clipboard_data.len()
+                            );
+                        }
                         let msg = bulk::ClientBulk::ClipboardHeader(bulk::ClientClipboardHeader {
                             requested_type: &requested_type,
                             data_type: data_type.as_ref().map(|t| t.as_str()),

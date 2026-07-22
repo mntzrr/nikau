@@ -1066,6 +1066,12 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         // min of source_client_max (if any), and server_max:
         max_size_bytes: u64,
     ) -> Result<()> {
+        // Machine-internal types (e.g. Chromium's chromium/x-internal-*
+        // markers) never enter the sharing layer: meaningless off-machine,
+        // and fetching them stalls the serving side. Applies to local updates
+        // and to client announcements from peers running an older build.
+        // A token-only clipboard filters down to no types — a clear.
+        let types = crate::clipboard::filter_shareable_mime_types(types);
         debug!("Announcing new clipboard source: source={:?} current={:?} with max_size_bytes={} has types={:?}", source, self.current_client, max_size_bytes, types);
         // An update with no types means the selection is gone — locally (the
         // compositor revoked it: the owning app exited and no clipboard
@@ -1389,6 +1395,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                 // timeout. The overall timeout covers read AND convert, like
                 // the client-side serve path (CLIPBOARD_SERVE_TIMEOUT_SECS).
                 // The next paste simply re-requests.
+                let started = Instant::now();
                 let (content, data_type) = match tokio::time::timeout(
                     Duration::from_secs(CLIPBOARD_SERVE_TIMEOUT_SECS),
                     server::LocalClipboard::read(
@@ -1416,6 +1423,23 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                         (Vec::new(), None)
                     }
                 };
+                // Symmetric with the writer's "Serving paste request ... took
+                // Ns": makes stalls attributable to the serving side.
+                let elapsed = started.elapsed();
+                if content.is_empty() {
+                    debug!(
+                        "Served clipboard fetch for {} in {:.1}s (empty)",
+                        requested_type,
+                        elapsed.as_secs_f32()
+                    );
+                } else {
+                    debug!(
+                        "Served clipboard fetch for {} in {:.1}s ({} bytes)",
+                        requested_type,
+                        elapsed.as_secs_f32(),
+                        content.len()
+                    );
+                }
                 let msg = bulk::ServerBulk::ClipboardHeader(bulk::ServerClipboardHeader {
                     requested_type: &requested_type,
                     data_type: data_type.as_ref().map(|t| t.as_str()),

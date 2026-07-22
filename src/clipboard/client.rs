@@ -5,7 +5,7 @@ use anyhow::{Result};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
-use crate::clipboard::{data, serve, wayland, x11};
+use crate::clipboard::{data, filter_shareable_mime_types, serve, wayland, x11};
 
 /// Wrapper around client-local clipboard storage, if available.
 pub struct LocalClipboard {
@@ -125,7 +125,10 @@ impl LocalClipboard {
 
     /// Switches to serving the local clipboard, rather than from the monux server
     pub fn set_local_clipboard(&mut self) {
-        self.local_types.replace(self.local_types_rx.borrow().clone());
+        // Machine-internal types (chromium/x-internal-* etc.) are never
+        // announced to the server; the local clipboard itself is untouched.
+        self.local_types
+            .replace(filter_shareable_mime_types(self.local_types_rx.borrow().clone()));
         // The local clipboard changed: never serve stale cached contents.
         // Lock-free: never waits on a serve in progress.
         self.reader.invalidate();
@@ -154,9 +157,11 @@ impl LocalClipboard {
     pub fn set_remote_clipboard(&mut self, types: Vec<String>) -> Result<()> {
         self.local_types = None;
         self.serving_remote_clipboard = true;
+        // Defense in depth: a peer on an older build may still advertise
+        // machine-internal types; never offer those to local apps.
         // Non-blocking: the actual advertisement happens on the writer
         // dispatcher thread; a failed send only means we're shutting down.
-        let _ = self.types_tx.send(types);
+        let _ = self.types_tx.send(filter_shareable_mime_types(types));
         Ok(())
     }
 }

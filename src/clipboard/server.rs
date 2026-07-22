@@ -6,7 +6,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task;
 use tracing::{debug, error, info, warn};
 
-use crate::clipboard::{ClipboardReader, ClipboardWriter, data, serve, wayland, x11};
+use crate::clipboard::{ClipboardReader, ClipboardWriter, data, filter_shareable_mime_types, serve, wayland, x11};
 use crate::rotation;
 
 /// Wrapper around server-local clipboard storage, if available.
@@ -205,9 +205,12 @@ impl LocalClipboard {
     /// available. Non-blocking: the actual wayland/X11 work happens on the
     /// writer dispatcher thread, so the rotation loop never stalls on it.
     pub fn store_types<K: Into<Vec<String>>>(&self, types: K) -> Result<()> {
+        // Defense in depth: a client on an older build may still advertise
+        // machine-internal types; never offer those to local apps.
+        let types = filter_shareable_mime_types(types.into());
         // The dispatcher thread exits (and this send fails) only if the
         // clipboard is being torn down; a failed advertisement is not fatal.
-        let _ = self.types_tx.send(types.into());
+        let _ = self.types_tx.send(types);
         Ok(())
     }
 }
