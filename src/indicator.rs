@@ -251,6 +251,9 @@ enum MenuAction {
     Resume,
     UpdateNow,
     CopyDiagnostics,
+    /// Hides the tray icon (the daemon SIGTERMs this very process, after
+    /// acking) until 'monux system tray show' or a daemon restart.
+    HideTray,
     Restart,
     Exit,
 }
@@ -265,6 +268,7 @@ impl MenuAction {
             MenuAction::Resume => "Resume",
             MenuAction::UpdateNow => "Update check",
             MenuAction::CopyDiagnostics => "Copy diagnostics",
+            MenuAction::HideTray => "Hide tray icon",
             MenuAction::Restart => "Restart monux",
             MenuAction::Exit => "Exit monux",
         }
@@ -343,6 +347,11 @@ fn menu_rows(state: Option<&State>) -> Vec<MenuRow> {
                 action: MenuAction::CopyDiagnostics,
                 enabled: true,
             });
+            rows.push(MenuRow::Action {
+                label: "Hide tray icon".to_string(),
+                action: MenuAction::HideTray,
+                enabled: true,
+            });
             rows.push(MenuRow::Separator);
             rows.push(MenuRow::Action {
                 label: "Restart monux".to_string(),
@@ -384,6 +393,11 @@ fn menu_rows(state: Option<&State>) -> Vec<MenuRow> {
             rows.push(MenuRow::Action {
                 label: "Copy diagnostics".to_string(),
                 action: MenuAction::CopyDiagnostics,
+                enabled: true,
+            });
+            rows.push(MenuRow::Action {
+                label: "Hide tray icon".to_string(),
+                action: MenuAction::HideTray,
                 enabled: true,
             });
             rows.push(MenuRow::Separator);
@@ -633,6 +647,7 @@ fn action_request(action: &MenuAction) -> String {
         MenuAction::Pause => r#"{"cmd":"pause"}"#.to_string(),
         MenuAction::Resume => r#"{"cmd":"resume"}"#.to_string(),
         MenuAction::UpdateNow => r#"{"cmd":"update_now"}"#.to_string(),
+        MenuAction::HideTray => r#"{"cmd":"indicator","action":"hide"}"#.to_string(),
         MenuAction::Restart => r#"{"cmd":"restart"}"#.to_string(),
         MenuAction::Exit => r#"{"cmd":"exit"}"#.to_string(),
         MenuAction::CopyDiagnostics => {
@@ -936,6 +951,7 @@ mod tests {
         // No update pending: plain manual check.
         assert!(rows.contains(&action_row("Check for update now", MenuAction::UpdateNow, true)));
         assert!(rows.contains(&action_row("Copy diagnostics", MenuAction::CopyDiagnostics, true)));
+        assert!(rows.contains(&action_row("Hide tray icon", MenuAction::HideTray, true)));
         assert!(rows.contains(&action_row("Restart monux", MenuAction::Restart, true)));
         assert!(rows.contains(&action_row("Exit monux", MenuAction::Exit, true)));
     }
@@ -1018,6 +1034,7 @@ mod tests {
                     action,
                     MenuAction::UpdateNow
                         | MenuAction::CopyDiagnostics
+                        | MenuAction::HideTray
                         | MenuAction::Restart
                         | MenuAction::Exit
                 ));

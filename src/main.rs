@@ -78,8 +78,19 @@ enum SystemCommands {
     /// paused, red = degraded link / client not connected, hollow "?" = monux
     /// not running) whose menu drives switches, pause/resume, update checks,
     /// diagnostics copy, and restart/exit via the control socket. Needs a
-    /// desktop session with an SNI host (waybar, KDE Plasma, ...).
+    /// desktop session with an SNI host (waybar, KDE Plasma, ...). Started
+    /// automatically with 'monux server'/'monux client' (opt out with
+    /// --no-indicator); running it manually takes over from the auto-spawned
+    /// instance — only one indicator runs at a time.
     Indicator,
+
+    /// Hides or restores the auto-spawned tray indicator without restarting
+    /// the daemon: 'hide' SIGTERMs the daemon's spawned indicator and
+    /// suppresses respawns (the daemon itself keeps running), 'show' spawns
+    /// it again. The hidden state is per-daemon-run only — a daemon restart
+    /// always starts the indicator. Talks to the daemon's control socket
+    /// (server socket first, then the client's), like 'monux system status'.
+    Tray(TrayArgs),
 
     /// Removes monux from this machine: stops any running server/client, then
     /// removes the binary (and stale copies), the /usr/local/bin link, and the
@@ -106,6 +117,24 @@ struct StatusArgs {
     /// Print the daemon's raw JSON response instead of a human-readable summary
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Args)]
+struct TrayArgs {
+    /// 'hide' removes the tray icon (the daemon keeps running), 'show' restores it
+    #[arg(value_enum, value_name = "hide|show")]
+    action: TrayAction,
+
+    /// Send the command to this explicit control socket path instead of the
+    /// default $XDG_RUNTIME_DIR/monux/{server,client}.sock locations
+    #[arg(long, value_name = "path")]
+    socket: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum TrayAction {
+    Hide,
+    Show,
 }
 
 #[derive(Args)]
@@ -201,6 +230,13 @@ struct ServerArgs {
     /// The session resumes automatically on reconnect.
     #[arg(long)]
     no_auto_update: bool,
+
+    /// Do not auto-spawn the tray indicator (monux system indicator) with the
+    /// daemon. By default the indicator starts once the daemon is up whenever
+    /// a desktop session bus is available, and stops with the daemon. Can
+    /// also be disabled with MONUX_NO_INDICATOR=1.
+    #[arg(long)]
+    no_indicator: bool,
 }
 
 #[derive(Args)]
@@ -253,6 +289,13 @@ struct ClientArgs {
     /// The session resumes automatically on reconnect.
     #[arg(long)]
     no_auto_update: bool,
+
+    /// Do not auto-spawn the tray indicator (monux system indicator) with the
+    /// daemon. By default the indicator starts once the daemon is up whenever
+    /// a desktop session bus is available, and stops with the daemon. Can
+    /// also be disabled with MONUX_NO_INDICATOR=1.
+    #[arg(long)]
+    no_indicator: bool,
 }
 
 #[derive(Args)]
@@ -441,10 +484,28 @@ fn main() -> Result<()> {
                 println!("{}", out);
                 return Ok(());
             }
+            SystemCommands::Tray(args) => {
+                let hide = matches!(args.action, TrayAction::Hide);
+                let out = monux::control::tray_cli(hide, args.socket.as_deref())?;
+                println!("{}", out);
+                return Ok(());
+            }
             SystemCommands::Uninstall => {
                 return monux::uninstall::run();
             }
             SystemCommands::Indicator => {
+                // Headless sessions fail here, before touching the lock: no
+                // point holding (or taking over) the single-instance lock for
+                // an indicator that can't even reach a session bus.
+                if !monux::indicator_spawn::has_desktop_session() {
+                    bail!(
+                        "no D-Bus session bus (DBUS_SESSION_BUS_ADDRESS unset and no /run/user/{}/bus): the indicator needs a desktop session running a StatusNotifierItem host (waybar, KDE Plasma, ...)",
+                        unsafe { libc::geteuid() }
+                    );
+                }
+                // One icon at all times: take over from any already-running
+                // indicator (auto-spawned or manual).
+                let _indicator_lock = single_instance::acquire("indicator")?;
                 return monux::indicator::run();
             }
         },
@@ -559,6 +620,7 @@ fn main() -> Result<()> {
                     motion_flush_interval,
                     bulk_throttle_mbps,
                     !args.no_auto_update,
+                    !args.no_indicator,
                 )
                 .await
             })?;
@@ -656,6 +718,7 @@ fn main() -> Result<()> {
                     args.scroll_scale,
                     bulk_throttle_mbps,
                     !args.no_auto_update,
+                    !args.no_indicator,
                 )
                 .await
             })?;
@@ -793,6 +856,7 @@ async fn server(
     motion_flush_interval: Option<Duration>,
     bulk_throttle_mbps: Option<f64>,
     auto_update: bool,
+    auto_indicator: bool,
 ) -> Result<()> {
     // Try to set up virtual devices up-front - exit early if we can't access uinput
     let mut output_handler = output::uinput::VirtualUInputDevices::new()
@@ -823,13 +887,18 @@ async fn server(
 
     // Local control IPC (status/switch/pause/update/restart/exit). Optional:
     // an unbindable path (e.g. another live daemon owns it) just drops the
-    // feature, not the server.
+    // feature, not the server. The tray-indicator supervisor is created here
+    // so the socket can hide/show it, but only launched once the daemon is
+    // up (see below); the guard SIGTERMs and reaps the child on every exit
+    // path out of this function.
+    let indicator = monux::indicator_spawn::Supervisor::new(!auto_indicator);
     match monux::control::Listener::bind(monux::control::Role::Server) {
         Ok(listener) => {
             let handler = monux::control::Handler::Server(monux::control::ServerHandler {
                 state: diagnostics.clone(),
                 event_tx: event_tx.clone(),
                 auto_update,
+                indicator: indicator.handle(),
             });
             task::spawn(listener.run(handler));
         }
@@ -911,6 +980,9 @@ async fn server(
             );
         }
     }
+    // The daemon is up (listening, rotation running): start the tray
+    // indicator alongside it.
+    indicator.launch();
     if let Some(exit_secs) = exit_secs {
         info!("Exiting in {} seconds...", exit_secs);
         tokio::select! {
@@ -981,6 +1053,7 @@ async fn client(
     scroll_scale: f64,
     bulk_throttle_mbps: Option<f64>,
     auto_update: bool,
+    auto_indicator: bool,
 ) -> Result<()> {
     // Try to set up virtual devices up-front - exit early if we can't access uinput
     let mut output_handler = output::uinput::VirtualUInputDevices::new()
@@ -1004,17 +1077,25 @@ async fn client(
     // (dis)connected, the Switch handler in client.rs drives `active`.
     let control_state = Arc::new(monux::control::ClientStateMirror::new(connect_addr));
     // Local control IPC (status/update/restart/exit only — rotation and pause
-    // are server concepts). Optional, as on the server.
+    // are server concepts). Optional, as on the server. The tray-indicator
+    // supervisor is created here so the socket can hide/show it, but only
+    // launched once the socket is bound; the guard SIGTERMs and reaps the
+    // child on every exit path out of this function.
+    let indicator = monux::indicator_spawn::Supervisor::new(!auto_indicator);
     match monux::control::Listener::bind(monux::control::Role::Client) {
         Ok(listener) => {
             let handler = monux::control::Handler::Client(monux::control::ClientHandler {
                 state: control_state.clone(),
                 auto_update,
+                indicator: indicator.handle(),
             });
             task::spawn(listener.run(handler));
         }
         Err(e) => warn!("Control socket unavailable: {:?}", e),
     }
+    // The daemon is up (control socket bound): start the tray indicator
+    // alongside it; it polls until the socket serves.
+    indicator.launch();
     // Keep one set of signal handlers registered across reconnect attempts.
     let shutdown = client_shutdown_signal();
     tokio::pin!(shutdown);
@@ -1111,5 +1192,56 @@ async fn client(
                 return Ok(());
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tray_subcommand_parses_hide_show_and_socket() {
+        let cli = Cli::try_parse_from(["monux", "system", "tray", "hide"]).unwrap();
+        let Commands::System(args) = cli.command else {
+            panic!("expected a system command")
+        };
+        let SystemCommands::Tray(tray) = args.command else {
+            panic!("expected the tray subcommand")
+        };
+        assert!(matches!(tray.action, TrayAction::Hide));
+        assert!(tray.socket.is_none());
+
+        let cli = Cli::try_parse_from([
+            "monux",
+            "system",
+            "tray",
+            "show",
+            "--socket",
+            "/tmp/x/monux/client.sock",
+        ])
+        .unwrap();
+        let Commands::System(args) = cli.command else {
+            panic!("expected a system command")
+        };
+        let SystemCommands::Tray(tray) = args.command else {
+            panic!("expected the tray subcommand")
+        };
+        assert!(matches!(tray.action, TrayAction::Show));
+        assert_eq!(
+            tray.socket.as_deref(),
+            Some(Path::new("/tmp/x/monux/client.sock"))
+        );
+    }
+
+    #[test]
+    fn tray_subcommand_rejects_missing_and_unknown_actions() {
+        assert!(Cli::try_parse_from(["monux", "system", "tray"]).is_err());
+        assert!(Cli::try_parse_from(["monux", "system", "tray", "blink"]).is_err());
+    }
+
+    #[test]
+    fn server_and_client_accept_no_indicator() {
+        assert!(Cli::try_parse_from(["monux", "server", "--no-indicator"]).is_ok());
+        assert!(Cli::try_parse_from(["monux", "client", "--no-indicator"]).is_ok());
     }
 }

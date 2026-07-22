@@ -5,6 +5,7 @@ pub mod control;
 pub mod device;
 pub mod discovery;
 pub mod indicator;
+pub mod indicator_spawn;
 pub mod logging;
 pub mod msgs;
 pub mod network;

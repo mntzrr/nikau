@@ -1,4 +1,5 @@
-//! Ensures only one server (and one client) instance runs at a time.
+//! Ensures only one server (and one client, and one tray indicator) instance
+//! runs at a time.
 //!
 //! The guarantee is an flock on a file in a machine-wide directory (/tmp by
 //! default). Because flock is tied to the open file description, the kernel
@@ -45,7 +46,8 @@ pub struct InstanceLock {
     pub took_over: bool,
 }
 
-/// Filesystem path of the lock file for `kind` ("server" or "client").
+/// Filesystem path of the lock file for `kind` ("server", "client" or
+/// "indicator").
 fn lock_path(kind: &str) -> PathBuf {
     let dir = std::env::var_os(LOCK_DIR_ENV)
         .map(PathBuf::from)
@@ -53,7 +55,8 @@ fn lock_path(kind: &str) -> PathBuf {
     dir.join(format!("monux-{}.lock", kind))
 }
 
-/// Takes the single-instance lock for `kind` ("server" or "client").
+/// Takes the single-instance lock for `kind` ("server", "client" or
+/// "indicator").
 /// If a previous instance holds it, that instance is asked to shut down
 /// (SIGTERM) and this call blocks until it exits (up to a few seconds),
 /// then takes over. The lock file records the holder's pid as a human hint

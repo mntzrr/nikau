@@ -37,6 +37,14 @@
 //!   can send the command matching the state it wants without reading first.
 //! - `{"cmd":"update_now"}` — wake the background auto-update check
 //!   immediately instead of waiting for the daily tick.
+//! - `{"cmd":"indicator","action":"hide"|"show"}` — hide the auto-spawned
+//!   tray indicator (SIGTERM the daemon's spawned indicator child, and keep
+//!   it down: no spawns/respawns) or show it again (spawn immediately when
+//!   none is running). The hidden state is in-memory only: a daemon restart
+//!   always starts the indicator fresh. show is REFUSED when the daemon runs
+//!   with --no-indicator — an explicit opt-out the socket may not override.
+//!   Manually-started indicators are never managed by this. The tray menu's
+//!   "Hide tray icon" and `monux system tray hide|show` drive this command.
 //! - `{"cmd":"restart"}` — graceful shutdown, then re-exec into the installed
 //!   binary (the auto-updater's restart path).
 //! - `{"cmd":"exit"}` — graceful shutdown.
@@ -48,8 +56,8 @@
 //! `ok` means it was accepted by the daemon's event loop — the effect (e.g.
 //! a rotation switch) lands asynchronously; poll status to observe it. The
 //! server socket serves the full command set; the client socket serves only
-//! status/diagnostics/update_now/restart/exit (rotation and pause are server
-//! concepts).
+//! status/diagnostics/update_now/indicator/restart/exit (rotation and pause
+//! are server concepts).
 //!
 //! # Diagnostics schema (the `diagnostics` object of a diagnostics response)
 //!
@@ -384,6 +392,8 @@ impl ClientStateMirror {
 pub struct Request {
     pub cmd: String,
     pub target: Option<String>,
+    /// Sub-action for commands that need one ("indicator": hide|show).
+    pub action: Option<String>,
 }
 
 /// Troubleshooting bundle served by `{"cmd":"diagnostics"}` (see module docs
@@ -483,6 +493,11 @@ enum PostAction {
     Restart,
     /// Graceful shutdown.
     Exit,
+    /// SIGTERM the spawned tray indicator. Deferred because the requester is
+    /// usually the indicator itself (its "Hide tray icon" menu action): the
+    /// ack must be on the wire before the requester is killed, or it would
+    /// report its own hide as a failure.
+    IndicatorHide,
 }
 
 /// Command/context bundle for the server socket.
@@ -495,12 +510,16 @@ pub struct ServerHandler {
     /// Whether the background auto-updater is running (update_now otherwise
     /// errors clearly instead of silently doing nothing).
     pub auto_update: bool,
+    /// Hide/show control for the auto-spawned tray indicator.
+    pub indicator: crate::indicator_spawn::SupervisorHandle,
 }
 
 /// Command/context bundle for the client socket.
 pub struct ClientHandler {
     pub state: Arc<ClientStateMirror>,
     pub auto_update: bool,
+    /// Hide/show control for the auto-spawned tray indicator.
+    pub indicator: crate::indicator_spawn::SupervisorHandle,
 }
 
 pub enum Handler {
@@ -556,6 +575,32 @@ impl Handler {
             "exit" => {
                 info!("Control socket: exit requested");
                 (Response::ok_empty(), Some(PostAction::Exit))
+            }
+            "indicator" => {
+                let indicator = match self {
+                    Handler::Server(h) => &h.indicator,
+                    Handler::Client(h) => &h.indicator,
+                };
+                match req.action.as_deref() {
+                    // Deferred (see PostAction::IndicatorHide): the requester
+                    // is usually the indicator about to be killed.
+                    Some("hide") => {
+                        info!("Control socket: tray indicator hide requested");
+                        (Response::ok_empty(), Some(PostAction::IndicatorHide))
+                    }
+                    // Synchronous: spawn errors belong in the response.
+                    Some("show") => {
+                        info!("Control socket: tray indicator show requested");
+                        match indicator.show() {
+                            Ok(()) => (Response::ok_empty(), None),
+                            Err(e) => (Response::err(format!("{:#}", e)), None),
+                        }
+                    }
+                    _ => (
+                        Response::err("indicator needs an action: hide|show"),
+                        None,
+                    ),
+                }
             }
             "switch" | "pause" | "resume" => match self {
                 Handler::Client(_) => (
@@ -713,6 +758,10 @@ async fn serve_connection(stream: tokio::net::UnixStream, handler: Arc<Handler>)
                     libc::kill(std::process::id() as i32, libc::SIGTERM);
                 }
             }
+            Some(PostAction::IndicatorHide) => match &*handler {
+                Handler::Server(h) => h.indicator.hide(),
+                Handler::Client(h) => h.indicator.hide(),
+            },
             None => {}
         }
     }
@@ -780,15 +829,50 @@ pub fn status_cli(
         }
         (None, true, true) => bail!("--server and --client are mutually exclusive"),
     };
-    // The first socket that answers wins; missing files and stale sockets
-    // (crash remnants) fall through to the next candidate.
+    let (path, raw) = query_first(&candidates, r#"{"cmd":"status"}"#)?;
+    format_status(&path, &raw, json)
+}
+
+/// Implements `monux system tray hide|show`: sends the indicator hide/show
+/// command to the daemon's control socket (server socket first, then the
+/// client's, exactly like status discovery; `socket` overrides) and returns
+/// the text to print. The daemon's error string propagates — e.g. the
+/// refusal to override a --no-indicator daemon on show.
+pub fn tray_cli(hide: bool, socket: Option<&Path>) -> Result<String> {
+    let candidates: Vec<PathBuf> = match socket {
+        Some(path) => vec![path.to_path_buf()],
+        None => vec![socket_path(Role::Server), socket_path(Role::Client)],
+    };
+    let action = if hide { "hide" } else { "show" };
+    let request = format!(r#"{{"cmd":"indicator","action":"{}"}}"#, action);
+    let (path, raw) = query_first(&candidates, &request)?;
+    let response: RawResponse = serde_json::from_str(&raw)
+        .with_context(|| format!("Malformed response from {}: {}", path.display(), raw))?;
+    if !response.ok {
+        bail!(
+            "The daemon reported an error: {}",
+            response.error.unwrap_or_default()
+        );
+    }
+    Ok(if hide {
+        "Tray indicator hidden (no respawns until 'monux system tray show' or a daemon restart)".to_string()
+    } else {
+        "Tray indicator shown".to_string()
+    })
+}
+
+/// Sends `request` to the first candidate socket that answers, returning the
+/// answering path and the raw response line. The first socket that answers
+/// wins; missing files and stale sockets (crash remnants) fall through to
+/// the next candidate. Shared by status_cli and tray_cli.
+fn query_first(candidates: &[PathBuf], request: &str) -> Result<(PathBuf, String)> {
     let mut last_err = None;
-    for path in &candidates {
+    for path in candidates {
         if !path.exists() {
             continue;
         }
-        match request_line(path, r#"{"cmd":"status"}"#) {
-            Ok(raw) => return format_status(path, &raw, json),
+        match request_line(path, request) {
+            Ok(raw) => return Ok((path.clone(), raw)),
             Err(e) => {
                 debug!("Control socket {} unusable: {:?}", path.display(), e);
                 last_err = Some(e);
@@ -847,7 +931,29 @@ mod tests {
         Request {
             cmd: cmd.to_string(),
             target: target.map(|t| t.to_string()),
+            action: None,
         }
+    }
+
+    fn req_action(cmd: &str, action: Option<&str>) -> Request {
+        Request {
+            cmd: cmd.to_string(),
+            target: None,
+            action: action.map(|a| a.to_string()),
+        }
+    }
+
+    /// A supervisor handle whose daemon opted out of the indicator: no
+    /// child, no task, and show() refuses — all without touching the
+    /// environment or spawning processes.
+    fn opted_out_indicator() -> crate::indicator_spawn::SupervisorHandle {
+        let supervisor = crate::indicator_spawn::Supervisor::new(true);
+        let handle = supervisor.handle();
+        // The guard must outlive the handle: its Drop flips the shutdown
+        // flag the handle checks (by design, for the daemon-exit window).
+        // Test handlers never drop their fields anyway.
+        std::mem::forget(supervisor);
+        handle
     }
 
     fn server_handler(
@@ -858,6 +964,7 @@ mod tests {
             state: Arc::new(DiagnosticsMirror::new("127.0.0.1:1".parse().unwrap())),
             event_tx,
             auto_update,
+            indicator: opted_out_indicator(),
         })
     }
 
@@ -867,6 +974,7 @@ mod tests {
             Handler::Client(ClientHandler {
                 state: mirror.clone(),
                 auto_update,
+                indicator: opted_out_indicator(),
             }),
             mirror,
         )
@@ -893,6 +1001,11 @@ mod tests {
         let r: Request = serde_json::from_str(r#"{"cmd":"switch","target":"d1d88653"}"#).unwrap();
         assert_eq!(r.cmd, "switch");
         assert_eq!(r.target.as_deref(), Some("d1d88653"));
+        // The indicator command carries an action.
+        let r: Request = serde_json::from_str(r#"{"cmd":"indicator","action":"hide"}"#).unwrap();
+        assert_eq!(r.cmd, "indicator");
+        assert_eq!(r.action.as_deref(), Some("hide"));
+        assert!(r.target.is_none());
         // Unknown fields are ignored, so newer peers keep working.
         let r: Request = serde_json::from_str(r#"{"cmd":"exit","extra":42}"#).unwrap();
         assert_eq!(r.cmd, "exit");
@@ -1027,6 +1140,64 @@ mod tests {
         assert!(resp.ok);
         let (resp, post) = handler.dispatch(&req("exit", None)).await;
         assert!(resp.ok && post == Some(PostAction::Exit));
+    }
+
+    #[tokio::test]
+    async fn indicator_command_maps_to_the_supervisor_handle() {
+        // Both roles serve it (the test handles sit on opted-out
+        // supervisors: no child, no task, show refused).
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let handler = server_handler(event_tx, false);
+        // hide acks and defers the SIGTERM until after the response is on
+        // the wire (the requester is usually the indicator itself).
+        let (resp, post) = handler.dispatch(&req_action("indicator", Some("hide"))).await;
+        assert!(resp.ok && post == Some(PostAction::IndicatorHide));
+        // show must not override an explicit --no-indicator opt-out.
+        let (resp, post) = handler.dispatch(&req_action("indicator", Some("show"))).await;
+        assert!(!resp.ok && post.is_none());
+        let err = resp.error.unwrap();
+        assert!(err.contains("--no-indicator"), "unexpected error: {}", err);
+        // Missing or unknown actions are validation errors.
+        let (resp, _) = handler.dispatch(&req_action("indicator", None)).await;
+        assert!(!resp.ok);
+        assert!(resp.error.unwrap().contains("hide|show"));
+        let (resp, _) = handler.dispatch(&req_action("indicator", Some("blink"))).await;
+        assert!(!resp.ok);
+
+        let (handler, _mirror) = client_handler(true);
+        let (resp, post) = handler.dispatch(&req_action("indicator", Some("hide"))).await;
+        assert!(resp.ok && post == Some(PostAction::IndicatorHide));
+        let (resp, _) = handler.dispatch(&req_action("indicator", Some("show"))).await;
+        assert!(!resp.ok);
+        assert!(resp.error.unwrap().contains("--no-indicator"));
+    }
+
+    #[tokio::test]
+    async fn indicator_command_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("client.sock");
+        let listener = Listener::bind_at(&path, "client").unwrap();
+        let (handler, _mirror) = client_handler(true);
+        let task = tokio::spawn(listener.run(handler));
+
+        // hide: plain ack (the deferred effect runs after the response and
+        // is a no-op here — the opted-out supervisor has no child).
+        let raw = request(path.clone(), r#"{"cmd":"indicator","action":"hide"}"#).await;
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v, serde_json::json!({"ok": true}));
+        // show on an opted-out daemon: the refusal comes back as an error.
+        let raw = request(path.clone(), r#"{"cmd":"indicator","action":"show"}"#).await;
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["ok"], false);
+        assert!(v["error"].as_str().unwrap().contains("--no-indicator"));
+        // An unknown action is a validation error, not a hang.
+        let raw = request(path.clone(), r#"{"cmd":"indicator","action":"blink"}"#).await;
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["ok"], false);
+        assert!(v["error"].as_str().unwrap().contains("hide|show"));
+
+        task.abort();
+        let _ = task.await;
     }
 
     #[test]

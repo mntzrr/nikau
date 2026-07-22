@@ -50,7 +50,7 @@ After installation, the binary is available as `monux` in `~/.local/bin`, which 
 monux system setup --autostart server   # or: --autostart client
 ```
 
-This writes `~/.config/systemd/user/monux-<role>.service` and enables+starts it via `systemctl --user` (`Restart=on-failure`, 3s delay). The client service runs plain `monux client` with no address argument, so it finds the server via mDNS auto-discovery — nothing machine-specific is baked into the unit. `--autostart off` disables both services and removes the unit files; omitting the flag leaves autostart untouched.
+This writes `~/.config/systemd/user/monux-<role>.service` and enables+starts it via `systemctl --user` (`Restart=on-failure`, 3s delay). The client service runs plain `monux client` with no address argument, so it finds the server via mDNS auto-discovery — nothing machine-specific is baked into the unit. `--autostart off` disables both services and removes the unit files; omitting the flag leaves autostart untouched. The tray indicator comes for free: the daemon auto-spawns it (see the tray-indicator section below), subject to the same `DBUS_SESSION_BUS_ADDRESS` caveat as clipboard sharing.
 
 Check status and logs with:
 
@@ -155,7 +155,7 @@ monux system status --client   # restrict to one role
 monux system status --json     # machine-readable response
 ```
 
-The wire protocol is newline-delimited JSON, one request and one response per line, so any language can drive it (this is the backend of the tray indicator below). Requests: `{"cmd":"status"}`, `{"cmd":"diagnostics"}` (a troubleshooting bundle: state dump plus the daemon's recent log lines), `{"cmd":"switch","target":"next"|"prev"|"local"|<fingerprint-prefix>}`, `{"cmd":"pause"}` / `{"cmd":"resume"}` (idempotent: pausing a paused server is a no-op), `{"cmd":"update_now"}` (wakes the background update check), `{"cmd":"restart"}` (graceful shutdown + re-exec, like after an update), `{"cmd":"exit"}`. Responses: `{"ok":true,"state":{...}}` for status, `{"ok":true,"diagnostics":{...}}` for diagnostics, `{"ok":true}` for accepted commands, `{"ok":false,"error":"..."}` on failure. The server socket serves the full set; the client socket only status/diagnostics/update_now/restart/exit — rotation and pause are server concepts. Example with socat:
+The wire protocol is newline-delimited JSON, one request and one response per line, so any language can drive it (this is the backend of the tray indicator below). Requests: `{"cmd":"status"}`, `{"cmd":"diagnostics"}` (a troubleshooting bundle: state dump plus the daemon's recent log lines), `{"cmd":"switch","target":"next"|"prev"|"local"|<fingerprint-prefix>}`, `{"cmd":"pause"}` / `{"cmd":"resume"}` (idempotent: pausing a paused server is a no-op), `{"cmd":"update_now"}` (wakes the background update check), `{"cmd":"indicator","action":"hide"|"show"}` (hides the auto-spawned tray indicator without stopping the daemon, or restores it), `{"cmd":"restart"}` (graceful shutdown + re-exec, like after an update), `{"cmd":"exit"}`. Responses: `{"ok":true,"state":{...}}` for status, `{"ok":true,"diagnostics":{...}}` for diagnostics, `{"ok":true}` for accepted commands, `{"ok":false,"error":"..."}` on failure. The server socket serves the full set; the client socket only status/diagnostics/update_now/indicator/restart/exit — rotation and pause are server concepts. Example with socat:
 
 ```bash
 echo '{"cmd":"pause"}' | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/monux/server.sock
@@ -175,7 +175,11 @@ The icon is a colored dot whose tooltip carries the details ("monux: input on 19
 
 The menu follows the current state: switch to local / to a specific client and pause/resume (server only), per-client connection facts and clipboard owner, "Check for update now" (or "Update available: `<sha>` — update now" when the auto-updater has seen a newer commit), "Copy diagnostics" (puts a bug-report bundle — version, state dump, recent logs — on the clipboard via `wl-copy`/`xclip`/`xsel`), and "Restart monux" / "Exit monux".
 
-The indicator needs a desktop session: on a headless TTY it exits with a "no D-Bus session / no tray host" error. To autostart it, add `monux system indicator` to your compositor's autostart (e.g. `exec-once = monux system indicator` in Hyprland). It is deliberately **not** part of the systemd units installed by `monux system setup --autostart` — those inherit the systemd user manager's environment, which usually lacks `DBUS_SESSION_BUS_ADDRESS` unless your compositor imports it (see the autostart caveat above); the compositor's own autostart always has the session bus.
+The indicator starts automatically with the daemon: whenever `monux server` or `monux client` runs with a desktop session bus available, it spawns `monux system indicator` as a child process and stops it again on shutdown (opt out with `--no-indicator` or `MONUX_NO_INDICATOR=1`). If the indicator dies on its own (e.g. its tray host restarted), the daemon respawns it — a bounded few times, after which it logs how to start it manually. Only one indicator runs at a time: a manually started `monux system indicator` takes over from the auto-spawned one (and vice versa), never a duplicate icon.
+
+You can hide the icon without stopping the daemon — the menu's **Hide tray icon**, or `monux system tray hide` — and bring it back with `monux system tray show` (or a manually started `monux system indicator`); the daemon suppresses (re)spawns only until then, and a daemon restart always starts the indicator fresh. `show` refuses to override a daemon started with `--no-indicator`.
+
+Headless sessions are detected and skipped silently by the daemon; a manually started indicator there exits with a "no D-Bus session / no tray host" error. The systemd units installed by `monux system setup --autostart` get the indicator for free, since the daemon spawns it — with the same caveat as clipboard sharing: the service needs `DBUS_SESSION_BUS_ADDRESS` in the systemd user manager's environment (see the autostart caveat above), otherwise the auto-spawn is skipped.
 
 ## Troubleshooting
 
