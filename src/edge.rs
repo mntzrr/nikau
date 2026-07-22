@@ -44,16 +44,11 @@ use tokio::time;
 use tracing::{debug, info, warn};
 
 use crate::device::Event;
+use crate::msgs::event::Direction;
 
-/// A screen edge that can be mapped to a client.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Direction {
-    Left,
-    Right,
-    Top,
-    Bottom,
-}
-
+/// Parses a --edge-map direction ("left"/"right"/"top"/"bottom"). The type
+/// itself lives on the wire side (msgs::event) for ServerEvent::EdgeInfo;
+/// the parsing helper stays here, next to the --edge-map handling.
 impl Direction {
     fn parse(s: &str) -> Result<Direction> {
         match s.to_ascii_lowercase().as_str() {
@@ -65,15 +60,6 @@ impl Direction {
                 "invalid edge direction '{}': expected left|right|top|bottom",
                 other
             ),
-        }
-    }
-
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Direction::Left => "left",
-            Direction::Right => "right",
-            Direction::Top => "top",
-            Direction::Bottom => "bottom",
         }
     }
 }

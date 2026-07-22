@@ -262,6 +262,14 @@ the new `ClientEvent::SwitchRequest { y_fraction }` (the crossing fraction
 along the edge, reserved for future cursor warping), which the server honors
 only from the current client, switching back to local through the normal
 rotation path. Later phases may add other compositors.
+Phase 9C (server-driven edge inference / EdgeInfo) implemented 2026-07-22
+(v5.0.0, protocol v12) — the server tells each mapped client which server
+edge it sits beyond (new appended `ServerEvent::EdgeInfo { direction }`,
+sent before the first `Switch(true)`; `Direction` moved to `msgs::event` as
+the shared wire enum), and the client infers the OPPOSITE edge for the
+return trip, so no `--edge-map` is needed on the client. An explicit client
+`--edge-map` still wins over the inference; the inferred map is rebuilt per
+connection.
 
 Move cursor off a screen edge to switch machines. Hyprland-only initially
 (compositor IPC for cursor position/monitor layout); needs edge resistance,

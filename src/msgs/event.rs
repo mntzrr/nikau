@@ -21,6 +21,15 @@ pub enum ServerEvent<'a> {
     /// grabbed and keystrokes buffer into the void until the QUIC idle
     /// timeout fires. New variants must be appended (wire format).
     Ping,
+
+    /// Tells the client which edge of the SERVER it sits beyond: the server's
+    /// --edge-map resolved this client as the target of `direction` (see
+    /// edge.rs). Sent on connect, before the first Switch(true), to mapped
+    /// clients only, so the client can infer the OPPOSITE edge for the return
+    /// trip without needing its own --edge-map. Appended variant (protocol
+    /// v12): mixed versions refuse at the handshake anyway, so a pre-v12
+    /// client never sees it.
+    EdgeInfo { direction: Direction },
 }
 
 impl<'a> std::fmt::Display for ServerEvent<'a> {
@@ -30,6 +39,46 @@ impl<'a> std::fmt::Display for ServerEvent<'a> {
             ServerEvent::Input(e) => f.write_str(format!("{:?}", e).as_str()),
             ServerEvent::ClipboardTypes(e) => e.fmt(f),
             ServerEvent::Ping => f.write_str("Ping"),
+            ServerEvent::EdgeInfo { direction } => {
+                f.write_str(format!("EdgeInfo(direction={})", direction.as_str()).as_str())
+            }
+        }
+    }
+}
+
+// Direction
+
+/// A screen edge, for the EdgeInfo layout advertisement (see
+/// ServerEvent::EdgeInfo). Defined on the wire side so the screen-edge
+/// switcher (edge.rs) and the server/client share one type without msgs
+/// depending on edge.rs.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub enum Direction {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+impl Direction {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Direction::Left => "left",
+            Direction::Right => "right",
+            Direction::Top => "top",
+            Direction::Bottom => "bottom",
+        }
+    }
+
+    /// The edge opposite this one (left↔right, top↔bottom): a client sitting
+    /// beyond the server's `self` edge watches `self.opposite()` on its own
+    /// machine for the return trip (see ServerEvent::EdgeInfo).
+    pub fn opposite(&self) -> Direction {
+        match self {
+            Direction::Left => Direction::Right,
+            Direction::Right => Direction::Left,
+            Direction::Top => Direction::Bottom,
+            Direction::Bottom => Direction::Top,
         }
     }
 }
@@ -374,6 +423,38 @@ mod tests {
         for y_fraction in [0.0, 0.25, 0.5, 0.75, 1.0] {
             assert_cobs_roundtrip!(ClientEvent, ClientEvent::SwitchRequest { y_fraction });
         }
+    }
+
+    #[test]
+    fn edge_info_roundtrip() {
+        // The server-driven edge inference (protocol v12): every direction
+        // must survive the postcard + COBS round trip.
+        for direction in [
+            Direction::Left,
+            Direction::Right,
+            Direction::Top,
+            Direction::Bottom,
+        ] {
+            assert_cobs_roundtrip!(ServerEvent, ServerEvent::EdgeInfo { direction });
+        }
+    }
+
+    #[test]
+    fn direction_opposite_is_an_involution() {
+        // left↔right, top↔bottom; applying it twice returns the original.
+        for direction in [
+            Direction::Left,
+            Direction::Right,
+            Direction::Top,
+            Direction::Bottom,
+        ] {
+            assert_eq!(direction.opposite().opposite(), direction);
+            assert_ne!(direction.opposite(), direction);
+        }
+        assert_eq!(Direction::Left.opposite(), Direction::Right);
+        assert_eq!(Direction::Right.opposite(), Direction::Left);
+        assert_eq!(Direction::Top.opposite(), Direction::Bottom);
+        assert_eq!(Direction::Bottom.opposite(), Direction::Top);
     }
 
     #[test]

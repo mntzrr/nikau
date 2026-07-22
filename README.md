@@ -140,11 +140,12 @@ Detection polls the cursor position from Hyprland's IPC every 40 ms and checks i
 
 Caveats: this requires a Hyprland session on the server (the layout comes from Hyprland's IPC, re-queried when it changes) — on other compositors the feature disables itself with a warning. Fullscreen games (and anything else that pins or rapidly slams the pointer into an edge) can trigger a switch mid-game; pause monux with the `--pause-shortcut` chord before gaming, or raise `--edge-dwell-ms`.
 
-**Switching back by edge:** the client can run the same detection on its own machine, so pushing the cursor against the opposite edge returns input to the server. Configure both sides (the client's only valid target is `auto`, meaning "the server" — a client has exactly one peer):
+**Switching back by edge:** the client can run the same detection on its own machine, so pushing the cursor against the opposite edge returns input to the server. Usually there is nothing to configure on the client: the server tells each mapped client which server edge it sits beyond (a `Telling client <fp> it is our <dir>-hand neighbor` log line), and the client infers the return trip from that — sitting beyond the server's right edge means watching its own *left* edge (`Server says we're its right-hand client: watching the left edge (inferred)`). The inference is re-applied on every (re)connect. An explicit `--edge-map` on the client always wins over the inference — configure it only to override what the server advertises (the client's only valid target is `auto`, meaning "the server" — a client has exactly one peer):
 
 ```bash
 monux server --edge-map right=auto    # push right: input goes to the client
-monux client --edge-map left=auto     # push left on the client: input comes back
+                                      # (the client infers: push left to come back)
+monux client --edge-map left=auto     # explicit override of the inferred edge
 ```
 
 While the client has input, dwelling on a mapped edge of the client machine sends a switch request to the server, which honors it only from the client that currently owns input (stale or foreign requests are ignored). The request carries the fraction along the edge where the cursor crossed (0.0–1.0); the server ignores it for now — it's reserved for future cursor warping — and the server's cursor is already parked at the edge the switch-out left from, so the pointer doesn't jump on the round trip. Detection on the client is quiet while disconnected and, like on the server, needs a Hyprland session (otherwise it disables itself with a warning); `--edge-dwell-ms` applies there too.

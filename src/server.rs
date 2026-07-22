@@ -102,6 +102,7 @@ pub async fn run_server_events_loop<O: output::OutputHandler>(
     mode: transport::NetworkMode,
     diagnostics: Arc<rotation::DiagnosticsMirror>,
     edge_client_tx: Option<watch::Sender<Vec<(SocketAddr, String)>>>,
+    edge_map: Option<crate::edge::EdgeMap>,
 ) -> Result<()> {
     let local_clipboard = LocalClipboard::start(
         config_dir.clone(),
@@ -114,6 +115,9 @@ pub async fn run_server_events_loop<O: output::OutputHandler>(
         rotation::Rotation::new(grab_tx, output_handler, local_clipboard, &config_dir, rotation_tx, motion_flush_interval, bulk_throttle_mbps, mode, diagnostics).await?;
     if let Some(tx) = edge_client_tx {
         rotation.set_edge_client_publisher(tx);
+    }
+    if let Some(map) = edge_map {
+        rotation.set_edge_map(map);
     }
     // Input-flow heartbeat: makes "user is typing but nothing arrives anywhere"
     // visible in the log, instead of silent (the dead-Enter investigations).

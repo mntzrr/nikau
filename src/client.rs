@@ -131,6 +131,8 @@ pub async fn run<O: output::OutputHandler>(
         scroll_scale,
         control_state,
         bulk_throttle_mbps,
+        edge_map.is_some(),
+        edge_dwell,
     )
     .await?;
     client.control_state.set_connected(client.conn().clone());
@@ -146,10 +148,12 @@ pub async fn run<O: output::OutputHandler>(
     if mode == transport::NetworkMode::Local {
         task::spawn(monitor_link(client.conn().clone()));
     }
-    // Screen-edge switching back to the server (opt-in via --edge-map): the
-    // detector runs per connection and queues the edge-crossing fraction
-    // here; the step loop turns it into a SwitchRequest on the events
-    // stream. Dropping the receiver (connection teardown) quiets it.
+    // Screen-edge switching back to the server: either an explicit --edge-map
+    // (spawned here per connection), or inferred from the server's EdgeInfo
+    // advertisement (see handle_event_messages) — explicit wins. The detector
+    // runs per connection and queues the edge-crossing fraction here; the
+    // step loop turns it into a SwitchRequest on the events stream. Dropping
+    // the receiver (connection teardown) quiets it.
     if let Some(map) = edge_map {
         let (request_tx, request_rx) = mpsc::unbounded_channel::<f64>();
         task::spawn(crate::edge::run_client(map, edge_dwell, request_tx));
@@ -236,6 +240,49 @@ struct Connection {
     /// messages on the events stream. None when the feature is off (no
     /// --edge-map, or the detector exited on an unavailable Hyprland IPC).
     switch_request_rx: Option<mpsc::UnboundedReceiver<f64>>,
+    /// Server-driven return-edge inference (see ServerEvent::EdgeInfo):
+    /// rebuilt per connection, so a reconnect re-applies whatever the new
+    /// connection's EdgeInfo says.
+    edge_inference: EdgeInference,
+    /// Dwell for the inferred edge detector (--edge-dwell-ms).
+    edge_dwell: Duration,
+}
+
+/// Per-connection state of server-driven edge inference (see
+/// ServerEvent::EdgeInfo): the server advertises which of ITS edges this
+/// client sits beyond, and the client watches the OPPOSITE edge of its own
+/// machine for the return trip — no --edge-map needed on the client. An
+/// explicit --edge-map always wins: advertisements are then ignored.
+struct EdgeInference {
+    /// Whether the user gave an explicit --edge-map (explicit wins).
+    explicit: bool,
+    /// The directions inferred so far on this connection (the opposites of
+    /// the server's advertised edges), each with target auto (the server is
+    /// a client's only peer).
+    map: crate::edge::EdgeMap,
+}
+
+impl EdgeInference {
+    fn new(explicit: bool) -> Self {
+        Self {
+            explicit,
+            map: crate::edge::EdgeMap::default(),
+        }
+    }
+
+    /// Applies one ServerEvent::EdgeInfo, returning the updated inferred map
+    /// when the detector should (re)start with it, or None when an explicit
+    /// --edge-map wins and the advertisement is ignored. The watched
+    /// direction is the OPPOSITE of the server's edge (the return trip).
+    fn apply(&mut self, direction: event::Direction) -> Option<crate::edge::EdgeMap> {
+        if self.explicit {
+            return None;
+        }
+        self.map
+            .targets
+            .insert(direction.opposite(), crate::edge::EdgeTarget::Auto);
+        Some(self.map.clone())
+    }
 }
 
 impl Connection {
@@ -250,6 +297,8 @@ impl Connection {
         scroll_scale: f64,
         control_state: Arc<crate::control::ClientStateMirror>,
         bulk_throttle_mbps: Option<f64>,
+        edge_map_explicit: bool,
+        edge_dwell: Duration,
     ) -> Result<(Self, Instant)> {
         let bind_addr: SocketAddr = match server_addr {
             SocketAddr::V4(_) => "0.0.0.0:0".parse().expect("Failed to parse 0.0.0.0:0"),
@@ -373,6 +422,8 @@ impl Connection {
                 scaler: DeltaScaler::new(mouse_scale, scroll_scale),
                 control_state,
                 switch_request_rx: None,
+                edge_inference: EdgeInference::new(edge_map_explicit),
+                edge_dwell,
             },
             connect_time,
         ))
@@ -733,6 +784,31 @@ impl Connection {
                         .write_all(&serializedmsg)
                         .await
                         .context("Failed to send pong message")?;
+                }
+                event::ServerEvent::EdgeInfo { direction } => {
+                    // Server-driven edge inference: the server told us which
+                    // of ITS edges we sit beyond, so we watch the OPPOSITE
+                    // edge of this machine for the return trip. Carries no
+                    // input state, so no pending_input flush.
+                    match self.edge_inference.apply(direction) {
+                        Some(map) => {
+                            info!(
+                                "Server says we're its {}-hand client: watching the {} edge (inferred)",
+                                direction.as_str(),
+                                direction.opposite().as_str()
+                            );
+                            // (Re)start the detector with the updated inferred
+                            // map: dropping the old receiver quiets the
+                            // previous detector (edge.rs client mode).
+                            let (request_tx, request_rx) = mpsc::unbounded_channel::<f64>();
+                            task::spawn(crate::edge::run_client(map, self.edge_dwell, request_tx));
+                            self.switch_request_rx = Some(request_rx);
+                        }
+                        None => debug!(
+                            "Server says we're its {}-hand client, but --edge-map was given explicitly: keeping it",
+                            direction.as_str()
+                        ),
+                    }
                 }
             }
             offset += consumed;
@@ -1480,5 +1556,55 @@ mod tests {
         );
         let t2 = t1 + LINK_NOTIFY_COOLDOWN + Duration::from_secs(1);
         assert_eq!(m.check(Duration::from_millis(80), 0.0, t2), LinkVerdict::Degraded);
+    }
+
+    #[test]
+    fn edge_inference_applies_the_opposite_edge_when_absent() {
+        // No explicit --edge-map: the server's advertisement is honored.
+        let mut inference = EdgeInference::new(false);
+        let map = inference
+            .apply(event::Direction::Right)
+            .expect("inference should apply");
+        assert_eq!(
+            map.targets[&event::Direction::Left],
+            crate::edge::EdgeTarget::Auto
+        );
+        assert_eq!(map.targets.len(), 1);
+        // Vertical edges invert too.
+        let map = inference
+            .apply(event::Direction::Top)
+            .expect("inference should apply");
+        assert_eq!(map.targets.len(), 2);
+        assert_eq!(
+            map.targets[&event::Direction::Bottom],
+            crate::edge::EdgeTarget::Auto
+        );
+    }
+
+    #[test]
+    fn edge_inference_explicit_edge_map_wins() {
+        // An explicit --edge-map makes the server's advertisement moot.
+        let mut inference = EdgeInference::new(true);
+        assert!(inference.apply(event::Direction::Right).is_none());
+        assert!(inference.map.targets.is_empty());
+    }
+
+    #[test]
+    fn edge_inference_resets_per_connection() {
+        // A fresh connection starts with a clean slate (Connection::new builds
+        // a fresh EdgeInference), so a reconnect re-applies whatever the new
+        // connection's EdgeInfo says instead of inheriting stale directions.
+        let mut inference = EdgeInference::new(false);
+        inference.apply(event::Direction::Right);
+        let mut reconnected = EdgeInference::new(false);
+        assert!(reconnected.map.targets.is_empty());
+        let map = reconnected
+            .apply(event::Direction::Bottom)
+            .expect("inference should apply");
+        assert_eq!(map.targets.len(), 1);
+        assert_eq!(
+            map.targets[&event::Direction::Top],
+            crate::edge::EdgeTarget::Auto
+        );
     }
 }

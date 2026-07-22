@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -16,6 +16,7 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::clipboard::{CLIPBOARD_SERVE_TIMEOUT_SECS, data, server};
 use crate::device;
+use crate::edge;
 use crate::msgs::{bulk, event};
 use crate::network::throttle::BulkThrottle;
 use crate::network::transport::NetworkMode;
@@ -581,6 +582,11 @@ pub struct Rotation<O: device::output::OutputHandler> {
     /// against it on every change and at switch time. None when --edge-map
     /// isn't in use.
     edge_client_tx: Option<watch::Sender<Vec<(SocketAddr, String)>>>,
+    /// The server's --edge-map, used by add_client to tell each mapped client
+    /// which server edge it sits beyond (ServerEvent::EdgeInfo), so the
+    /// client can infer the return-trip edge without its own --edge-map.
+    /// None when --edge-map isn't in use.
+    edge_map: Option<edge::EdgeMap>,
 }
 
 /// Computes the target of a previous-client switch (None = local machine).
@@ -660,6 +666,30 @@ fn resolve_goto(clients: &[(SocketAddr, &str)], fingerprint: &str) -> GotoResolu
     }
 }
 
+/// The --edge-map directions a client sits beyond: every direction whose
+/// target resolves to the client's fingerprint against the LIVE client list —
+/// the same resolution semantics as the edge switch itself (auto / fingerprint
+/// prefix / hostname; see edge::resolve_edge_target). Unresolvable targets
+/// (e.g. `auto` with two clients connected) simply yield no EdgeInfo for that
+/// direction. A free function so the matching is testable: ClientInfo embeds
+/// quinn handles and can't be fabricated in a unit test.
+fn edge_info_directions(
+    map: &edge::EdgeMap,
+    clients: &[(SocketAddr, String)],
+    fingerprint: &str,
+    resolve_host: &dyn Fn(&str) -> Vec<IpAddr>,
+) -> Vec<event::Direction> {
+    map.targets
+        .iter()
+        .filter(|(_, target)| {
+            edge::resolve_edge_target(target, clients, resolve_host)
+                .map(|resolved| resolved == fingerprint)
+                .unwrap_or(false)
+        })
+        .map(|(direction, _)| *direction)
+        .collect()
+}
+
 impl<O: device::output::OutputHandler> Rotation<O> {
     pub async fn new(
         grab_tx: watch::Sender<device::GrabState>,
@@ -715,6 +745,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             went_local_via_silence: false,
             diagnostics,
             edge_client_tx: None,
+            edge_map: None,
         })
     }
 
@@ -729,6 +760,13 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             let _ = tx.send(entries);
         }
         self.edge_client_tx = Some(tx);
+    }
+
+    /// Hands the rotation the server's --edge-map so add_client can tell each
+    /// mapped client which server edge it sits beyond (ServerEvent::EdgeInfo).
+    /// Called once from the server events loop when --edge-map is in use.
+    pub fn set_edge_map(&mut self, map: edge::EdgeMap) {
+        self.edge_map = Some(map);
     }
 
     /// The current client list as (endpoint, fingerprint) pairs, in the
@@ -895,6 +933,38 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                 .join(", ")
         );
         notify_client_joined(&endpoint);
+
+        // Server-driven edge inference (ServerEvent::EdgeInfo): tell the new
+        // client which of our edges it sits beyond, so it watches the
+        // OPPOSITE edge for the return trip without its own --edge-map. Sent
+        // BEFORE any Switch(true) below, on this ordered events stream (the
+        // same ordering discipline as the clipboard types push further down):
+        // the client's inferred detector is running before its first
+        // activation. Unmapped clients get nothing.
+        let edge_info_directions = match &self.edge_map {
+            Some(map) => edge_info_directions(
+                map,
+                &self.edge_client_entries(),
+                &fingerprint,
+                &edge::resolve_hostname,
+            ),
+            None => Vec::new(),
+        };
+        for direction in edge_info_directions {
+            info!(
+                "Telling client {} it is our {}-hand neighbor",
+                fingerprint,
+                direction.as_str()
+            );
+            if let Err(e) = self
+                .send_event(&endpoint, event::ServerEvent::EdgeInfo { direction })
+                .await
+            {
+                // This shouldn't happen in practice, given we just added the client...
+                warn!("Newly added client already failed and was removed: {:?}", e);
+                break;
+            }
+        }
 
         // Announce clipboard to client, if its IP doesn't match the clipboard owner's IP.
         // Matching IP would indicate that the client is reconnecting but we haven't disconnected the old one yet.
@@ -3357,6 +3427,77 @@ mod tests {
             resolve_goto(&clients, "aaaa"),
             GotoResolution::Ambiguous(vec![clients[0].0, clients[1].0])
         );
+    }
+
+    fn edge_client_entries(specs: &[(&str, &str)]) -> Vec<(SocketAddr, String)> {
+        specs
+            .iter()
+            .map(|(addr, fp)| (addr.parse().unwrap(), fp.to_string()))
+            .collect()
+    }
+
+    fn no_ips(_: &str) -> Vec<IpAddr> {
+        vec![]
+    }
+
+    fn edge_map_of(specs: &[&str]) -> edge::EdgeMap {
+        edge::parse_edge_map(&specs.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+            .unwrap()
+    }
+
+    #[test]
+    fn edge_info_auto_resolves_to_the_single_client() {
+        // --edge-map right=auto with exactly one client: it gets Right.
+        let clients = edge_client_entries(&[("10.0.0.1:9000", "aaaa1111")]);
+        let map = edge_map_of(&["right=auto"]);
+        assert_eq!(
+            edge_info_directions(&map, &clients, "aaaa1111", &no_ips),
+            vec![event::Direction::Right]
+        );
+        // A different fingerprint (not connected) gets nothing.
+        assert!(edge_info_directions(&map, &clients, "bbbb2222", &no_ips).is_empty());
+    }
+
+    #[test]
+    fn edge_info_only_mapped_clients() {
+        // Two clients, a prefix target: only the mapped client is told.
+        let clients = edge_client_entries(&[
+            ("10.0.0.1:9000", "aaaa1111"),
+            ("10.0.0.2:9000", "bbbb2222"),
+        ]);
+        let map = edge_map_of(&["right=bbbb"]);
+        assert_eq!(
+            edge_info_directions(&map, &clients, "bbbb2222", &no_ips),
+            vec![event::Direction::Right]
+        );
+        assert!(edge_info_directions(&map, &clients, "aaaa1111", &no_ips).is_empty());
+        // 'auto' with two clients connected is ambiguous: no EdgeInfo at all.
+        let map = edge_map_of(&["right=auto"]);
+        assert!(edge_info_directions(&map, &clients, "aaaa1111", &no_ips).is_empty());
+        assert!(edge_info_directions(&map, &clients, "bbbb2222", &no_ips).is_empty());
+    }
+
+    #[test]
+    fn edge_info_hostname_and_multiple_directions() {
+        // A hostname target resolves by IP, and one client can sit beyond
+        // several edges (BTreeMap order: Left < Right < Top < Bottom).
+        let clients = edge_client_entries(&[
+            ("10.0.0.1:9000", "aaaa1111"),
+            ("10.0.0.2:9000", "bbbb2222"),
+        ]);
+        let resolver = |name: &str| -> Vec<IpAddr> {
+            match name {
+                "laptop" => vec!["10.0.0.2".parse().unwrap()],
+                _ => vec![],
+            }
+        };
+        let map = edge_map_of(&["top=laptop,bottom=bbbb,right=auto"]);
+        assert_eq!(
+            edge_info_directions(&map, &clients, "bbbb2222", &resolver),
+            vec![event::Direction::Top, event::Direction::Bottom]
+        );
+        // The other client matches nothing ('auto' is ambiguous with two).
+        assert!(edge_info_directions(&map, &clients, "aaaa1111", &resolver).is_empty());
     }
 
     #[tokio::test]

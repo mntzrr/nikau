@@ -301,11 +301,13 @@ struct ClientArgs {
 
     /// Switching BACK to the server by screen edge (Hyprland only for now):
     /// while this client has input, pushing the cursor against this screen
-    /// edge and dwelling there asks the server to take input back. Same
-    /// syntax as the server's --edge-map, but the only valid target is
-    /// 'auto' (the server — a client has exactly one peer). Multi-monitor
-    /// setups expose only the outer edge segments; ~8% at each end of a
-    /// segment is a corner dead zone.
+    /// edge and dwelling there asks the server to take input back. Usually
+    /// unnecessary: when the server maps this client to one of its edges, the
+    /// client infers the opposite edge automatically — this flag overrides
+    /// that inference. Same syntax as the server's --edge-map, but the only
+    /// valid target is 'auto' (the server — a client has exactly one peer).
+    /// Multi-monitor setups expose only the outer edge segments; ~8% at each
+    /// end of a segment is a corner dead zone.
     #[arg(long, value_name = "direction=auto")]
     edge_map: Option<Vec<String>>,
 
@@ -972,14 +974,16 @@ async fn server(
     // layer-shell strips and dwell timers, resolves targets against the live
     // client list that the rotation loop publishes through this watch channel,
     // and fires switches as Event::SwitchTo — the same entry point as goto
-    // chords, so debounce/pause/no-op cleanup all apply.
-    let edge_client_tx = match edge_map {
+    // chords, so debounce/pause/no-op cleanup all apply. The rotation loop
+    // also keeps a copy of the map itself, to tell each mapped client which
+    // edge it sits beyond (ServerEvent::EdgeInfo; see rotation.rs add_client).
+    let (edge_client_tx, edge_map) = match edge_map {
         Some(map) => {
             let (tx, rx) = watchchan::channel(Vec::new());
-            task::spawn(monux::edge::run(map, edge_dwell, event_tx.clone(), rx));
-            Some(tx)
+            task::spawn(monux::edge::run(map.clone(), edge_dwell, event_tx.clone(), rx));
+            (Some(tx), Some(map))
         }
-        None => None,
+        None => (None, None),
     };
 
     let key_combos = shortcut::parse_key_combos(keys_next, keys_prev, keys_goto, keys_pause)?;
@@ -1019,6 +1023,7 @@ async fn server(
             mode,
             diagnostics,
             edge_client_tx,
+            edge_map,
         )
         .await
     });
