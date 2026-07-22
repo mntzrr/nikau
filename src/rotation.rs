@@ -769,6 +769,57 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         self.edge_map = Some(map);
     }
 
+    /// Sends EdgeInfo for every edge-map direction resolving to this client,
+    /// so it can infer its return edge (see ServerEvent::EdgeInfo). Used at
+    /// add time and to re-advertise when the topology changes (a peer's
+    /// removal can make 'auto' resolve to a remaining client).
+    async fn advertise_edge_info(&mut self, endpoint: &SocketAddr, fingerprint: &str) {
+        let Some(map) = &self.edge_map else {
+            return;
+        };
+        let directions = edge_info_directions(
+            map,
+            &self.edge_client_entries(),
+            fingerprint,
+            &edge::resolve_hostname,
+        );
+        for direction in directions {
+            info!(
+                "Telling client {} it is our {}-hand neighbor",
+                fingerprint,
+                direction.as_str()
+            );
+            // Direct write rather than send_event: this advertisement is
+            // best-effort, and send_event's removal-on-failure path would
+            // recurse back into this fn on topology-change re-advertising.
+            // Dead clients are removed by their connection handler anyway.
+            let serialized = match postcard::to_stdvec_cobs(&event::ServerEvent::EdgeInfo {
+                direction,
+            }) {
+                Ok(m) => m,
+                Err(e) => {
+                    error!("Failed to serialize EdgeInfo: {:?}", e);
+                    return;
+                }
+            };
+            let result = match self.clients.binary_search_by(|c| c.endpoint.cmp(endpoint)) {
+                Ok(idx) => {
+                    let events_send = &mut self
+                        .clients
+                        .get_mut(idx)
+                        .expect("client exists after binary_search")
+                        .events_send;
+                    events_send.write_all(&serialized).await
+                }
+                Err(_) => return,
+            };
+            if let Err(e) = result {
+                debug!("Failed to send EdgeInfo to {}: {:?}", endpoint, e);
+                return;
+            }
+        }
+    }
+
     /// The current client list as (endpoint, fingerprint) pairs, in the
     /// shape the edge switcher resolves --edge-map targets against.
     fn edge_client_entries(&self) -> Vec<(SocketAddr, String)> {
@@ -941,30 +992,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         // same ordering discipline as the clipboard types push further down):
         // the client's inferred detector is running before its first
         // activation. Unmapped clients get nothing.
-        let edge_info_directions = match &self.edge_map {
-            Some(map) => edge_info_directions(
-                map,
-                &self.edge_client_entries(),
-                &fingerprint,
-                &edge::resolve_hostname,
-            ),
-            None => Vec::new(),
-        };
-        for direction in edge_info_directions {
-            info!(
-                "Telling client {} it is our {}-hand neighbor",
-                fingerprint,
-                direction.as_str()
-            );
-            if let Err(e) = self
-                .send_event(&endpoint, event::ServerEvent::EdgeInfo { direction })
-                .await
-            {
-                // This shouldn't happen in practice, given we just added the client...
-                warn!("Newly added client already failed and was removed: {:?}", e);
-                break;
-            }
-        }
+        self.advertise_edge_info(&endpoint, &fingerprint).await;
 
         // Announce clipboard to client, if its IP doesn't match the clipboard owner's IP.
         // Matching IP would indicate that the client is reconnecting but we haven't disconnected the old one yet.
@@ -2769,6 +2797,17 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             }
         }
         self.publish_edge_clients();
+        // Topology changed: re-advertise so remaining clients that have
+        // become resolvable (e.g. 'auto' with one peer left) learn their
+        // return edge too. Re-sends are idempotent on the client.
+        let remaining: Vec<(SocketAddr, String)> = self
+            .clients
+            .iter()
+            .map(|c| (c.endpoint, c.fingerprint.clone()))
+            .collect();
+        for (endpoint, fingerprint) in remaining {
+            self.advertise_edge_info(&endpoint, &fingerprint).await;
+        }
         let client_list = self
             .clients
             .iter()

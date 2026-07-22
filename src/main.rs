@@ -232,6 +232,9 @@ struct ServerArgs {
     /// prefix (see the 'Added client ...' log line), a hostname, or 'auto' for
     /// exactly-one-connected-client. Multi-monitor setups expose only the outer
     /// edge segments; ~8% at each end of a segment is a corner dead zone.
+    /// The server also advertises this layout to each mapped client (protocol
+    /// v12+), so the client infers its return edge automatically — no client
+    /// --edge-map needed unless you want to override the inference.
     #[arg(long, value_name = "direction=target")]
     edge_map: Option<Vec<String>>,
 

@@ -1,6 +1,6 @@
 [package]
 name = "monux"
-version = "5.0.0"
+version = "5.0.1"
 authors = ["Nick Parker <nick@nickbp.com>"]
 license = "AGPL-3.0-or-later"
 edition = "2021"
