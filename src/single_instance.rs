@@ -188,3 +188,23 @@ fn write_pid(file: &fs::File) {
 fn read_pid(path: &PathBuf) -> Option<i32> {
     fs::read_to_string(path).ok()?.trim().strip_prefix("pid ")?.parse().ok()
 }
+
+/// The pid of the live holder of the `kind` lock, if there is one: the lock
+/// file records a pid and that process is alive and looks like monux running
+/// the matching kind. Read-only role detection (e.g. the update gate decides
+/// whether this machine is a pure server) — it never disturbs the lock.
+pub fn live_holder(kind: &str) -> Option<i32> {
+    let pid = read_pid(&lock_path(kind))?;
+    if pid == std::process::id() as i32 {
+        return None;
+    }
+    let comm = fs::read_to_string(format!("/proc/{}/comm", pid)).ok()?;
+    let cmdline = fs::read_to_string(format!("/proc/{}/cmdline", pid))
+        .map(|s| s.replace('\0', " "))
+        .ok()?;
+    if comm.trim() == "monux" && cmdline.contains(kind) {
+        Some(pid)
+    } else {
+        None
+    }
+}

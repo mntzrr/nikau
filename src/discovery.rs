@@ -254,6 +254,7 @@ fn collect_server_protocol_versions(daemon: &ServiceDaemon) -> Result<Vec<u64>> 
         .browse(SERVICE_TYPE)
         .context("Failed to browse for Monux servers")?;
     let deadline = Instant::now() + SERVER_VERSION_DISCOVERY_TIMEOUT;
+    let own_instance = get_hostname().unwrap_or_default();
     let mut versions = BTreeSet::new();
     loop {
         let remaining = match deadline.checked_duration_since(Instant::now()) {
@@ -264,12 +265,23 @@ fn collect_server_protocol_versions(daemon: &ServiceDaemon) -> Result<Vec<u64>> 
             Ok(ServiceEvent::ServiceResolved(resolved)) => {
                 match protocol_version_of(resolved.get_properties()) {
                     Some(version) => {
-                        debug!(
-                            "Discovered Monux server {} advertising protocol v{}",
-                            resolved.get_fullname(),
-                            version
-                        );
-                        versions.insert(version);
+                        let instance = instance_name_of(resolved.get_fullname());
+                        if instance == own_instance {
+                            // Our own advertisement must not gate our own
+                            // update: a server leads protocol upgrades — the
+                            // gate exists for client machines.
+                            debug!(
+                                "Ignoring our own mDNS advertisement of protocol v{} for the update gate",
+                                version
+                            );
+                        } else {
+                            debug!(
+                                "Discovered Monux server {} advertising protocol v{}",
+                                resolved.get_fullname(),
+                                version
+                            );
+                            versions.insert(version);
+                        }
                     }
                     None => debug!(
                         "Discovered Monux server {} without a protocol version; skipping it",
@@ -284,6 +296,14 @@ fn collect_server_protocol_versions(daemon: &ServiceDaemon) -> Result<Vec<u64>> 
         }
     }
     Ok(versions.into_iter().collect())
+}
+
+/// The instance-name part of a service fullname (everything before the
+/// service-type suffix), e.g. "myhost" from "myhost._monux._udp.local.".
+fn instance_name_of(fullname: &str) -> &str {
+    fullname
+        .strip_suffix(&format!(".{}", SERVICE_TYPE))
+        .unwrap_or(fullname)
 }
 
 /// Picks an address to connect to. A server may advertise several addresses
@@ -441,6 +461,13 @@ mod tests {
         assert_eq!(protocol_version_of(&empty), None);
         let junk = HashMap::from([("pv".to_string(), "eight".to_string())]).into_txt_properties();
         assert_eq!(protocol_version_of(&junk), None);
+    }
+
+    #[test]
+    fn instance_name_strips_the_service_type() {
+        assert_eq!(instance_name_of("myhost._monux._udp.local."), "myhost");
+        // No suffix present: the name is returned unchanged.
+        assert_eq!(instance_name_of("myhost"), "myhost");
     }
 
     #[test]

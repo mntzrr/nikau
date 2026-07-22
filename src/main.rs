@@ -519,6 +519,15 @@ fn main() -> Result<()> {
             let constraint = if args.force {
                 // --force bypasses the gate; skip the discovery delay.
                 None
+            } else if single_instance::live_holder("server").is_some()
+                && single_instance::live_holder("client").is_none()
+            {
+                // This machine runs a monux server and no client: it leads
+                // protocol upgrades, and the gate must not block it (its own
+                // mDNS advertisement or a stale client-role record would
+                // otherwise refuse the update).
+                info!("This machine runs a monux server and no client: the protocol-compatibility gate does not apply");
+                None
             } else {
                 let config_dir = home::home_dir().map(|h| h.join(".config").join("monux"));
                 refresh_protocol_constraint(config_dir.as_deref())
