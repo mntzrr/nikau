@@ -193,12 +193,11 @@ fn create_socket(bind_addr: SocketAddr, mode: NetworkMode) -> Result<std::net::U
         }
     };
     if bind_ret != 0 {
+        let e = std::io::Error::last_os_error();
         close_fd();
-        bail!(
-            "Failed to bind UDP socket to {}: {}",
-            bind_addr,
-            std::io::Error::last_os_error()
-        );
+        // Keep the io error in the chain: callers (and the bind retry in
+        // server.rs) match on its raw errno.
+        return Err(e).with_context(|| format!("Failed to bind UDP socket to {}", bind_addr));
     }
 
     // Now hand ownership to std::net::UdpSocket.

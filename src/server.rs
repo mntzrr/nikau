@@ -7,7 +7,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use tokio::sync::{mpsc, watch};
 use tokio::task;
 use tokio::time;
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::clipboard::data::ClipboardData;
 use crate::clipboard::server::LocalClipboard;
@@ -141,6 +141,45 @@ pub async fn run_server_events_loop<O: output::OutputHandler>(
     }
 }
 
+/// A previous instance releases the single-instance lock before its endpoint
+/// socket finishes closing (teardown ordering), so a takeover can arrive
+/// while the port is still draining: retry briefly on EADDRINUSE instead of
+/// dying (seen in the wild when a manual start took over from an auto-update
+/// restart).
+async fn bind_server_with_retry(
+    listen_addr: &SocketAddr,
+    cert_verifier: Arc<approval::MonuxCertVerification<'static>>,
+    mode: transport::NetworkMode,
+) -> Result<quinn::Endpoint> {
+    const MAX_RETRIES: u32 = 10;
+    let mut attempt = 0u32;
+    loop {
+        match transport::build_server(listen_addr, cert_verifier.clone(), mode) {
+            Ok(endpoint) => return Ok(endpoint),
+            Err(e) if is_addr_in_use(&e) && attempt < MAX_RETRIES => {
+                attempt += 1;
+                info!(
+                    "Port {} is still held (previous instance finishing teardown?), retrying bind in 500ms (attempt {}/{})",
+                    listen_addr.port(),
+                    attempt,
+                    MAX_RETRIES
+                );
+                time::sleep(Duration::from_millis(500)).await;
+            }
+            Err(e) => return Err(e).context("Failed to set up server endpoint"),
+        }
+    }
+}
+
+/// Whether the error chain contains an EADDRINUSE io error.
+fn is_addr_in_use(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.raw_os_error() == Some(libc::EADDRINUSE))
+    })
+}
+
 pub async fn run_server_connections_loop(
     listen_addr: &SocketAddr,
     cert_verifier: Arc<approval::MonuxCertVerification<'static>>,
@@ -149,8 +188,7 @@ pub async fn run_server_connections_loop(
     rotation_tx: mpsc::Sender<rotation::RotationEvent>,
     mode: transport::NetworkMode,
 ) -> Result<()> {
-    let server_endpoint = transport::build_server(listen_addr, cert_verifier, mode)
-        .context("Failed to set up server endpoint")?;
+    let server_endpoint = bind_server_with_retry(listen_addr, cert_verifier, mode).await?;
     // How long a single connection handshake may take before it is dropped.
     // Local mode must outlast the interactive approval prompt (60s), which runs
     // inside the handshake. Www mode never prompts, so it can be much stricter.

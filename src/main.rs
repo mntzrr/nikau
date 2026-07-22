@@ -917,7 +917,7 @@ async fn server(
     }
     let input_handler = input::InputHandler::new(&key_combos, event_tx)?;
 
-    let watch_handle = task::spawn(async move {
+    let mut watch_handle = task::spawn(async move {
         let device_handles =
             handles::DeviceHandles::new(input_handler, grab_tx, key_combos.all_keys);
         watch::watch_loop(device_handles, device_filters, virtual_nodes)
@@ -931,7 +931,7 @@ async fn server(
 
     let (rotation_tx, rotation_rx) = mpsc::channel::<rotation::RotationEvent>(256);
     let rotation_tx2 = rotation_tx.clone();
-    let server_events_handle = task::spawn(async move {
+    let mut server_events_handle = task::spawn(async move {
         server::run_server_events_loop(
             config_dir,
             event_rx,
@@ -950,7 +950,7 @@ async fn server(
         )
         .await
     });
-    let server_connections_handle = task::spawn(async move {
+    let mut server_connections_handle = task::spawn(async move {
         server::run_server_connections_loop(
             &listen_addr,
             verifier,
@@ -987,19 +987,20 @@ async fn server(
     if let Some(exit_secs) = exit_secs {
         info!("Exiting in {} seconds...", exit_secs);
         tokio::select! {
-            watch_exit = watch_handle => {
+            watch_exit = &mut watch_handle => {
                 watch_exit?.context("Failed to watch input events, exiting early")?
             },
-            server_events_exit = server_events_handle => {
+            server_events_exit = &mut server_events_handle => {
                 server_events_exit?.context("Server events loop failed, exiting early")?
             },
-            server_connections_exit = server_connections_handle => {
+            server_connections_exit = &mut server_connections_handle => {
                 server_connections_exit?.context("Server connections loop failed, exiting early")?
             },
             _timeout = time::sleep(Duration::from_secs(exit_secs as u64)) => {
                 info!("Exiting automatically as requested (--exit-secs={})", exit_secs);
             },
             _signal = shutdown_signal() => {
+                close_loops(watch_handle, server_events_handle, server_connections_handle).await;
                 // Dropping _mdns_registration here sends the mDNS goodbye.
                 // The active-client state file is deliberately left in place:
                 // a restart (e.g. after 'monux update') resumes the session
@@ -1011,16 +1012,17 @@ async fn server(
         };
     } else {
         tokio::select! {
-            watch_exit = watch_handle => {
+            watch_exit = &mut watch_handle => {
                 watch_exit?.context("Failed to watch input events, exiting")?
             },
-            server_events_exit = server_events_handle => {
+            server_events_exit = &mut server_events_handle => {
                 server_events_exit?.context("Server events loop failed, exiting early")?
             },
-            server_connections_exit = server_connections_handle => {
+            server_connections_exit = &mut server_connections_handle => {
                 server_connections_exit?.context("Server connections loop failed, exiting early")?
             },
             _signal = shutdown_signal() => {
+                close_loops(watch_handle, server_events_handle, server_connections_handle).await;
                 // Dropping _mdns_registration here sends the mDNS goodbye.
                 // The active-client state file is deliberately left in place:
                 // a restart (e.g. after 'monux update') resumes the session
@@ -1032,6 +1034,24 @@ async fn server(
         }
     }
     Ok(())
+}
+
+/// Aborts the spawned loop tasks and waits for them to drop their state.
+/// The connections loop owns the UDP endpoint, and the single-instance lock
+/// is released as soon as server() returns — a socket that outlives the lock
+/// makes the next instance's bind fail with EADDRINUSE (seen in the wild when
+/// a manual start took over from an auto-update restart).
+async fn close_loops(
+    watch_handle: task::JoinHandle<Result<()>>,
+    server_events_handle: task::JoinHandle<Result<()>>,
+    server_connections_handle: task::JoinHandle<Result<()>>,
+) {
+    watch_handle.abort();
+    server_events_handle.abort();
+    server_connections_handle.abort();
+    let _ = watch_handle.await;
+    let _ = server_events_handle.await;
+    let _ = server_connections_handle.await;
 }
 
 /// A failed connection that had survived beyond this was a healthy session: its
