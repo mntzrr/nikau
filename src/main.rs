@@ -46,13 +46,9 @@ enum Commands {
     Client(ClientArgs),
 
     /// Manages this machine's system integration for monux: persisting
-    /// machine-local settings (setup) and removing monux again (uninstall)
+    /// machine-local settings (setup), updating monux, and removing it again
+    /// (uninstall)
     System(SystemArgs),
-
-    /// Updates monux to the latest version from GitHub, rebuilding from
-    /// source. The server protocol-compatibility gate is first refreshed
-    /// from the mDNS advertisements of servers on the LAN.
-    Update(UpdateArgs),
 }
 
 #[derive(Args)]
@@ -76,6 +72,11 @@ enum SystemCommands {
     /// Lists the server's connected clients with fingerprint prefixes and
     /// resolved edge directions — the reference for configuring --edge-map.
     Clients(ClientsArgs),
+
+    /// Updates monux to the latest version from GitHub, rebuilding from
+    /// source. The server protocol-compatibility gate is first refreshed
+    /// from the mDNS advertisements of servers on the LAN.
+    Update(UpdateArgs),
 
     /// Runs a StatusNotifierItem tray indicator for the local monux daemon:
     /// a colored dot (green = input local, blue = input on a client, grey =
@@ -536,6 +537,31 @@ fn main() -> Result<()> {
                 println!("{}", out);
                 return Ok(());
             }
+            SystemCommands::Update(args) => {
+                // Gate on the server's protocol version when this machine acts as
+                // a client, so an update can't break the connection. The version
+                // recorded at the last handshake can be stale (the server upgraded
+                // while this client was away), so refresh it from the servers'
+                // mDNS advertisements first; the config dir may not exist yet, the
+                // constraint is simply absent then.
+                let constraint = if args.force {
+                    // --force bypasses the gate; skip the discovery delay.
+                    None
+                } else if single_instance::live_holder("server").is_some()
+                    && single_instance::live_holder("client").is_none()
+                {
+                    // This machine runs a monux server and no client: it leads
+                    // protocol upgrades, and the gate must not block it (its own
+                    // mDNS advertisement or a stale client-role record would
+                    // otherwise refuse the update).
+                    info!("This machine runs a monux server and no client: the protocol-compatibility gate does not apply");
+                    None
+                } else {
+                    let config_dir = home::home_dir().map(|h| h.join(".config").join("monux"));
+                    refresh_protocol_constraint(config_dir.as_deref())
+                };
+                return monux::update::run(args.force, false, constraint).map(|_| ());
+            }
             SystemCommands::Tray(args) => {
                 let hide = matches!(args.action, TrayAction::Hide);
                 let out = monux::control::tray_cli(hide, args.socket.as_deref())?;
@@ -561,31 +587,6 @@ fn main() -> Result<()> {
                 return monux::indicator::run();
             }
         },
-        Commands::Update(args) => {
-            // Gate on the server's protocol version when this machine acts as
-            // a client, so an update can't break the connection. The version
-            // recorded at the last handshake can be stale (the server upgraded
-            // while this client was away), so refresh it from the servers'
-            // mDNS advertisements first; the config dir may not exist yet, the
-            // constraint is simply absent then.
-            let constraint = if args.force {
-                // --force bypasses the gate; skip the discovery delay.
-                None
-            } else if single_instance::live_holder("server").is_some()
-                && single_instance::live_holder("client").is_none()
-            {
-                // This machine runs a monux server and no client: it leads
-                // protocol upgrades, and the gate must not block it (its own
-                // mDNS advertisement or a stale client-role record would
-                // otherwise refuse the update).
-                info!("This machine runs a monux server and no client: the protocol-compatibility gate does not apply");
-                None
-            } else {
-                let config_dir = home::home_dir().map(|h| h.join(".config").join("monux"));
-                refresh_protocol_constraint(config_dir.as_deref())
-            };
-            return monux::update::run(args.force, false, constraint).map(|_| ());
-        }
         _ => {}
     }
 
@@ -606,8 +607,8 @@ fn main() -> Result<()> {
     );
 
     match cli.command {
-        Commands::System(_) | Commands::Update(_) => {
-            unreachable!("system commands and update are handled before runtime initialization")
+        Commands::System(_) => {
+            unreachable!("system commands are handled before runtime initialization")
         }
         Commands::Server(args) => {
             if args.port == 0 {

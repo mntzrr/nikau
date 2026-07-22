@@ -85,7 +85,7 @@ esac
 echo
 echo "Run server: monux server   (as your user; needs 'input' group + /dev/uinput access)"
 echo "Run client: monux client [host]"
-echo "Update later with: monux update"
+echo "Update later with: monux system update"
 echo
 echo "If device permissions aren't set up, run 'monux system setup' (elevates via sudo),"
 echo "or fall back to: sudo -E monux server"

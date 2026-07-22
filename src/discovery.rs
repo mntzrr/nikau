@@ -14,7 +14,7 @@ const SERVICE_TYPE: &str = "_monux._udp.local.";
 /// of waiting for a handshake.
 const PROTOCOL_VERSION_PROPERTY: &str = "pv";
 
-/// How long `monux update` browses for advertised server protocol versions
+/// How long `monux system update` browses for advertised server protocol versions
 /// before falling back to the recorded gate value: long enough for a running
 /// server to answer, short enough that the command doesn't appear to hang.
 const SERVER_VERSION_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(2);
@@ -237,7 +237,7 @@ pub fn protocol_version_constraint(discovered: &[u64]) -> Option<u64> {
 }
 
 /// Synchronously collects the distinct protocol versions (sorted) advertised
-/// by Monux servers on the LAN, for the update gate in `monux update` — which
+/// by Monux servers on the LAN, for the update gate in `monux system update` — which
 /// runs before the tokio runtime exists, hence the blocking API. Best-effort
 /// within a short timeout; servers without the property are skipped.
 pub fn discover_server_protocol_versions() -> Result<Vec<u64>> {

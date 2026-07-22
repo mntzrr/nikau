@@ -68,7 +68,7 @@ Remove or edit `.cargo/config.toml` and change `target-cpu=native` to `target-cp
 ## Updating
 
 ```bash
-monux update
+monux system update
 ```
 
 This pulls the latest source from GitHub into `~/.cache/monux/src`, rebuilds it on this machine (with `target-cpu=native`), and installs over the existing binary. Run it on each machine (server and clients), then restart any running `monux server` / `monux client` to pick up the new version. `monux --version` prints the commit the binary was built from, so you can check that all machines match.
@@ -78,11 +78,11 @@ Updating never disrupts a running session: the processes keep their in-memory bi
 To pick up the new version, restart the processes — the session then heals itself:
 
 - **Server:** start `monux server` again however you normally run it (the new instance asks the old one to shut down and takes over). Clients reconnect within a few seconds, and the machine that was active is re-activated automatically — no client-side steps needed.
-- **Client:** run `monux update` on the client machine and restart the client there (e.g. over SSH). It reconnects and resumes by itself. With auto-update (below, on by default) it does both by itself — no remote access needed.
+- **Client:** run `monux system update` on the client machine and restart the client there (e.g. over SSH). It reconnects and resumes by itself. With auto-update (below, on by default) it does both by itself — no remote access needed.
 
 Active-session resumption survives server restarts for up to an hour (see `active_client` in `~/.config/monux`).
 
-**Protocol-compatibility gate:** a client never installs a build whose protocol version differs from its server's — such a build would be unable to reconnect. The client records the server's protocol version at every connection, including handshakes the server refused, and `monux update` (manual or automatic) checks the new source against it before building. Servers also advertise their protocol version via mDNS, so a manual `monux update` first refreshes the record from the LAN (gating on the lowest version when several servers answer) and only falls back to the last recorded version when no server answers. If they differ, the update is skipped with a log message telling you to update the server first; once the server is updated, the client learns the new version via mDNS or on its next (refused) connection attempt and the gate opens by itself. `monux update --force` bypasses the gate. Touchpad multitouch (gestures) requires protocol v9 or newer on both ends — earlier versions only forward single-touch pointer and button events — and mixed versions refuse to connect at the handshake anyway.
+**Protocol-compatibility gate:** a client never installs a build whose protocol version differs from its server's — such a build would be unable to reconnect. The client records the server's protocol version at every connection, including handshakes the server refused, and `monux system update`` (manual or automatic) checks the new source against it before building. Servers also advertise their protocol version via mDNS, so a manual `monux system update`` first refreshes the record from the LAN (gating on the lowest version when several servers answer) and only falls back to the last recorded version when no server answers. If they differ, the update is skipped with a log message telling you to update the server first; once the server is updated, the client learns the new version via mDNS or on its next (refused) connection attempt and the gate opens by itself. `monux system update` --force` bypasses the gate. Touchpad multitouch (gestures) requires protocol v9 or newer on both ends — earlier versions only forward single-touch pointer and button events — and mixed versions refuse to connect at the handshake anyway.
 
 ### Automatic updates
 

@@ -329,7 +329,7 @@ impl Connection {
         transport::send_version(&mut events_send).await?;
         let server_version = transport::recv_version(&mut events_recv, &mut event_bytes).await?;
         // Record the server's version (even on mismatch) for the update gate:
-        // 'monux update' refuses builds our server couldn't talk to. Recording
+        // 'monux system update' refuses builds our server couldn't talk to. Recording
         // a refused handshake too is what unblocks the gate after the server
         // upgrades ahead of us.
         crate::update::record_server_protocol_version(config_dir, server_version);
