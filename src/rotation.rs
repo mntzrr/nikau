@@ -254,6 +254,12 @@ pub struct ClipboardSendContentArgs {
 struct InputCounts {
     /// Physical events read from local devices.
     physical: u64,
+    /// Of `physical`: events from devices monux currently holds grabbed. Only
+    /// these have anywhere to go (forwarded to a client, or re-emitted
+    /// locally) — ungrabbed devices pass through to the local system by
+    /// design, so counting them in the swallow detector would false-positive
+    /// on pure mouse movement.
+    physical_grabbed: u64,
     /// Events forwarded to the remote client.
     forwarded: u64,
     /// Events emitted to local virtual devices.
@@ -1613,19 +1619,22 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                 counts.emitted_local as f64 / secs
             ),
         }
-        // Swallow detection: physical input arrived but had nowhere to go.
-        // The event threshold avoids false positives from a consumed switch combo.
-        // (The paused case returned above: dropped input is expected there.)
-        if counts.physical >= 8 {
+        // Swallow detection: input from GRABBED devices arrived but had
+        // nowhere to go. Ungrabbed (passthrough) devices never emit/forward
+        // by design, so they must not count here (mouse movement is not
+        // swallowed input). The event threshold avoids false positives from
+        // a consumed switch combo. (The paused case returned above: dropped
+        // input is expected there.)
+        if counts.physical_grabbed >= 8 {
             if self.current_client.is_some() && counts.forwarded == 0 {
                 warn!(
                     "INPUT SWALLOWED: {} physical events seen while switched to a client, but none were forwarded!",
-                    counts.physical
+                    counts.physical_grabbed
                 );
             } else if self.current_client.is_none() && counts.emitted_local == 0 {
                 warn!(
                     "INPUT SWALLOWED: {} physical events seen while local with devices grabbed, but none were emitted to the virtual devices!",
-                    counts.physical
+                    counts.physical_grabbed
                 );
             }
         }
@@ -1886,6 +1895,9 @@ impl<O: device::output::OutputHandler> Rotation<O> {
     pub async fn send_input_events(&mut self, batch: device::InputBatch) -> Result<()> {
         let event_count = batch.events.len() as u64;
         self.status_counts.physical += event_count;
+        if batch.is_grabbed {
+            self.status_counts.physical_grabbed += event_count;
+        }
         if self.paused {
             // Paused: all devices are ungrabbed, so the local machine already
             // sees this input raw. monux only keeps listening (for the pause
@@ -2447,12 +2459,24 @@ mod tests {
         };
         rotation.send_input_events(batch).await.unwrap();
         assert_eq!(rotation.status_counts.physical, 2);
+        assert_eq!(rotation.status_counts.physical_grabbed, 2);
         assert_eq!(rotation.status_counts.emitted_local, 2);
         assert_eq!(rotation.output_handler.written, 2);
+
+        // Events from ungrabbed (passthrough) devices don't count toward the
+        // swallow detector's grabbed tally (mouse movement is not a swallow).
+        let batch = device::InputBatch {
+            events: vec![i32_event(evdev::EventType::RELATIVE.0, 0, 5)],
+            is_grabbed: false,
+        };
+        rotation.send_input_events(batch).await.unwrap();
+        assert_eq!(rotation.status_counts.physical, 3);
+        assert_eq!(rotation.status_counts.physical_grabbed, 2);
 
         // The status log resets the window for the next interval.
         rotation.log_input_status();
         assert_eq!(rotation.status_counts.physical, 0);
+        assert_eq!(rotation.status_counts.physical_grabbed, 0);
         assert_eq!(rotation.status_counts.emitted_local, 0);
         let _ = fs::remove_dir_all(&dir);
     }

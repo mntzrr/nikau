@@ -87,11 +87,20 @@ impl DiscoveryRegistration {
 
 impl Drop for DiscoveryRegistration {
     fn drop(&mut self) {
-        if let Err(e) = self.daemon.unregister(&self.fullname) {
-            warn!("Failed to unregister mDNS service: {}", e);
+        // Wait for each response (with a timeout) instead of dropping the
+        // receivers: the daemon thread error-logs "failed to send response"
+        // when it can't deliver the status to a dropped receiver.
+        match self.daemon.unregister(&self.fullname) {
+            Ok(resp) => {
+                let _ = resp.recv_timeout(std::time::Duration::from_secs(2));
+            }
+            Err(e) => warn!("Failed to unregister mDNS service: {}", e),
         }
-        if let Err(e) = self.daemon.shutdown() {
-            warn!("Failed to shutdown mDNS daemon: {}", e);
+        match self.daemon.shutdown() {
+            Ok(resp) => {
+                let _ = resp.recv_timeout(std::time::Duration::from_secs(2));
+            }
+            Err(e) => warn!("Failed to shutdown mDNS daemon: {}", e),
         }
     }
 }
