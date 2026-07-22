@@ -659,6 +659,20 @@ impl Connection {
                         debug!("Ignoring clipboard types from server: {}", types.types);
                     }
                 }
+                event::ServerEvent::Ping => {
+                    // Server liveness check: answer immediately on this same
+                    // ordered, reliable events stream. The server counts ANY
+                    // received message as liveness; the pong is what an
+                    // otherwise idle client has to say. No pending_input
+                    // flush: the pong carries no input state and must not
+                    // wait behind a burst of queued input.
+                    let serializedmsg = postcard::to_stdvec_cobs(&event::ClientEvent::Pong)
+                        .map_err(|e| anyhow!("Failed to serialize pong message: {:?}", e))?;
+                    self.events_send
+                        .write_all(&serializedmsg)
+                        .await
+                        .context("Failed to send pong message")?;
+                }
             }
             offset += consumed;
         }

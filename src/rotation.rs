@@ -127,6 +127,80 @@ impl DefunctClientInfo {
     }
 }
 
+/// How often the server sends a Ping to the current client (and to any
+/// silenced client) on the events stream (see ServerEvent::Ping).
+pub const PING_INTERVAL: Duration = Duration::from_secs(2);
+
+/// How many consecutive ping intervals may go unanswered before the current
+/// client is declared silent: 3 x PING_INTERVAL ~= 6s. The server then
+/// switches to the local machine and ungrabs, WITHOUT removing the client or
+/// touching the connection — the QUIC idle timeout (25s) still owns actual
+/// removal. Until this fires, a black-holed link (WiFi) keeps devices
+/// grabbed and keystrokes buffer into the void.
+pub const PONG_MISS_LIMIT: u32 = 3;
+
+/// Consecutive pongs (or any messages) a silenced client must produce before
+/// it is re-activated automatically (see REACTIVATE_COOLDOWN).
+pub const REACTIVATE_PONGS: u32 = 3;
+
+/// Minimum time spent in the silenced state before automatic re-activation.
+/// Together with REACTIVATE_PONGS this hysteresis keeps a lossy-but-alive
+/// link from flapping the input grab between machines.
+pub const REACTIVATE_COOLDOWN: Duration = Duration::from_secs(5);
+
+/// Per-client liveness tracking for the app-level Ping/Pong check (see
+/// ServerEvent::Ping). Detects a black-holed link within seconds, where the
+/// QUIC idle timeout needs 25s — time during which grabbed input is
+/// silently lost.
+#[derive(Debug)]
+struct LivenessState {
+    /// When anything was last received from this client: ANY ClientEvent or
+    /// bulk bytes count as liveness (see server.rs), not just Pongs.
+    last_heard: Instant,
+    /// Some(since) while the client is marked silenced: it missed
+    /// PONG_MISS_LIMIT pings while current, so the server switched to the
+    /// local machine and ungrabbed. The client stays in the rotation and
+    /// keeps being pinged so its recovery can be heard.
+    silenced_since: Option<Instant>,
+    /// Consecutive messages received while silenced, for the re-activation
+    /// hysteresis (see REACTIVATE_PONGS). A fresh miss resets this to 0.
+    recovery_pongs: u32,
+}
+
+impl LivenessState {
+    /// Fresh state: just heard from, not silenced. A newly connected or
+    /// freshly switched-to client gets the full miss window before the
+    /// silence detector can fire.
+    fn new() -> Self {
+        LivenessState {
+            last_heard: Instant::now(),
+            silenced_since: None,
+            recovery_pongs: 0,
+        }
+    }
+}
+
+/// Whether the client has missed enough pings to be declared silent
+/// (PONG_MISS_LIMIT x PING_INTERVAL without any message). A free function so
+/// the timing is testable without a Rotation.
+fn liveness_miss_limit_reached(state: &LivenessState, now: &Instant) -> bool {
+    now.duration_since(state.last_heard) >= PING_INTERVAL * PONG_MISS_LIMIT
+}
+
+/// Whether a silenced client's re-activation bar is met: enough consecutive
+/// messages AND the cooldown served. Both are required; either alone lets a
+/// flapping link yank the grab back and forth. A free function so the bar is
+/// testable without a Rotation.
+fn liveness_recovery_complete(state: &LivenessState, now: &Instant) -> bool {
+    match state.silenced_since {
+        Some(since) => {
+            state.recovery_pongs >= REACTIVATE_PONGS
+                && now.duration_since(since) >= REACTIVATE_COOLDOWN
+        }
+        None => false,
+    }
+}
+
 /// Tracks the location and type of the current clipboard
 #[derive(Debug)]
 struct ClipboardTarget {
@@ -166,6 +240,9 @@ pub enum RotationEvent {
     ClipboardRequestContent(ClipboardRequestContentArgs),
     /// Request to send a current clipboard's content in response to a prior request
     ClipboardSendContent(ClipboardSendContentArgs),
+    /// Anything was received from a client (proof of liveness; see
+    /// ServerEvent::Ping). Internal channel message only (never on the wire).
+    ClientHeardFrom { endpoint: SocketAddr },
 }
 
 pub struct AddClientArgs {
@@ -461,6 +538,12 @@ pub struct Rotation<O: device::output::OutputHandler> {
     bulk_throttle_mbps: Option<f64>,
     /// When the last next/prev switch was processed (see SWITCH_DEBOUNCE).
     last_switch_at: Option<Instant>,
+    /// Per-client liveness tracking for the Ping/Pong check (see
+    /// ServerEvent::Ping), keyed by endpoint and kept in lockstep with
+    /// `clients` (inserted on add, removed on removal). A separate map so the
+    /// state machine is testable — ClientInfo embeds quinn handles and can't
+    /// be fabricated in a unit test.
+    liveness: HashMap<SocketAddr, LivenessState>,
     /// Loop-independent mirror of this rotation's diagnostic state, dumped by
     /// the SIGHUP handler without involving the loop (see DiagnosticsMirror).
     diagnostics: Arc<DiagnosticsMirror>,
@@ -588,6 +671,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             motion_flush_interval,
             bulk_throttle_mbps,
             last_switch_at: None,
+            liveness: HashMap::new(),
             diagnostics,
         })
     }
@@ -645,6 +729,9 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                 {
                     warn!("Failed to send clipboard content to client: {:?}", e);
                 }
+            }
+            RotationEvent::ClientHeardFrom { endpoint } => {
+                self.note_client_heard(endpoint).await;
             }
         }
     }
@@ -716,6 +803,10 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             Ok(idx) => self.clients[idx] = info,
             Err(idx) => self.clients.insert(idx, info),
         }
+        // Fresh liveness bookkeeping for the (re)connection, kept in lockstep
+        // with the clients entry (see handle_client_removal). The new client
+        // gets the full miss window before the silence detector can fire.
+        self.liveness.insert(endpoint, LivenessState::new());
 
         info!(
             "Added client {} @ {} to rotation: {}",
@@ -1791,6 +1882,130 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         }
     }
 
+    /// Records proof of liveness from a client (see ServerEvent::Ping): ANY
+    /// received ClientEvent or bulk bytes refresh it, not just Pongs. While
+    /// the client is silenced, each message also counts toward automatic
+    /// re-activation: once REACTIVATE_PONGS consecutive messages arrived AND
+    /// REACTIVATE_COOLDOWN has passed, the client is switched back to — like
+    /// the existing session resume — unless the user has since switched to
+    /// another client; a manual choice wins over the auto-recovery, so then
+    /// the client is only marked healthy again.
+    async fn note_client_heard(&mut self, endpoint: SocketAddr) {
+        let now = Instant::now();
+        let Some(state) = self.liveness.get_mut(&endpoint) else {
+            // Already removed from the rotation (a late chunk racing the
+            // removal): nothing to track.
+            return;
+        };
+        state.last_heard = now;
+        if state.silenced_since.is_none() {
+            return;
+        }
+        state.recovery_pongs += 1;
+        if !liveness_recovery_complete(state, &now) {
+            return;
+        }
+        let pongs = state.recovery_pongs;
+        let silenced_for = state
+            .silenced_since
+            .map(|since| now.duration_since(since))
+            .unwrap_or_default();
+        state.silenced_since = None;
+        state.recovery_pongs = 0;
+        if self.current_client.is_none() {
+            info!(
+                "Client {} is answering again ({} consecutive pongs after {:?} silenced): re-activating it",
+                endpoint, pongs, silenced_for
+            );
+            self.update_current_client(Some(endpoint)).await;
+        } else {
+            info!(
+                "Client {} is answering again ({} consecutive pongs after {:?} silenced): input stays on the manually chosen target {:?}",
+                endpoint, pongs, silenced_for, self.current_client
+            );
+        }
+    }
+
+    /// App-level liveness check (see ServerEvent::Ping): called every
+    /// PING_INTERVAL from the server events loop, like the status and motion
+    /// ticks. Pings the current client (and every silenced client, so a
+    /// returning one can be heard) and runs the miss detector: a current
+    /// client silent for PONG_MISS_LIMIT intervals is declared silenced —
+    /// the server switches to the local machine and ungrabs
+    /// (update_current_client(None) also sends Switch(false), so the client
+    /// releases its keys), WITHOUT removing the client or touching the
+    /// connection: the QUIC idle timeout and the existing removal/resume
+    /// paths stay as they are.
+    pub async fn ping_tick(&mut self) {
+        let now = Instant::now();
+        // Miss detection first, so a silent current client is ungrabbed
+        // before the next ping goes out.
+        if let Some(current) = self.current_client {
+            let missed = self
+                .liveness
+                .get(&current)
+                .is_some_and(|state| liveness_miss_limit_reached(state, &now));
+            if missed {
+                let silent_for = self
+                    .liveness
+                    .get(&current)
+                    .map(|state| now.duration_since(state.last_heard))
+                    .unwrap_or_default();
+                info!(
+                    "No sign of life from current client {} for {:?} (>= {} missed pings): switching to the local machine and ungrabbing; the client stays connected and will be re-activated when it answers again",
+                    current, silent_for, PONG_MISS_LIMIT
+                );
+                let state = self.liveness.entry(current).or_insert_with(LivenessState::new);
+                state.silenced_since = Some(now);
+                state.recovery_pongs = 0;
+                self.update_current_client(None).await;
+            }
+        }
+        // A fresh miss while a silenced client was recovering resets its
+        // consecutive counter (hysteresis against a flapping link).
+        let recovering: Vec<SocketAddr> = self
+            .liveness
+            .iter()
+            .filter(|(_, state)| state.silenced_since.is_some() && state.recovery_pongs > 0)
+            .map(|(endpoint, _)| *endpoint)
+            .collect();
+        for endpoint in recovering {
+            let missed = self
+                .liveness
+                .get(&endpoint)
+                .is_some_and(|state| liveness_miss_limit_reached(state, &now));
+            if missed {
+                debug!(
+                    "Silenced client {} went quiet again during recovery: resetting its consecutive-pong count",
+                    endpoint
+                );
+                if let Some(state) = self.liveness.get_mut(&endpoint) {
+                    state.recovery_pongs = 0;
+                }
+            }
+        }
+        // Ping the current client and every silenced client. A write failure
+        // removes the client (same policy as input forwarding); a black-holed
+        // link accepts the write into the send buffer, so the miss detector
+        // above — not the write — is what notices the silence.
+        let mut ping_targets: Vec<SocketAddr> = self
+            .liveness
+            .iter()
+            .filter(|(_, state)| state.silenced_since.is_some())
+            .map(|(endpoint, _)| *endpoint)
+            .collect();
+        if let Some(current) = self.current_client {
+            if !ping_targets.contains(&current) {
+                ping_targets.push(current);
+            }
+        }
+        for endpoint in ping_targets {
+            let _ = self
+                .send_event(&endpoint, event::ServerEvent::Ping)
+                .await;
+        }
+    }
+
     /// Periodic INFO snapshot of input flow, plus warnings for the two ways
     /// input can silently die: grabbed locally but nothing emitted, or a client
     /// is active but nothing is forwarded. Called on a timer from the server
@@ -2312,6 +2527,10 @@ impl<O: device::output::OutputHandler> Rotation<O> {
     /// Removes the client and switches to the server if it was the active client.
     /// If this returns true, then clipboard_clear() should also be called.
     async fn handle_client_removal(&mut self, endpoint: &SocketAddr) -> bool {
+        // Liveness bookkeeping goes away with the client, kept in lockstep
+        // with the clients list (a removal for a never-added endpoint just
+        // finds no entry).
+        self.liveness.remove(endpoint);
         // Always refetch the idx to avoid issues if there was an await in which the client was
         // removed behind our back.
         match self.clients.binary_search_by(|c| c.endpoint.cmp(&endpoint)) {
@@ -2396,6 +2615,14 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         self.motion_dirty = false;
         self.motion_history.clear();
         self.current_client = client;
+        if let Some(endpoint) = client {
+            // A switched-to client gets a fresh liveness window (see
+            // ServerEvent::Ping): stale bookkeeping — e.g. a previous
+            // silence — must not re-fire instantly, and if the client is
+            // still silent the miss detector simply ungrabs again. This is
+            // what makes a manual switch to a silenced client safe.
+            self.liveness.insert(endpoint, LivenessState::new());
+        }
         // Record which client is active (or none) so that an unexpected exit
         // mid-session can be recovered on the next server start. This is the
         // single funnel for current_client changes, incl. client removal.
@@ -3505,6 +3732,266 @@ mod tests {
         assert_eq!(rotation.status_counts.forwarded, 0);
         assert_eq!(rotation.status_counts.emitted_local, 0);
         assert_eq!(rotation.output_handler.written, 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Builds a rotation for liveness tests, returning the grab-state
+    /// receiver so the ungrab on silence can be asserted on. The liveness
+    /// map is plain state precisely so these tests need no ClientInfo (it
+    /// embeds quinn handles); fabricated endpoints stand in for clients, so
+    /// sends to them fail benignly (warn-logged "not found").
+    async fn liveness_rotation(
+        name: &str,
+    ) -> (PathBuf, Rotation<StubOutput>, watch::Receiver<device::GrabState>) {
+        let dir = temp_dir(name);
+        let (grab_tx, grab_rx) = watch::channel(device::GrabState {
+            client_active: false,
+            paused: false,
+        });
+        let (rotation_tx, _rotation_rx) = mpsc::channel(8);
+        let rotation = Rotation::new(
+            grab_tx,
+            StubOutput { written: 0, released: 0 },
+            None,
+            &dir,
+            rotation_tx,
+            None,
+            None,
+            Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
+        )
+        .await
+        .unwrap();
+        (dir, rotation, grab_rx)
+    }
+
+    /// A liveness entry silenced since `silenced_for` ago with `pongs`
+    /// consecutive recovery messages so far, heard from just now.
+    fn silenced_state(silenced_for: Duration, pongs: u32) -> LivenessState {
+        LivenessState {
+            last_heard: Instant::now(),
+            silenced_since: Some(Instant::now() - silenced_for),
+            recovery_pongs: pongs,
+        }
+    }
+
+    #[test]
+    fn liveness_miss_limit_timing() {
+        let now = Instant::now();
+        // Misses accumulate over the ping interval; the limit fires exactly
+        // at PONG_MISS_LIMIT intervals of silence.
+        for (silence, expected) in [
+            (Duration::ZERO, false),
+            (PING_INTERVAL, false),
+            (
+                PING_INTERVAL * PONG_MISS_LIMIT - Duration::from_millis(500),
+                false,
+            ),
+            (PING_INTERVAL * PONG_MISS_LIMIT, true),
+            (PING_INTERVAL * PONG_MISS_LIMIT * 2, true),
+        ] {
+            let state = LivenessState {
+                last_heard: now - silence,
+                silenced_since: None,
+                recovery_pongs: 0,
+            };
+            assert_eq!(
+                liveness_miss_limit_reached(&state, &now),
+                expected,
+                "silence={:?}",
+                silence
+            );
+        }
+    }
+
+    #[test]
+    fn liveness_recovery_bar_requires_pongs_and_cooldown() {
+        let now = Instant::now();
+        let state = |silenced_for: Duration, pongs: u32| LivenessState {
+            last_heard: now,
+            silenced_since: Some(now - silenced_for),
+            recovery_pongs: pongs,
+        };
+        // Both conditions are required; either alone blocks re-activation.
+        assert!(!liveness_recovery_complete(
+            &state(REACTIVATE_COOLDOWN, REACTIVATE_PONGS - 1),
+            &now
+        ));
+        assert!(!liveness_recovery_complete(
+            &state(REACTIVATE_COOLDOWN - Duration::from_secs(1), REACTIVATE_PONGS),
+            &now
+        ));
+        assert!(liveness_recovery_complete(
+            &state(REACTIVATE_COOLDOWN, REACTIVATE_PONGS),
+            &now
+        ));
+        assert!(liveness_recovery_complete(
+            &state(REACTIVATE_COOLDOWN * 2, REACTIVATE_PONGS + 1),
+            &now
+        ));
+        // Not silenced at all: never "recovers".
+        let healthy = LivenessState {
+            last_heard: now,
+            silenced_since: None,
+            recovery_pongs: 99,
+        };
+        assert!(!liveness_recovery_complete(&healthy, &now));
+    }
+
+    #[tokio::test]
+    async fn liveness_silence_switches_local_without_removing_client() {
+        let (dir, mut rotation, grab_rx) = liveness_rotation("liveness-silence").await;
+        let endpoint: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        rotation.current_client = Some(endpoint);
+        rotation.liveness.insert(endpoint, LivenessState::new());
+
+        // Below the miss limit: the tick pings but takes no action.
+        rotation.ping_tick().await;
+        assert_eq!(rotation.current_client, Some(endpoint));
+        assert!(rotation.liveness[&endpoint].silenced_since.is_none());
+
+        // Nothing heard for PONG_MISS_LIMIT intervals: declared silenced, the
+        // server switches local and ungrabs — WITHOUT removing the client
+        // (its liveness entry and the rotation stay).
+        rotation.liveness.get_mut(&endpoint).unwrap().last_heard =
+            Instant::now() - PING_INTERVAL * PONG_MISS_LIMIT - Duration::from_secs(1);
+        rotation.ping_tick().await;
+        assert_eq!(rotation.current_client, None);
+        assert!(!grab_rx.borrow().client_active);
+        let state = &rotation.liveness[&endpoint];
+        assert!(state.silenced_since.is_some());
+        assert_eq!(state.recovery_pongs, 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn liveness_any_message_refreshes_the_miss_window() {
+        let (dir, mut rotation, _grab_rx) = liveness_rotation("liveness-heard").await;
+        let endpoint: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        rotation.current_client = Some(endpoint);
+        rotation.liveness.insert(
+            endpoint,
+            LivenessState {
+                last_heard: Instant::now() - Duration::from_secs(5),
+                silenced_since: None,
+                recovery_pongs: 0,
+            },
+        );
+        // 5s in, a message arrives (a Pong, but any message counts): the miss
+        // window starts over, and the next tick finds the client healthy.
+        rotation.note_client_heard(endpoint).await;
+        assert!(rotation.liveness[&endpoint].last_heard.elapsed() < Duration::from_secs(1));
+        rotation.ping_tick().await;
+        assert_eq!(rotation.current_client, Some(endpoint));
+        assert!(rotation.liveness[&endpoint].silenced_since.is_none());
+
+        // A heard-from for an endpoint no longer in the rotation (a late
+        // chunk racing the removal) is ignored, not tracked.
+        let gone: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        rotation.note_client_heard(gone).await;
+        assert!(!rotation.liveness.contains_key(&gone));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn liveness_recovery_needs_consecutive_pongs_and_the_cooldown() {
+        let (dir, mut rotation, _grab_rx) = liveness_rotation("liveness-recovery").await;
+        let endpoint: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+
+        // Cooldown served, but too few consecutive pongs: still silenced.
+        rotation
+            .liveness
+            .insert(endpoint, silenced_state(Duration::from_secs(10), 0));
+        rotation.note_client_heard(endpoint).await;
+        rotation.note_client_heard(endpoint).await;
+        assert_eq!(rotation.liveness[&endpoint].recovery_pongs, 2);
+        assert!(rotation.liveness[&endpoint].silenced_since.is_some());
+        // The third consecutive message meets the bar: the client is marked
+        // healthy again. (The re-activation switch itself needs a client that
+        // can receive Switch(true), which a fabricated endpoint can't — e2e
+        // covers it; here we assert the state machine's bookkeeping.)
+        rotation.note_client_heard(endpoint).await;
+        assert!(rotation.liveness[&endpoint].silenced_since.is_none());
+        assert_eq!(rotation.liveness[&endpoint].recovery_pongs, 0);
+
+        // Enough pongs but the cooldown NOT served: re-activation is blocked.
+        rotation
+            .liveness
+            .insert(endpoint, silenced_state(Duration::from_secs(1), 0));
+        for _ in 0..REACTIVATE_PONGS {
+            rotation.note_client_heard(endpoint).await;
+        }
+        assert_eq!(rotation.liveness[&endpoint].recovery_pongs, REACTIVATE_PONGS);
+        assert!(rotation.liveness[&endpoint].silenced_since.is_some());
+        assert_eq!(rotation.current_client, None);
+        // Once the cooldown has passed, the next message completes the bar.
+        rotation.liveness.get_mut(&endpoint).unwrap().silenced_since =
+            Some(Instant::now() - REACTIVATE_COOLDOWN - Duration::from_secs(1));
+        rotation.note_client_heard(endpoint).await;
+        assert!(rotation.liveness[&endpoint].silenced_since.is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn liveness_recovery_keeps_manually_chosen_target() {
+        let (dir, mut rotation, _grab_rx) = liveness_rotation("liveness-manual").await;
+        let silenced: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let other: SocketAddr = "127.0.0.1:1235".parse().unwrap();
+        rotation.current_client = Some(other);
+        rotation.liveness.insert(other, LivenessState::new());
+        rotation
+            .liveness
+            .insert(silenced, silenced_state(Duration::from_secs(10), REACTIVATE_PONGS - 1));
+
+        // The silenced client meets the recovery bar while the user is on
+        // another client: marked healthy, but no yank-back.
+        rotation.note_client_heard(silenced).await;
+        assert_eq!(rotation.current_client, Some(other));
+        assert!(rotation.liveness[&silenced].silenced_since.is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn liveness_miss_during_recovery_resets_consecutive_counter() {
+        let (dir, mut rotation, _grab_rx) = liveness_rotation("liveness-flap").await;
+        let endpoint: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        // Two answers in, the link goes quiet past the miss limit again: the
+        // consecutive counter resets, so a flapping link never recovers.
+        let mut state = silenced_state(Duration::from_secs(20), 2);
+        state.last_heard = Instant::now() - PING_INTERVAL * PONG_MISS_LIMIT - Duration::from_secs(1);
+        rotation.liveness.insert(endpoint, state);
+        rotation.ping_tick().await;
+        assert_eq!(rotation.liveness[&endpoint].recovery_pongs, 0);
+        assert!(rotation.liveness[&endpoint].silenced_since.is_some());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn liveness_switch_to_silenced_client_resets_its_window() {
+        let (dir, mut rotation, _grab_rx) = liveness_rotation("liveness-manual-switch").await;
+        let endpoint: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        rotation
+            .liveness
+            .insert(endpoint, silenced_state(Duration::from_secs(30), 1));
+        // A manual switch to a silenced client is allowed; it gets a fresh
+        // miss window (and the miss detector ungrabs again if the silence
+        // continues).
+        rotation.set_and_grab_current_client(Some(endpoint)).await;
+        let state = &rotation.liveness[&endpoint];
+        assert!(state.silenced_since.is_none());
+        assert_eq!(state.recovery_pongs, 0);
+        assert!(state.last_heard.elapsed() < Duration::from_secs(1));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn liveness_removal_cleans_up_state() {
+        let (dir, mut rotation, _grab_rx) = liveness_rotation("liveness-removal").await;
+        let endpoint: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        rotation
+            .liveness
+            .insert(endpoint, silenced_state(Duration::from_secs(10), 0));
+        rotation.remove_client_and_clear_clipboard(endpoint, 1).await;
+        assert!(!rotation.liveness.contains_key(&endpoint));
         let _ = fs::remove_dir_all(&dir);
     }
 }

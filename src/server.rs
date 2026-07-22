@@ -43,6 +43,12 @@ pub async fn run_server_events_loop<O: output::OutputHandler>(
     let mut status_tick = time::interval(Duration::from_secs(10));
     // Skip the immediate first tick; the first heartbeat lands 10s in.
     status_tick.tick().await;
+    // App-level liveness check (see ServerEvent::Ping): pings the current
+    // client so a black-holed link ungrabs within ~6s instead of silently
+    // swallowing input until the QUIC idle timeout fires.
+    let mut ping_tick = time::interval(rotation::PING_INTERVAL);
+    // Skip the immediate first tick; the first ping lands one interval in.
+    ping_tick.tick().await;
     // Pointer-motion coalescing flush timer (office mode, see --motion-hz).
     // The branch guard keeps it inert until motion has accumulated; after a
     // long idle the first tick fires immediately, so the first delta goes out
@@ -105,6 +111,9 @@ pub async fn run_server_events_loop<O: output::OutputHandler>(
                 // Prune fetch bookkeeping whose requester already gave up, so
                 // dead entries don't linger until the next request arrives.
                 rotation.prune_pending_clipboard_requests();
+            },
+            _ = ping_tick.tick() => {
+                rotation.ping_tick().await;
             },
             _ = motion_tick.tick(), if rotation.motion_dirty() => {
                 rotation.flush_pending_motion().await;
@@ -302,6 +311,15 @@ async fn handle_connection(
                     }
                 };
                 trace!("Received {} bytes from events stream: {:X?}", resp.bytes.len(), &*resp.bytes);
+                // Anything received from the client is proof of liveness (see
+                // ServerEvent::Ping): reported per chunk, so raw clipboard
+                // payload counts too — a large upload taking >6s must not
+                // look like a silent client.
+                rotation_tx
+                    .send(rotation::RotationEvent::ClientHeardFrom {
+                        endpoint: conn.remote_address(),
+                    })
+                    .await?;
                 // Copy the immutable response data into a mutable buffer
                 event_bytes.extend_from_slice(&resp.bytes);
                 handle_event_messages(conn.remote_address(), &rotation_tx, &mut event_bytes, max_clipboard_size_bytes).await?;
@@ -315,6 +333,12 @@ async fn handle_connection(
                     }
                 };
                 trace!("Received {} bytes from bulk stream: {:X?}", resp.bytes.len(), &*resp.bytes);
+                // Proof of liveness, same as the events stream above.
+                rotation_tx
+                    .send(rotation::RotationEvent::ClientHeardFrom {
+                        endpoint: conn.remote_address(),
+                    })
+                    .await?;
                 if let Some((c, request_client, request_id)) = &mut incoming_clipboard_data {
                     if c.remaining_bytes >= resp.bytes.len() {
                         // Chunk is all clipboard data.
@@ -385,6 +409,12 @@ async fn handle_event_messages(
             consumed
         );
         match msg {
+            event::ClientEvent::Pong => {
+                // Answer to the server's Ping (see ServerEvent::Ping). The
+                // liveness bookkeeping already happened per-chunk in
+                // handle_connection (ClientHeardFrom); nothing else to do.
+                trace!("Got pong from client {}", source);
+            }
             event::ClientEvent::ClipboardTypes(t) => {
                 // Client broadcasted new clipboard types for server (and other clients) to advertise.
                 // An empty types string (the client's clipboard was cleared) splits

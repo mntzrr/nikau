@@ -22,8 +22,9 @@ const KEEPALIVE_MILLIS: u64 = 2000;
 /// delayed WiFi packet (interference, client power-save, brief CPU stall) severed otherwise
 /// healthy connections. 25s tolerates ~12 consecutive lost keepalives, so multi-second WiFi
 /// black holes pass as invisible stalls. The tradeoff: a genuinely dead connection now takes
-/// up to 25s to detect, during which forwarded input is silently lost and devices stay
-/// grabbed (a degraded-link indicator is planned separately).
+/// up to 25s to detect — too long to wait before ungrabbing, so the app-level Ping/Pong
+/// liveness check (see ServerEvent::Ping) switches local and ungrabs after ~6s of silence,
+/// while this timeout still owns the actual teardown/removal.
 const TIMEOUT_MILLIS: u32 = 25_000;
 
 /// WWW-mode idle timeout: internet paths can stall much longer than LAN ones,

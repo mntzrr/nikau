@@ -124,6 +124,10 @@ Every switch also shows a desktop notification (via `notify-send`), so an unexpe
 
 > **Pick a shortcut that doesn't collide with your compositor/WM/application binds.** monux consumes only the *last* key of the combo, so if the same combo is bound elsewhere (e.g. `Alt+Shift+R` toggling your clipboard manager), pressing it fires *both* actions — and a switch you didn't mean to make looks exactly like dead keys: your input silently goes to the other machine. The notification exists to make such accidents obvious.
 
+### Client silence: the liveness check
+
+While a client owns the input, the server pings it every 2 seconds and the client answers immediately (any message from the client counts, not just pongs). If nothing arrives for ~6 seconds — the classic symptom of a WiFi link that black-holed — the server switches back to the local machine and ungrabs, so keystrokes stop flowing into the void: `No sign of life from current client <addr> ... switching to the local machine and ungrabbing`. The client is **not** disconnected or removed from the rotation; the 25s QUIC idle timeout still owns that, and pinging continues meanwhile. When the client answers again, the server waits for 3 consecutive pongs spread over at least 5 seconds (hysteresis against a flapping link), then re-activates it automatically: `Client <addr> is answering again ... re-activating it` — unless you switched elsewhere by hand in the meantime, in which case your choice wins. Manually switching to a silenced client is allowed; the same ~6s check applies and ungrabs again if the silence continues.
+
 ### Local network vs. internet
 
 By default Monux is tuned for low-latency local networks (LAN, wired links, direct WiFi). Use `--www` on both server and client when connecting over the public internet:

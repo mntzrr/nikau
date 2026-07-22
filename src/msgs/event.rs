@@ -14,6 +14,13 @@ pub enum ServerEvent<'a> {
     /// Broadcasts the types of a clipboard that can be retrieved from the server.
     #[serde(borrow)]
     ClipboardTypes(ClipboardTypes<'a>),
+
+    /// App-level liveness check, sent by the server to the current (and any
+    /// silenced) client every PING_INTERVAL. The client must answer with a
+    /// Pong immediately; a black-holed link (WiFi) otherwise keeps devices
+    /// grabbed and keystrokes buffer into the void until the QUIC idle
+    /// timeout fires. New variants must be appended (wire format).
+    Ping,
 }
 
 impl<'a> std::fmt::Display for ServerEvent<'a> {
@@ -22,6 +29,7 @@ impl<'a> std::fmt::Display for ServerEvent<'a> {
             ServerEvent::Switch(e) => e.fmt(f),
             ServerEvent::Input(e) => f.write_str(format!("{:?}", e).as_str()),
             ServerEvent::ClipboardTypes(e) => e.fmt(f),
+            ServerEvent::Ping => f.write_str("Ping"),
         }
     }
 }
@@ -32,12 +40,19 @@ pub enum ClientEvent<'a> {
     /// Broadcasts the types of a clipboard that can be retrieved from the client.
     #[serde(borrow)]
     ClipboardTypes(ClipboardTypes<'a>),
+
+    /// Answer to the server's Ping liveness check (see ServerEvent::Ping),
+    /// sent immediately on the same ordered events stream. Any received
+    /// message counts as liveness on the server; Pong exists so that an
+    /// otherwise idle client has something to say. Appended variant.
+    Pong,
 }
 
 impl<'a> std::fmt::Display for ClientEvent<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             ClientEvent::ClipboardTypes(e) => e.fmt(f),
+            ClientEvent::Pong => f.write_str("Pong"),
         }
     }
 }
@@ -330,6 +345,14 @@ mod tests {
     fn switch_event_roundtrip() {
         assert_cobs_roundtrip!(ServerEvent, ServerEvent::Switch(SwitchEvent { enabled: true }));
         assert_cobs_roundtrip!(ServerEvent, ServerEvent::Switch(SwitchEvent { enabled: false }));
+    }
+
+    #[test]
+    fn ping_pong_roundtrip() {
+        // The liveness pair (see rotation.rs Ping/Pong): unit variants must
+        // survive the postcard + COBS round trip like any payload message.
+        assert_cobs_roundtrip!(ServerEvent, ServerEvent::Ping);
+        assert_cobs_roundtrip!(ClientEvent, ClientEvent::Pong);
     }
 
     #[test]
