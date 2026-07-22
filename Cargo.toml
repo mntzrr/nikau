@@ -1,6 +1,6 @@
 [package]
 name = "monux"
-version = "1.4.0"
+version = "1.5.0"
 authors = ["Nick Parker <nick@nickbp.com>"]
 license = "AGPL-3.0-or-later"
 edition = "2021"
@@ -21,6 +21,7 @@ clap = { version = "4.4", features = ["derive", "string"] }
 evdev = { version = "0.13", features = ["tokio"] }
 hex = "0.4"
 home = "0.5"
+ksni = { version = "0.3", features = ["blocking"] }
 libc = "0.2"
 mdns-sd = "0.11"
 nonblock = "0.2"

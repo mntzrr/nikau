@@ -6,7 +6,8 @@
 //! the previous one instead of stacking, while different kinds never replace
 //! each other. Current ids: `monux-switch`, `monux-update`, `monux-client`
 //! (server-side roster changes), `monux-connection` (client-side
-//! connect/lost), `monux-link` (degradation/recovery).
+//! connect/lost), `monux-link` (degradation/recovery), `monux-indicator`
+//! (tray indicator action feedback).
 
 use std::process::Stdio;
 

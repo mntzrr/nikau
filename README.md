@@ -155,11 +155,27 @@ monux system status --client   # restrict to one role
 monux system status --json     # machine-readable response
 ```
 
-The wire protocol is newline-delimited JSON, one request and one response per line, so any language can drive it (this is the backend for a future tray indicator). Requests: `{"cmd":"status"}`, `{"cmd":"switch","target":"next"|"prev"|"local"|<fingerprint-prefix>}`, `{"cmd":"pause"}` / `{"cmd":"resume"}` (idempotent: pausing a paused server is a no-op), `{"cmd":"update_now"}` (wakes the background update check), `{"cmd":"restart"}` (graceful shutdown + re-exec, like after an update), `{"cmd":"exit"}`. Responses: `{"ok":true,"state":{...}}` for status, `{"ok":true}` for accepted commands, `{"ok":false,"error":"..."}` on failure. The server socket serves the full set; the client socket only status/update_now/restart/exit — rotation and pause are server concepts. Example with socat:
+The wire protocol is newline-delimited JSON, one request and one response per line, so any language can drive it (this is the backend of the tray indicator below). Requests: `{"cmd":"status"}`, `{"cmd":"diagnostics"}` (a troubleshooting bundle: state dump plus the daemon's recent log lines), `{"cmd":"switch","target":"next"|"prev"|"local"|<fingerprint-prefix>}`, `{"cmd":"pause"}` / `{"cmd":"resume"}` (idempotent: pausing a paused server is a no-op), `{"cmd":"update_now"}` (wakes the background update check), `{"cmd":"restart"}` (graceful shutdown + re-exec, like after an update), `{"cmd":"exit"}`. Responses: `{"ok":true,"state":{...}}` for status, `{"ok":true,"diagnostics":{...}}` for diagnostics, `{"ok":true}` for accepted commands, `{"ok":false,"error":"..."}` on failure. The server socket serves the full set; the client socket only status/diagnostics/update_now/restart/exit — rotation and pause are server concepts. Example with socat:
 
 ```bash
 echo '{"cmd":"pause"}' | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/monux/server.sock
 ```
+
+### Tray indicator (`monux system indicator`)
+
+`monux system indicator` puts a StatusNotifierItem (SNI) tray icon in your panel — any SNI host works: waybar (with a `tray` module), KDE Plasma, xfce4-panel, and so on. It is a thin client of the control socket: it polls `{"cmd":"status"}` every 2 seconds (server socket first, then the client's) and never talks to the daemon's event loops, so it can neither stall nor be stalled by monux.
+
+The icon is a colored dot whose tooltip carries the details ("monux: input on 192.168.1.102", per-client RTT and uptime, clipboard owner):
+
+- **green** — input is local (client role: connected, not owning input)
+- **blue** — input is on a client (client role: this machine owns the input)
+- **grey** — the server is paused
+- **red** — the link is degraded: any client with RTT over 50 ms (server role), or not connected to the server (client role)
+- hollow grey **?** — no monux daemon is running
+
+The menu follows the current state: switch to local / to a specific client and pause/resume (server only), per-client connection facts and clipboard owner, "Check for update now" (or "Update available: `<sha>` — update now" when the auto-updater has seen a newer commit), "Copy diagnostics" (puts a bug-report bundle — version, state dump, recent logs — on the clipboard via `wl-copy`/`xclip`/`xsel`), and "Restart monux" / "Exit monux".
+
+The indicator needs a desktop session: on a headless TTY it exits with a "no D-Bus session / no tray host" error. To autostart it, add `monux system indicator` to your compositor's autostart (e.g. `exec-once = monux system indicator` in Hyprland). It is deliberately **not** part of the systemd units installed by `monux system setup --autostart` — those inherit the systemd user manager's environment, which usually lacks `DBUS_SESSION_BUS_ADDRESS` unless your compositor imports it (see the autostart caveat above); the compositor's own autostart always has the session bus.
 
 ## Troubleshooting
 

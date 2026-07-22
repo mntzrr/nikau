@@ -329,9 +329,11 @@ impl DiagnosticsMirror {
         Some(state)
     }
 
-    /// Logs the full state dump for SIGHUP. Runs on the signal thread, so it
-    /// must never wait on the rotation loop: it only reads this mirror.
-    pub fn dump(&self) {
+    /// The dump string: loop liveness plus the latest formatted state. Served
+    /// verbatim by the control socket's diagnostics command (control.rs) and
+    /// logged by dump(). Only reads this mirror, so it never waits on the
+    /// rotation loop.
+    pub fn state_dump(&self) -> String {
         let age_ms = self
             .started
             .elapsed()
@@ -341,11 +343,16 @@ impl DiagnosticsMirror {
             Ok(s) => s.clone(),
             Err(_) => "<diagnostics state lock poisoned>".to_string(),
         };
-        info!(
-            "Diagnostics dump (SIGHUP): rotation loop last completed an iteration {}ms ago (a healthy loop iterates at least every 10s); {}",
-            age_ms,
-            state
-        );
+        format!(
+            "rotation loop last completed an iteration {}ms ago (a healthy loop iterates at least every 10s); {}",
+            age_ms, state
+        )
+    }
+
+    /// Logs the full state dump for SIGHUP. Runs on the signal thread, so it
+    /// must never wait on the rotation loop: it only reads this mirror.
+    pub fn dump(&self) {
+        info!("Diagnostics dump (SIGHUP): {}", self.state_dump());
     }
 }
 

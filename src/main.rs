@@ -73,6 +73,14 @@ enum SystemCommands {
     /// connected clients, clipboard owner, update availability.
     Status(StatusArgs),
 
+    /// Runs a StatusNotifierItem tray indicator for the local monux daemon:
+    /// a colored dot (green = input local, blue = input on a client, grey =
+    /// paused, red = degraded link / client not connected, hollow "?" = monux
+    /// not running) whose menu drives switches, pause/resume, update checks,
+    /// diagnostics copy, and restart/exit via the control socket. Needs a
+    /// desktop session with an SNI host (waybar, KDE Plasma, ...).
+    Indicator,
+
     /// Removes monux from this machine: stops any running server/client, then
     /// removes the binary (and stale copies), the /usr/local/bin link, and the
     /// system settings persisted by 'monux system setup'. Asks before also
@@ -392,6 +400,9 @@ fn main() -> Result<()> {
             }
             SystemCommands::Uninstall => {
                 return monux::uninstall::run();
+            }
+            SystemCommands::Indicator => {
+                return monux::indicator::run();
             }
         },
         Commands::Update(args) => {

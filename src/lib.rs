@@ -4,6 +4,7 @@ pub mod clipboard;
 pub mod control;
 pub mod device;
 pub mod discovery;
+pub mod indicator;
 pub mod logging;
 pub mod msgs;
 pub mod network;

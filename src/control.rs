@@ -27,6 +27,8 @@
 //! exactly one response line. Requests:
 //!
 //! - `{"cmd":"status"}` — the daemon's live state (schema below).
+//! - `{"cmd":"diagnostics"}` — a troubleshooting bundle for bug reports
+//!   (schema below); the tray indicator's "Copy diagnostics" uses it.
 //! - `{"cmd":"switch","target":"next"|"prev"|"local"|<fingerprint-prefix>}` —
 //!   rotate input to another machine (server socket only).
 //! - `{"cmd":"pause"}` / `{"cmd":"resume"}` — suspend/resume input handling
@@ -39,13 +41,25 @@
 //!   binary (the auto-updater's restart path).
 //! - `{"cmd":"exit"}` — graceful shutdown.
 //!
-//! Responses: `{"ok":true,"state":{...}}` for status, `{"ok":true}` for
+//! Responses: `{"ok":true,"state":{...}}` for status,
+//! `{"ok":true,"diagnostics":{...}}` for diagnostics, `{"ok":true}` for
 //! accepted commands, `{"ok":false,"error":"..."}` on failure (unknown
 //! command, wrong role, missing target, event queue full, ...). A command's
 //! `ok` means it was accepted by the daemon's event loop — the effect (e.g.
 //! a rotation switch) lands asynchronously; poll status to observe it. The
 //! server socket serves the full command set; the client socket serves only
-//! status/update_now/restart/exit (rotation and pause are server concepts).
+//! status/diagnostics/update_now/restart/exit (rotation and pause are server
+//! concepts).
+//!
+//! # Diagnostics schema (the `diagnostics` object of a diagnostics response)
+//!
+//! Served by both roles:
+//! - `version`, `protocol_version`, `role`: as in the status state
+//! - `state_dump`: the server's SIGHUP rotation-state dump string
+//!   (rotation::DiagnosticsMirror::state_dump); for the client role, the
+//!   human-readable rendering of the client mirror's state
+//! - `recent_logs`: the daemon's last ~50 log lines (the logging.rs ring
+//!   buffer), oldest first; empty when nothing was logged yet
 //!
 //! # State schema (the `state` object of a status response)
 //!
@@ -370,12 +384,53 @@ pub struct Request {
     pub target: Option<String>,
 }
 
+/// Troubleshooting bundle served by `{"cmd":"diagnostics"}` (see module docs
+/// for the schema). The tray indicator formats and copies this for bug
+/// reports.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Diagnostics {
+    pub version: String,
+    pub protocol_version: u64,
+    pub role: String,
+    /// SIGHUP dump string (server) or client state rendering (client).
+    pub state_dump: String,
+    /// The daemon's last ~50 log lines, oldest first.
+    pub recent_logs: Vec<String>,
+}
+
+impl Diagnostics {
+    fn server(mirror: &DiagnosticsMirror) -> Self {
+        Diagnostics {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            protocol_version: PROTOCOL_VERSION,
+            role: Role::Server.as_str().to_string(),
+            state_dump: mirror.state_dump(),
+            recent_logs: crate::logging::recent_logs(crate::logging::RECENT_LOGS_DEFAULT),
+        }
+    }
+
+    fn client(mirror: &ClientStateMirror) -> Self {
+        Diagnostics {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            protocol_version: PROTOCOL_VERSION,
+            role: Role::Client.as_str().to_string(),
+            state_dump: State::Client(mirror.snapshot())
+                .to_string()
+                .trim_end()
+                .to_string(),
+            recent_logs: crate::logging::recent_logs(crate::logging::RECENT_LOGS_DEFAULT),
+        }
+    }
+}
+
 /// The single response line sent back for every request.
 #[derive(Debug, Serialize)]
 pub struct Response {
     pub ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<Diagnostics>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -385,6 +440,7 @@ impl Response {
         Response {
             ok: true,
             state: None,
+            diagnostics: None,
             error: None,
         }
     }
@@ -393,6 +449,16 @@ impl Response {
         Response {
             ok: true,
             state: serde_json::to_value(state).ok(),
+            diagnostics: None,
+            error: None,
+        }
+    }
+
+    fn ok_diagnostics(diagnostics: Diagnostics) -> Self {
+        Response {
+            ok: true,
+            state: None,
+            diagnostics: Some(diagnostics),
             error: None,
         }
     }
@@ -401,6 +467,7 @@ impl Response {
         Response {
             ok: false,
             state: None,
+            diagnostics: None,
             error: Some(error.into()),
         }
     }
@@ -453,6 +520,16 @@ impl Handler {
                     ),
                 },
                 Handler::Client(h) => (Response::ok_state(State::Client(h.state.snapshot())), None),
+            },
+            "diagnostics" => match self {
+                Handler::Server(h) => (
+                    Response::ok_diagnostics(Diagnostics::server(&h.state)),
+                    None,
+                ),
+                Handler::Client(h) => (
+                    Response::ok_diagnostics(Diagnostics::client(&h.state)),
+                    None,
+                ),
             },
             "update_now" => {
                 let auto_update = match self {
@@ -629,12 +706,25 @@ async fn serve_connection(stream: tokio::net::UnixStream, handler: Arc<Handler>)
     }
 }
 
+/// Longest a synchronous socket request may block. The daemon answers in
+/// microseconds (dispatch only reads mirrors or hands off to a channel), so
+/// hitting this means the daemon is wedged; the tray indicator's poll loop
+/// must not hang on that.
+const SOCKET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Sends one request to a control socket and returns the raw response line.
-/// Synchronous: used by the short-lived `monux system status` CLI.
-fn request_line(socket: &Path, request: &str) -> Result<String> {
+/// Synchronous with a short timeout: used by the short-lived
+/// `monux system status` CLI and the tray indicator's poll loop.
+pub fn request_line(socket: &Path, request: &str) -> Result<String> {
     use std::io::{BufRead, BufReader, Write};
     let stream = std::os::unix::net::UnixStream::connect(socket)
         .with_context(|| format!("Failed to connect to {}", socket.display()))?;
+    stream
+        .set_read_timeout(Some(SOCKET_TIMEOUT))
+        .context("Failed to set control socket read timeout")?;
+    stream
+        .set_write_timeout(Some(SOCKET_TIMEOUT))
+        .context("Failed to set control socket write timeout")?;
     let mut writer = stream
         .try_clone()
         .context("Failed to clone control socket stream")?;
@@ -1030,5 +1120,51 @@ mod tests {
         assert!(text.contains("monux client v1.4.0 (protocol 8)"));
         assert!(text.contains("server:         10.0.0.1:1213"));
         assert!(text.contains("connected:      yes (for 42s, rtt 1ms, 0 packets lost)"));
+    }
+
+    #[tokio::test]
+    async fn diagnostics_from_the_client_socket() {
+        let (handler, mirror) = client_handler(true);
+        mirror.set_server("10.0.0.1:1213".parse().unwrap());
+        let (resp, post) = handler.dispatch(&req("diagnostics", None)).await;
+        assert!(resp.ok && post.is_none());
+        assert!(resp.state.is_none());
+        let diag = resp.diagnostics.unwrap();
+        assert_eq!(diag.role, "client");
+        assert_eq!(diag.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(diag.protocol_version, PROTOCOL_VERSION);
+        // The client state dump is the client mirror's rendering.
+        assert!(diag.state_dump.contains("monux client"), "{}", diag.state_dump);
+        assert!(diag.state_dump.contains("10.0.0.1:1213"), "{}", diag.state_dump);
+        // No logging layer in tests: the buffer is simply empty.
+        assert!(diag.recent_logs.is_empty());
+
+        // The wire shape is {"ok":true,"diagnostics":{...}}.
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&Response::ok_diagnostics(diag)).unwrap())
+                .unwrap();
+        assert_eq!(v["ok"], true);
+        assert!(v.get("state").is_none());
+        assert!(v.get("error").is_none());
+        for key in ["version", "protocol_version", "role", "state_dump", "recent_logs"] {
+            assert!(v["diagnostics"].get(key).is_some(), "missing {}", key);
+        }
+    }
+
+    #[tokio::test]
+    async fn diagnostics_from_the_server_socket() {
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let handler = server_handler(event_tx, true);
+        let (resp, post) = handler.dispatch(&req("diagnostics", None)).await;
+        assert!(resp.ok && post.is_none());
+        let diag = resp.diagnostics.unwrap();
+        assert_eq!(diag.role, "server");
+        // The server state dump is the SIGHUP rotation dump string; it works
+        // even before the rotation loop's first iteration.
+        assert!(
+            diag.state_dump.contains("rotation loop last completed an iteration"),
+            "{}",
+            diag.state_dump
+        );
     }
 }
