@@ -13,6 +13,14 @@ mod limited;
 
 pub const CLIPBOARD_TIMEOUT_SECS: u64 = 5;
 
+/// Overall timeout for serving one clipboard fetch (read + convert), applied
+/// on both the client and the server serve paths. Deliberately below
+/// CLIPBOARD_TIMEOUT_SECS so the requester always gets an answer — even an
+/// empty one — before its own fetch timeout expires. Convert/zip of a large
+/// copy can run arbitrarily long under the serve mutex, so the inner wayland
+/// read timeout alone isn't enough.
+pub const CLIPBOARD_SERVE_TIMEOUT_SECS: u64 = 4;
+
 /// Clipboard writes (advertising types to the local environment) can block for
 /// a long time: each call opens a fresh wayland connection, does roundtrips,
 /// and spawns a serving thread. Running them on the rotation or client event

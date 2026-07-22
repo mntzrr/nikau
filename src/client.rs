@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use tokio::task;
 use tracing::{debug, error, info, trace, warn};
 
-use crate::clipboard::{client, data};
+use crate::clipboard::{CLIPBOARD_SERVE_TIMEOUT_SECS, client, data};
 use crate::device::output;
 use crate::msgs::{bulk, event, shared};
 use crate::network::{approval, transport};
@@ -176,7 +176,7 @@ struct Connection {
     /// keeps a multi-megabyte clipboard write from suspending this loop —
     /// including input application — and keeps each header glued to its
     /// payload when transfers overlap.
-    bulk_tx: mpsc::UnboundedSender<Vec<u8>>,
+    bulk_tx: mpsc::Sender<Vec<u8>>,
     bulk_recv: RecvStream,
     max_clipboard_size_bytes: u64,
 
@@ -302,8 +302,10 @@ impl Connection {
         // including input application — for the whole transfer. The task also
         // keeps each header glued to its payload by writing queued byte blobs
         // sequentially. It exits when the last sender is dropped (connection
-        // teardown) or when the stream fails.
-        let (bulk_tx, mut bulk_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        // teardown) or when the stream fails. The queue is bounded
+        // (bulk::BULK_QUEUE_CAPACITY): senders fail fast instead of queueing
+        // clipboard payloads without limit behind a server that can't drain.
+        let (bulk_tx, mut bulk_rx) = mpsc::channel::<Vec<u8>>(bulk::BULK_QUEUE_CAPACITY);
         {
             let mut bulk_send = bulk_send;
             task::spawn(async move {
@@ -409,10 +411,13 @@ impl Connection {
                         // Queue the whole frame for the bulk writer task: a
                         // direct write here would suspend the whole select —
                         // including input application — behind any in-flight
-                        // clipboard payload.
+                        // clipboard payload. try_send keeps the loop from
+                        // parking on a full queue: a server that isn't
+                        // draining leaves the connection wedged (it would die
+                        // on the idle timeout anyway), so fail and reconnect.
                         self.bulk_tx
-                            .send(serializedmsg)
-                            .context("Failed to queue clipboard request message")?;
+                            .try_send(serializedmsg)
+                            .context("Failed to queue clipboard request message (bulk queue full or closed)")?;
                     } else {
                         bail!("Clipboard fetch request queue has closed");
                     }
@@ -562,10 +567,18 @@ impl Connection {
                     }
                     if let Some(local_clipboard) = &mut local_clipboard {
                         if let Some(types) = &local_clipboard.get_local_clipboard_types() {
-                            if (!e.enabled || first_activation) && !types.is_empty() {
+                            if !e.enabled || first_activation {
                                 // We're being disabled and we have a clipboard from a local app.
                                 // It may be from when we were disabled, or from a prior enabled session. That's fine.
                                 // Keep announcing the local clipboard until/unless it gets overridden by a new one from the server.
+                                //
+                                // Empty types are announced too: the local selection was
+                                // revoked while we were active (the owning app exited), and
+                                // the server must hear about that as a clipboard clear or the
+                                // rotation's target stays stale. This can't ping-pong with the
+                                // server's own clear broadcast: a server-pushed announcement
+                                // goes to set_remote_clipboard (local_types = None), so it is
+                                // never re-announced here as a local clipboard.
                                 //
                                 // The first activation of a connection RE-announces it too:
                                 // when a drop makes the server clear the rotation's clipboard
@@ -623,9 +636,10 @@ impl Connection {
                     // Announce the types to X11 for local apps to see, and clear any prior types from local apps.
                     if let Some(local_clipboard) = &mut local_clipboard {
                         debug!("Got clipboard types from server: {}", types.types);
-                        let types: Vec<String> =
-                            types.types.split(' ').map(|s| s.to_string()).collect();
-                        local_clipboard.set_remote_clipboard(types)?;
+                        // An empty types string (clipboard clear) splits to no
+                        // types, so the writer takes its clear branch instead
+                        // of advertising a phantom "" mime type.
+                        local_clipboard.set_remote_clipboard(types.types_vec())?;
                     } else {
                         debug!("Ignoring clipboard types from server: {}", types.types);
                     }
@@ -791,7 +805,7 @@ impl Connection {
                         // On read failure or timeout, reply with an empty header so that the requester just sets nothing.
                         // The read must always answer within the 5s fetch timeout on the requester side.
                         let (local_clipboard_data, data_type) = match tokio::time::timeout(
-                            Duration::from_secs(4),
+                            Duration::from_secs(CLIPBOARD_SERVE_TIMEOUT_SECS),
                             client::LocalClipboard::read(&reader, &requested_type, max_size_bytes, request_client),
                         )
                         .await
@@ -802,7 +816,7 @@ impl Connection {
                                 (Vec::new(), None)
                             }
                             Err(_) => {
-                                warn!("Timed out after 4s reading local clipboard of type {}", requested_type);
+                                warn!("Timed out after {}s reading local clipboard of type {}", CLIPBOARD_SERVE_TIMEOUT_SECS, requested_type);
                                 (Vec::new(), None)
                             }
                         };
@@ -824,12 +838,13 @@ impl Connection {
                         // The whole frame — header glued to its payload — goes
                         // to the bulk writer task as one blob, so overlapping
                         // transfers can't interleave on the stream, and this
-                        // task never parks on a multi-megabyte write.
+                        // task never parks on a multi-megabyte write. A full
+                        // queue means the server isn't draining; the wedged
+                        // connection dies on the step loop's read side or the
+                        // idle timeout, and the reconnect re-serves.
                         let len = bytes.len();
-                        if bulk_tx.send(bytes).is_err() {
-                            // The writer task died with the connection; the
-                            // step loop's read side resets it.
-                            error!("Failed to queue {} byte clipboard content for sending", len);
+                        if bulk_tx.try_send(bytes).is_err() {
+                            error!("Failed to queue {} byte clipboard content for sending: bulk queue full or closed", len);
                         }
                     });
                 }

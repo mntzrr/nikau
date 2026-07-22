@@ -57,6 +57,10 @@ pub async fn run_server_events_loop<O: output::OutputHandler>(
     // Seed the diagnostics mirror so a SIGHUP before the first event still dumps.
     rotation.update_diagnostics();
     loop {
+        // Snapshot per iteration (Copy, so no borrow of rotation crosses the
+        // select): the trailing edge of the local clipboard debounce window,
+        // if an update is currently held (see CLIPBOARD_UPDATE_DEBOUNCE).
+        let clipboard_debounce_deadline = rotation.pending_local_clipboard_deadline();
         tokio::select! {
             // Listen and forward rotation events to rotation
             event = rotation_rx.recv() => {
@@ -97,9 +101,22 @@ pub async fn run_server_events_loop<O: output::OutputHandler>(
             },
             _ = status_tick.tick() => {
                 rotation.log_input_status();
+                // Prune fetch bookkeeping whose requester already gave up, so
+                // dead entries don't linger until the next request arrives.
+                rotation.prune_pending_clipboard_requests();
             },
             _ = motion_tick.tick(), if rotation.motion_dirty() => {
                 rotation.flush_pending_motion().await;
+            },
+            // Trailing edge of the local clipboard debounce: apply the newest
+            // update held during the window. Pends forever when nothing is held.
+            _ = async {
+                match clipboard_debounce_deadline {
+                    Some(deadline) => time::sleep_until(time::Instant::from_std(deadline)).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                rotation.flush_pending_local_clipboard().await;
             },
         }
         // Refresh the mirrored state after every iteration: the SIGHUP handler
@@ -367,8 +384,10 @@ async fn handle_event_messages(
         );
         match msg {
             event::ClientEvent::ClipboardTypes(t) => {
-                // Client broadcasted new clipboard types for server (and other clients) to advertise
-                let types: Vec<String> = t.types.split(' ').map(|t| t.to_string()).collect();
+                // Client broadcasted new clipboard types for server (and other clients) to advertise.
+                // An empty types string (the client's clipboard was cleared) splits
+                // to no types — a phantom "" type must never reach the rotation.
+                let types: Vec<String> = t.types_vec();
                 debug!("Got clipboard type advertisement from client {}: {:?}", source, types);
                 rotation_tx
                     .send(rotation::RotationEvent::ClipboardUpdateSource(

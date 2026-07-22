@@ -264,6 +264,21 @@ pub struct ClipboardTypes<'a> {
     pub max_size_bytes: u64,
 }
 
+impl<'a> ClipboardTypes<'a> {
+    /// Splits the space-separated types list into individual mime types.
+    /// Empty entries are dropped: an empty types string (a clipboard clear)
+    /// must yield NO types, but `"".split(' ')` yields `[""]` — advertising
+    /// that would offer a phantom "" mime type (plus the ignore marker)
+    /// instead of taking the writer's clear branch.
+    pub fn types_vec(&self) -> Vec<String> {
+        self.types
+            .split(' ')
+            .filter(|t| !t.is_empty())
+            .map(|t| t.to_string())
+            .collect()
+    }
+}
+
 impl<'a> std::fmt::Display for ClipboardTypes<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         f.write_str(
@@ -373,5 +388,37 @@ mod tests {
         assert_eq!(r.last_seq, 2);
         assert_eq!(r.applied_mask, 0b11);
         assert_eq!(r.delta, (3, 0));
+    }
+
+    /// A clipboard clear arrives as an empty types string. It must split into
+    /// ZERO mime types — `"".split(' ')` otherwise yields `[""]`, a phantom
+    /// empty type that the wayland writer would advertise (plus the ignore
+    /// marker) instead of taking its `mime_types.is_empty()` clear branch.
+    #[test]
+    fn empty_types_string_splits_to_no_types() {
+        let clear = ClipboardTypes {
+            types: "",
+            max_size_bytes: 0,
+        };
+        assert!(clear.types_vec().is_empty());
+    }
+
+    #[test]
+    fn types_vec_drops_empty_entries() {
+        let single = ClipboardTypes {
+            types: "text/plain",
+            max_size_bytes: 0,
+        };
+        assert_eq!(single.types_vec(), vec!["text/plain".to_string()]);
+        // Repeated separators (not produced by join, but tolerated) must not
+        // leak empty entries into the advertised types either.
+        let padded = ClipboardTypes {
+            types: "text/plain  image/png",
+            max_size_bytes: 0,
+        };
+        assert_eq!(
+            padded.types_vec(),
+            vec!["text/plain".to_string(), "image/png".to_string()]
+        );
     }
 }

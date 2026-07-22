@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::os::fd::AsFd;
+use std::io::{self, Read, Write};
+use std::os::fd::{AsFd, AsRawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -7,7 +8,8 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use os_pipe::{pipe, PipeReader};
-use tokio::{task, time};
+use rustix::fs::{fcntl_setfl, OFlags};
+use tokio::task;
 use tracing::{debug, trace, warn};
 use wayland_client::globals::registry_queue_init;
 use wayland_client::{Connection, EventQueue};
@@ -191,31 +193,20 @@ impl ClipboardReaderTrait for ClipboardReader {
             (inner, offer)
         })
         .await??;
-        let mut pipe_reader = if let Some(rdr) = offer {
+        let pipe_reader = if let Some(rdr) = offer {
             rdr
         } else {
             bail!("No clipboard available");
         };
 
-        // Read on a worker thread with a timeout: a hung local app could otherwise
-        // block the pipe read forever, freezing the whole event loop.
-        let buf = match time::timeout(
-            Duration::from_secs(CLIPBOARD_TIMEOUT_SECS),
-            task::spawn_blocking(move || -> Result<Vec<u8>> {
-                let mut limited = limited::LimitedCursor::new(max_size_bytes);
-                std::io::copy(&mut pipe_reader, &mut limited)?;
-                Ok(limited.into_inner())
-            }),
-        )
-        .await
-        {
-            Ok(Ok(read_result)) => read_result?,
-            Ok(Err(e)) => bail!("Wayland clipboard read worker failed: {:?}", e),
-            Err(_e) => {
-                warn!("Wayland clipboard read timed out after {}s", CLIPBOARD_TIMEOUT_SECS);
-                Vec::new()
-            }
-        };
+        // Read on a worker thread: a hung local app could otherwise block the
+        // pipe read forever, freezing the whole event loop. The worker
+        // enforces the deadline itself (see read_offer_pipe), so a timeout
+        // also releases the read end — no detached worker left parked on the
+        // pipe with the fd held open.
+        let buf = task::spawn_blocking(move || read_offer_pipe(pipe_reader, max_size_bytes))
+            .await
+            .context("Wayland clipboard read worker failed")??;
         debug!(
             "Read {} for {}: {} bytes",
             requested_type,
@@ -226,9 +217,58 @@ impl ClipboardReaderTrait for ClipboardReader {
     }
 }
 
+/// Reads a clipboard offer pipe to EOF with a deadline, so a hung source app
+/// can't block the read forever. The fd is set non-blocking and polled,
+/// mirroring write_paste_fd in writer.rs: on timeout the worker returns here
+/// and drops the pipe reader, closing the read end — rather than staying
+/// parked on the pipe with the fd held open. (Closing the fd from ANOTHER
+/// thread is not an alternative: on Linux that doesn't interrupt a blocked
+/// read, and the eventual double close could hit a reused fd.)
+fn read_offer_pipe(mut pipe_reader: PipeReader, max_size_bytes: u64) -> Result<Vec<u8>> {
+    fcntl_setfl(&pipe_reader, OFlags::NONBLOCK).map_err(io::Error::from)?;
+    let raw_fd = pipe_reader.as_raw_fd();
+    let deadline = std::time::Instant::now() + Duration::from_secs(CLIPBOARD_TIMEOUT_SECS);
+    let mut limited = limited::LimitedCursor::new(max_size_bytes);
+    let mut chunk = [0u8; 65536];
+    loop {
+        match pipe_reader.read(&mut chunk) {
+            // EOF: the source app closed its end.
+            Ok(0) => break,
+            Ok(n) => limited.write_all(&chunk[..n])?,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    // Same contract as the timeout this replaces: a timed-out
+                    // read serves nothing.
+                    warn!(
+                        "Wayland clipboard read timed out after {}s",
+                        CLIPBOARD_TIMEOUT_SECS
+                    );
+                    return Ok(Vec::new());
+                }
+                let mut pfd = libc::pollfd {
+                    fd: raw_fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                if unsafe { libc::poll(&mut pfd, 1, remaining.as_millis() as libc::c_int) } < 0 {
+                    let err = io::Error::last_os_error();
+                    if err.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(err).context("Failed to poll clipboard pipe");
+                }
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(limited.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::time;
 
     /// Completing work returns its result and hands the state back, so the
     /// slot is immediately usable for the next read.

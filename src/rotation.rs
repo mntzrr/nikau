@@ -14,7 +14,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task;
 use tracing::{debug, error, info, trace, warn};
 
-use crate::clipboard::{data, server};
+use crate::clipboard::{CLIPBOARD_SERVE_TIMEOUT_SECS, data, server};
 use crate::device;
 use crate::msgs::{bulk, event};
 
@@ -38,10 +38,19 @@ pub const ACTIVE_CLIENT_STATE_FILE: &str = "active_client";
 /// resuming a days-old session would be surprising.
 const ACTIVE_CLIENT_MAX_AGE: Duration = Duration::from_secs(3600);
 
-/// Minimum spacing between processed clipboard source updates. Clipboard
-/// managers (wl-clip-persist, wl-paste --watch) can turn one copy into dozens
-/// of updates per second; each processed update costs a fresh wayland
+/// Minimum spacing between processed clipboard source updates, per source
+/// (the local machine, or each client endpoint). Clipboard managers
+/// (wl-clip-persist, wl-paste --watch) can turn one copy into dozens of
+/// updates per second; each processed update costs a fresh wayland
 /// connection and data source on the compositor, so bursts are collapsed.
+/// Per-source, because one source's burst must not drop another source's
+/// update (e.g. a client's deactivate-announcement landing right after a
+/// local update). The LOCAL source debounces trailing-edge — an update
+/// inside the window is remembered and the newest one is applied when the
+/// window expires — because a dropped local state (fast double Ctrl+C) is
+/// never re-sent and would be lost outright. Remote sources use a plain
+/// leading-edge check: their announcements are switch-driven one-shots
+/// spaced by SWITCH_DEBOUNCE, so there is no final state to lose.
 const CLIPBOARD_UPDATE_DEBOUNCE: Duration = Duration::from_millis(300);
 
 /// Minimum spacing between processed rotation switches TO A CLIENT (next/prev).
@@ -66,8 +75,10 @@ struct ClientInfo {
     events_send: SendStream,
     /// Queue for the client's bulk writer task, which owns the actual bulk
     /// stream. Keeping large clipboard writes out of the rotation loop means
-    /// they never stall input forwarding.
-    bulk_tx: mpsc::UnboundedSender<Vec<u8>>,
+    /// they never stall input forwarding. Bounded (bulk::BULK_QUEUE_CAPACITY):
+    /// a client that can't drain is dropped like a write failure rather than
+    /// queueing clipboard payloads without limit.
+    bulk_tx: mpsc::Sender<Vec<u8>>,
     /// Connection handle for sending unreliable/unordered QUIC datagrams
     /// (used for high-rate pointer motion; see MotionDatagram).
     conn: quinn::Connection,
@@ -115,6 +126,18 @@ impl DefunctClientInfo {
 struct ClipboardTarget {
     /// None if the clipboard is at the server
     source: Option<SocketAddr>,
+    types: Vec<String>,
+    max_size_bytes: u64,
+}
+
+/// A local clipboard update held for the trailing edge of the debounce
+/// window (see CLIPBOARD_UPDATE_DEBOUNCE).
+#[derive(Debug)]
+struct PendingLocalClipboard {
+    /// When the debounce window expires (last processed local update +
+    /// CLIPBOARD_UPDATE_DEBOUNCE). The server events loop wakes at this
+    /// instant to apply the update.
+    deadline: Instant,
     types: Vec<String>,
     max_size_bytes: u64,
 }
@@ -396,10 +419,14 @@ pub struct Rotation<O: device::output::OutputHandler> {
     /// Self-handle for spawned tasks (e.g. per-client bulk writers) to report
     /// events back to the rotation loop, such as client removal on stream failure.
     rotation_tx: mpsc::Sender<RotationEvent>,
-    /// When the last clipboard source update was processed; used to debounce
-    /// machine-paced update bursts from clipboard managers (see
-    /// CLIPBOARD_UPDATE_DEBOUNCE).
-    last_clipboard_update: Option<Instant>,
+    /// When each clipboard source's last update was processed, for the
+    /// per-source debounce (see CLIPBOARD_UPDATE_DEBOUNCE). Keyed by source:
+    /// None = the local machine, Some(endpoint) = a client.
+    last_clipboard_update: HashMap<Option<SocketAddr>, Instant>,
+    /// Newest local update received inside the debounce window, applied when
+    /// the window expires (trailing edge). Remote sources don't get one:
+    /// their leading-edge check suffices (see CLIPBOARD_UPDATE_DEBOUNCE).
+    pending_local_clipboard: Option<PendingLocalClipboard>,
     /// Sequence number for the next pointer-motion datagram (per server; only
     /// monotonicity within a client connection matters for stale-drop).
     motion_seq: u64,
@@ -462,7 +489,8 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             pending_clipboard_requests: HashMap::new(),
             next_clipboard_request_id: 0,
             rotation_tx,
-            last_clipboard_update: None,
+            last_clipboard_update: HashMap::new(),
+            pending_local_clipboard: None,
             motion_seq: 0,
             motion_datagram_announced: false,
             status_counts: InputCounts::default(),
@@ -545,8 +573,10 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         // Dedicated writer task for this client's bulk stream: clipboard payloads
         // can be megabytes, and writing them inline would stall input forwarding
         // for the whole rotation. The task also keeps each header glued to its
-        // payload by writing queued byte blobs sequentially.
-        let (bulk_tx, mut bulk_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        // payload by writing queued byte blobs sequentially. The queue is
+        // bounded (bulk::BULK_QUEUE_CAPACITY): senders fail fast when the
+        // client can't drain, and the client is dropped like a write failure.
+        let (bulk_tx, mut bulk_rx) = mpsc::channel::<Vec<u8>>(bulk::BULK_QUEUE_CAPACITY);
         {
             let rotation_tx = self.rotation_tx.clone();
             let mut bulk_send = bulk_send;
@@ -1000,34 +1030,56 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         max_size_bytes: u64,
     ) -> Result<()> {
         debug!("Announcing new clipboard source: source={:?} current={:?} with max_size_bytes={} has types={:?}", source, self.current_client, max_size_bytes, types);
-        // A local update with no types means the compositor revoked the
-        // selection (the owning app exited and no clipboard manager persisted
-        // it): the tracked target is stale and must stop being announced, or
-        // every fetch against it fails. Clear right away, bypassing the
-        // debounce, and reset its timestamp so a clipboard manager re-owning
-        // the content immediately after isn't debounced away.
-        if source.is_none() && types.is_empty() {
-            self.last_clipboard_update = None;
+        // An update with no types means the selection is gone — locally (the
+        // compositor revoked it: the owning app exited and no clipboard
+        // manager persisted it) or on a client (its watcher saw the same and
+        // the client announced the clear). Either way the tracked target is
+        // stale and must stop being announced, or every fetch against it
+        // fails. Clear right away, bypassing the debounce, and reset the
+        // source's debounce state so a re-own right after (e.g. a clipboard
+        // manager persisting the content) is processed, not debounced away.
+        // This can't loop with the broadcast clear a client applies via
+        // set_remote_clipboard: that replaces the client's local types, so it
+        // is never re-announced as a local clipboard (see client.rs).
+        if types.is_empty() {
+            self.last_clipboard_update.remove(&source);
+            if source.is_none() {
+                // A revocation supersedes any update held for the trailing edge.
+                self.pending_local_clipboard = None;
+            }
             self.clipboard_clear().await;
             return Ok(());
         }
         // The clipboard changed hands: drop any cached served payload so
         // stale contents are never served. Lock-free (an epoch bump), so it
         // never waits on a serve in progress. This must happen even when the
-        // update is debounced away below: a debounced update still means the
-        // clipboard changed, and the old cache would otherwise keep being
-        // served.
+        // update is debounced below: a held update still means the clipboard
+        // changed, and the old cache would otherwise keep being served.
         if let Some(reader) = self.local_clipboard.as_ref().map(|lc| lc.reader_handle()) {
             reader.invalidate();
         }
-        // Debounce machine-paced bursts: clipboard managers (wl-clip-persist,
-        // wl-paste --watch) can turn one copy into dozens of source updates per
-        // second, and each processed update costs a fresh wayland connection
-        // and source on the compositor. Collapse bursts to one update per
-        // CLIPBOARD_UPDATE_DEBOUNCE; legit copies are human-paced and unaffected.
-        if let Some(last) = self.last_clipboard_update {
+        // Debounce machine-paced bursts per source: clipboard managers
+        // (wl-clip-persist, wl-paste --watch) can turn one copy into dozens of
+        // source updates per second, and each processed update costs a fresh
+        // wayland connection and source on the compositor. Collapse bursts to
+        // one update per CLIPBOARD_UPDATE_DEBOUNCE per source; legit copies
+        // are human-paced and unaffected. A LOCAL update inside the window is
+        // held for the trailing edge (only the newest is kept): the final
+        // state of a fast double copy is never re-sent, so dropping it would
+        // lose it outright. Remote updates use a plain leading-edge drop —
+        // they are switch-driven one-shots with no burst to collapse.
+        if let Some(last) = self.last_clipboard_update.get(&source) {
             if last.elapsed() < CLIPBOARD_UPDATE_DEBOUNCE {
-                debug!("Debouncing rapid clipboard source update");
+                if source.is_none() {
+                    debug!("Holding rapid local clipboard source update for the debounce window's trailing edge");
+                    self.pending_local_clipboard = Some(PendingLocalClipboard {
+                        deadline: *last + CLIPBOARD_UPDATE_DEBOUNCE,
+                        types,
+                        max_size_bytes,
+                    });
+                } else {
+                    debug!("Debouncing rapid clipboard source update from {:?}", source);
+                }
                 return Ok(());
             }
         }
@@ -1042,7 +1094,53 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                 return Ok(());
             }
         }
-        self.last_clipboard_update = Some(Instant::now());
+        self.last_clipboard_update.insert(source, Instant::now());
+        if source.is_none() {
+            // A directly processed local update supersedes a held one.
+            self.pending_local_clipboard = None;
+        }
+        self.apply_clipboard_source(source, types, max_size_bytes)
+            .await
+    }
+
+    /// When the held local clipboard update (if any) should be applied — the
+    /// trailing edge of its debounce window. The server events loop sleeps on
+    /// this and then calls flush_pending_local_clipboard.
+    pub fn pending_local_clipboard_deadline(&self) -> Option<Instant> {
+        self.pending_local_clipboard.as_ref().map(|p| p.deadline)
+    }
+
+    /// Applies the local clipboard update held by the debounce's trailing
+    /// edge (see CLIPBOARD_UPDATE_DEBOUNCE). Called by the server events loop
+    /// when the debounce window expires.
+    pub async fn flush_pending_local_clipboard(&mut self) {
+        let Some(pending) = self.pending_local_clipboard.take() else {
+            return;
+        };
+        // The same ping-pong guard as a directly processed update: the target
+        // may have converged on these types while the update was held.
+        if let Some(current) = &self.clipboard_target {
+            if current.source.is_none() && types_equal(&current.types, &pending.types) {
+                debug!("Ignoring held local clipboard update: matches the current target");
+                return;
+            }
+        }
+        self.last_clipboard_update.insert(None, Instant::now());
+        if let Err(e) = self
+            .apply_clipboard_source(None, pending.types, pending.max_size_bytes)
+            .await
+        {
+            warn!("Failed to apply held local clipboard update: {:?}", e);
+        }
+    }
+
+    /// Records a new clipboard target and announces it to the active side.
+    async fn apply_clipboard_source(
+        &mut self,
+        source: Option<SocketAddr>,
+        types: Vec<String>,
+        max_size_bytes: u64,
+    ) -> Result<()> {
         // Save the clipboard types/source for future retrievals and client switches
         self.clipboard_target = Some(ClipboardTarget {
             source,
@@ -1086,17 +1184,20 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         };
         // Sanity check: Is the requested type among the list of supported types?
         if !target.types.contains(&requested_type.to_string()) {
-            if let ClipboardRequestSource::Remote(client) = &request_source {
-                let client = *client;
-                self.reply_empty_clipboard_fetch(&client, requested_type, request_id.unwrap_or(0))
-                    .await;
-            }
-            bail!(
+            // Formatted up front: the empty reply takes &mut self, ending the
+            // borrow of the target.
+            let err = anyhow!(
                 "Requested clipboard type {} from source {} isn't among available types: {:?}",
                 requested_type,
                 request_source,
                 target.types
             );
+            if let ClipboardRequestSource::Remote(client) = &request_source {
+                let client = *client;
+                self.reply_empty_clipboard_fetch(&client, requested_type, request_id.unwrap_or(0))
+                    .await;
+            }
+            return Err(err);
         }
 
         // Figure out where the requested clipboard can be found
@@ -1216,16 +1317,14 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             };
             let reader = local_clipboard.reader_handle();
             // Look up the requesting client's bulk queue before spawning.
-            let bulk_tx = match self
+            let (bulk_tx, conn_token) = match self
                 .clients
                 .binary_search_by(|c| c.endpoint.cmp(request_client))
             {
-                Ok(idx) => self
-                    .clients
-                    .get(idx)
-                    .expect("missing request_client")
-                    .bulk_tx
-                    .clone(),
+                Ok(idx) => {
+                    let client = self.clients.get(idx).expect("missing request_client");
+                    (client.bulk_tx.clone(), client.conn_token)
+                }
                 Err(_idx) => {
                     warn!(
                         "Unable to send server clipboard data to {}: not connected (clients: {:?})",
@@ -1237,26 +1336,40 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             // Reading the clipboard can take seconds for large copies (files get
             // zipped from disk), so serve it from a spawned task: the rotation
             // loop must keep forwarding input meanwhile.
+            let rotation_tx = self.rotation_tx.clone();
             let request_client = *request_client;
             let requested_type = requested_type.to_string();
             task::spawn(async move {
-                // A failed read (clipboard gone, hung source app) still gets an
+                // A failed or slow read (clipboard gone, hung source app,
+                // long convert/zip under the serve mutex) still gets an
                 // immediate reply — empty content — so the requester's paste
                 // completes right away instead of waiting out its fetch
-                // timeout. The next paste simply re-requests.
-                let (content, data_type) = match server::LocalClipboard::read(
-                    &reader,
-                    &requested_type,
-                    max_size_bytes,
-                    &request_client,
+                // timeout. The overall timeout covers read AND convert, like
+                // the client-side serve path (CLIPBOARD_SERVE_TIMEOUT_SECS).
+                // The next paste simply re-requests.
+                let (content, data_type) = match tokio::time::timeout(
+                    Duration::from_secs(CLIPBOARD_SERVE_TIMEOUT_SECS),
+                    server::LocalClipboard::read(
+                        &reader,
+                        &requested_type,
+                        max_size_bytes,
+                        &request_client,
+                    ),
                 )
                 .await
                 {
-                    Ok(ok) => ok,
-                    Err(e) => {
+                    Ok(Ok(ok)) => ok,
+                    Ok(Err(e)) => {
                         warn!(
                             "Failed to read server clipboard for {}: {:?}",
                             request_client, e
+                        );
+                        (Vec::new(), None)
+                    }
+                    Err(_) => {
+                        warn!(
+                            "Timed out after {}s reading server clipboard for {}",
+                            CLIPBOARD_SERVE_TIMEOUT_SECS, request_client
                         );
                         (Vec::new(), None)
                     }
@@ -1270,11 +1383,21 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                 match postcard::to_stdvec_cobs(&msg) {
                     Ok(mut bytes) => {
                         bytes.extend_from_slice(&content);
-                        if bulk_tx.send(bytes).is_err() {
+                        // try_send, same policy as send_bulk: a full or closed
+                        // queue means the client isn't draining, so drop it
+                        // like a write failure — via the rotation's own
+                        // removal path (the token guards a replaced entry).
+                        if bulk_tx.try_send(bytes).is_err() {
                             warn!(
-                                "Unable to send server clipboard data to {}: bulk queue closed",
+                                "Unable to send server clipboard data to {}: bulk queue full or closed, removing client",
                                 request_client
                             );
+                            let _ = rotation_tx
+                                .send(RotationEvent::RemoveClient {
+                                    endpoint: request_client,
+                                    conn_token,
+                                })
+                                .await;
                         }
                     }
                     Err(e) => {
@@ -1292,7 +1415,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
     /// gone, the requested type isn't offered, or the owning peer is gone.
     /// Best-effort: an unconnected requester simply gets nothing, as before.
     async fn reply_empty_clipboard_fetch(
-        &self,
+        &mut self,
         request_client: &SocketAddr,
         requested_type: &str,
         request_id: u64,
@@ -1317,11 +1440,16 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         });
         match postcard::to_stdvec_cobs(&msg) {
             Ok(bytes) => {
-                if bulk_tx.send(bytes).is_err() {
+                // Same policy as send_bulk: a full or closed queue means the
+                // client isn't draining — drop it like a write failure.
+                if bulk_tx.try_send(bytes).is_err() {
                     warn!(
-                        "Unable to send empty clipboard reply to {}: bulk queue closed",
+                        "Unable to send empty clipboard reply to {}: bulk queue full or closed, removing client",
                         request_client
                     );
+                    if self.handle_client_removal(request_client).await {
+                        self.clipboard_clear().await;
+                    }
                 }
             }
             Err(e) => {
@@ -2039,22 +2167,32 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             trace!("Queueing {} byte payload for {}", payload.len(), endpoint);
             bytes.extend_from_slice(&payload);
         }
-        match self.clients.binary_search_by(|c| c.endpoint.cmp(endpoint)) {
-            Ok(idx) => {
-                let bulk_tx = &self
-                    .clients
+        // The network write happens in the client's bulk writer task, so large
+        // payloads never block the rotation loop. try_send keeps it that way
+        // with a bounded queue, and each queued blob is a whole frame, so
+        // nothing is dropped mid-message. A FULL queue means the client isn't
+        // draining (a closed one means its writer task died): drop the client
+        // like a write failure — it would die on the QUIC idle timeout anyway.
+        let sent = match self.clients.binary_search_by(|c| c.endpoint.cmp(endpoint)) {
+            Ok(idx) => Some(
+                self.clients
                     .get(idx)
                     .expect("missing current_client")
-                    .bulk_tx;
-                // The network write happens in the client's bulk writer task, so
-                // large payloads never block the rotation loop. A closed queue
-                // means the writer task died; it reports the removal itself.
-                match bulk_tx.send(bytes) {
-                    Ok(()) => Ok(true),
-                    Err(_) => Ok(false),
+                    .bulk_tx
+                    .try_send(bytes),
+            ),
+            Err(_idx) => None,
+        };
+        match sent {
+            Some(Ok(())) => Ok(true),
+            Some(Err(e)) => {
+                warn!("Bulk queue to {} failed ({}), removing client", endpoint, e);
+                if self.handle_client_removal(endpoint).await {
+                    self.clipboard_clear().await;
                 }
+                Ok(false)
             }
-            Err(_idx) => {
+            None => {
                 warn!(
                     "Bulk client {} not found in clients map: {:?}",
                     endpoint, self.clients
@@ -2171,12 +2309,26 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         self.broadcast_grab_state();
     }
 
+    /// Drops pending server-originated clipboard fetches whose requester
+    /// already gave up (timed out). New requests prune on arrival; this runs
+    /// from the server events loop's status tick so dead entries also get
+    /// pruned when no new requests arrive.
+    pub fn prune_pending_clipboard_requests(&mut self) {
+        self.pending_clipboard_requests
+            .retain(|_, tx| !tx.is_closed());
+    }
+
     /// Ensures that all clients and the server have their clipboard state cleared.
     /// To be called when handle_client_removal() returns true, when a client holding the clipboard has disconnected.
     /// Broken into a separate function to avoid recursive async calls.
     async fn clipboard_clear(&mut self) {
         debug!("Clearing clipboard on server and all clients");
         self.clipboard_target = None;
+
+        // Fail any server-originated fetches still waiting on the departed
+        // owner: dropping the senders errors the receivers immediately, so
+        // they resolve empty instead of waiting out the 5s fetch timeout.
+        self.pending_clipboard_requests.clear();
 
         // Clear the server's host clipboard status
         if let Some(c) = &mut self.local_clipboard {
@@ -2703,6 +2855,183 @@ mod tests {
             .await
             .unwrap();
         assert!(rotation.clipboard_target.is_some());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Builds a rotation for clipboard tests (no local clipboard, no clients;
+    /// a ClientInfo can't be fabricated without a QUIC connection).
+    async fn clipboard_rotation(name: &str) -> (PathBuf, Rotation<StubOutput>) {
+        let dir = temp_dir(name);
+        let (grab_tx, _grab_rx) = watch::channel(device::GrabState {
+            client_active: false,
+            paused: false,
+        });
+        let (rotation_tx, _rotation_rx) = mpsc::channel(8);
+        let rotation = Rotation::new(
+            grab_tx,
+            StubOutput { written: 0, released: 0 },
+            None,
+            &dir,
+            rotation_tx,
+            None,
+            Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
+        )
+        .await
+        .unwrap();
+        (dir, rotation)
+    }
+
+    #[tokio::test]
+    async fn clipboard_debounce_is_per_source() {
+        let (dir, mut rotation) = clipboard_rotation("clip-per-source").await;
+        let client_a: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let client_b: SocketAddr = "127.0.0.1:1235".parse().unwrap();
+
+        // A local update starts the LOCAL debounce window...
+        rotation
+            .clipboard_update_source(None, vec!["text/plain".to_string()], 1024)
+            .await
+            .unwrap();
+        // ...but a client update right after is a different source and must be
+        // processed (a global debounce would drop this deactivate-announcement).
+        rotation
+            .clipboard_update_source(Some(client_a), vec!["image/png".to_string()], 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            rotation.clipboard_target.as_ref().unwrap().source,
+            Some(client_a)
+        );
+        // A second client's update isn't debounced by the first client's either.
+        rotation
+            .clipboard_update_source(Some(client_b), vec!["text/html".to_string()], 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            rotation.clipboard_target.as_ref().unwrap().source,
+            Some(client_b)
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn local_clipboard_debounce_collapses_to_newest_on_trailing_edge() {
+        let (dir, mut rotation) = clipboard_rotation("clip-trailing").await;
+
+        rotation
+            .clipboard_update_source(None, vec!["one".to_string()], 1024)
+            .await
+            .unwrap();
+        // Two rapid local updates inside the window (e.g. a fast double
+        // Ctrl+C): neither applies immediately, and only the newest is held.
+        rotation
+            .clipboard_update_source(None, vec!["two".to_string()], 1024)
+            .await
+            .unwrap();
+        rotation
+            .clipboard_update_source(None, vec!["three".to_string()], 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            rotation.clipboard_target.as_ref().unwrap().types,
+            vec!["one".to_string()]
+        );
+        assert!(rotation.pending_local_clipboard.is_some());
+
+        // The window expires (the server events loop calls this from its
+        // timer): the newest held state is applied, never lost.
+        rotation.flush_pending_local_clipboard().await;
+        assert_eq!(
+            rotation.clipboard_target.as_ref().unwrap().types,
+            vec!["three".to_string()]
+        );
+        assert!(rotation.pending_local_clipboard.is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn remote_clipboard_debounce_is_leading_edge_without_trailing_state() {
+        let (dir, mut rotation) = clipboard_rotation("clip-remote-leading").await;
+        let client: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+
+        rotation
+            .clipboard_update_source(Some(client), vec!["one".to_string()], 1024)
+            .await
+            .unwrap();
+        // A same-client update inside the window is dropped outright: remote
+        // announcements are switch-driven one-shots, no final state is lost.
+        rotation
+            .clipboard_update_source(Some(client), vec!["two".to_string()], 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            rotation.clipboard_target.as_ref().unwrap().types,
+            vec!["one".to_string()]
+        );
+        // Remote sources never arm the local trailing-edge timer.
+        assert!(rotation.pending_local_clipboard.is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn local_revocation_supersedes_held_update() {
+        let (dir, mut rotation) = clipboard_rotation("clip-held-revoked").await;
+
+        rotation
+            .clipboard_update_source(None, vec!["one".to_string()], 1024)
+            .await
+            .unwrap();
+        rotation
+            .clipboard_update_source(None, vec!["two".to_string()], 1024)
+            .await
+            .unwrap();
+        assert!(rotation.pending_local_clipboard.is_some());
+        // The compositor revokes the selection before the window expires: the
+        // held (older) state must not resurrect it on the trailing edge.
+        rotation
+            .clipboard_update_source(None, vec![], 1024)
+            .await
+            .unwrap();
+        assert!(rotation.clipboard_target.is_none());
+        rotation.flush_pending_local_clipboard().await;
+        assert!(rotation.clipboard_target.is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn empty_remote_types_clear_clipboard_target() {
+        let (dir, mut rotation) = clipboard_rotation("clip-remote-clear").await;
+        let client: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+
+        rotation
+            .clipboard_update_source(Some(client), vec!["text/plain".to_string()], 1024)
+            .await
+            .unwrap();
+        assert!(rotation.clipboard_target.is_some());
+
+        // The owning app exited on the client: its watcher delivered empty
+        // types and the client announced the clear. The rotation target must
+        // not stay stale, same as a local revocation.
+        rotation
+            .clipboard_update_source(Some(client), vec![], 1024)
+            .await
+            .unwrap();
+        assert!(rotation.clipboard_target.is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn clipboard_clear_drops_pending_fetches() {
+        let (dir, mut rotation) = clipboard_rotation("clip-clear-pending").await;
+
+        // A server-originated fetch still waiting on its reply (e.g. the
+        // owner disconnected mid-fetch) must error immediately on clear, not
+        // wait out the 5s fetch timeout.
+        let (tx, rx) = oneshot::channel::<data::ClipboardData>();
+        rotation.pending_clipboard_requests.insert(0, tx);
+        rotation.clipboard_clear().await;
+        assert!(rx.await.is_err());
+        assert!(rotation.pending_clipboard_requests.is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 
