@@ -252,6 +252,10 @@ pub enum RotationEvent {
     /// Anything was received from a client (proof of liveness; see
     /// ServerEvent::Ping). Internal channel message only (never on the wire).
     ClientHeardFrom { endpoint: SocketAddr },
+    /// A client asked the server to take input back (client-initiated return
+    /// via screen-edge detection on the client; see ClientEvent::SwitchRequest).
+    /// Internal channel message only (never on the wire).
+    SwitchRequest { endpoint: SocketAddr },
 }
 
 pub struct AddClientArgs {
@@ -800,6 +804,9 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             }
             RotationEvent::ClientHeardFrom { endpoint } => {
                 self.note_client_heard(endpoint).await;
+            }
+            RotationEvent::SwitchRequest { endpoint } => {
+                self.switch_request_from_client(endpoint).await;
             }
         }
     }
@@ -2015,6 +2022,32 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                 }
             );
         }
+    }
+
+    /// Honors a client's return-to-local request (client-initiated return via
+    /// screen-edge detection on the client; see ClientEvent::SwitchRequest):
+    /// only the CURRENT client may hand input back — a request from any other
+    /// endpoint is stale (or misbehaving) and is ignored. The switch itself
+    /// reuses the normal path (update_current_client(None) also sends
+    /// Switch(false) to the client, so it releases its keys); the server's
+    /// cursor is already parked at the edge the switch out left from, so
+    /// cursor continuity needs nothing else.
+    async fn switch_request_from_client(&mut self, endpoint: SocketAddr) {
+        if self.current_client != Some(endpoint) {
+            debug!(
+                "Ignoring switch request from {}: not the current client (current: {:?})",
+                endpoint, self.current_client
+            );
+            return;
+        }
+        let fingerprint = self
+            .clients
+            .iter()
+            .find(|c| c.endpoint == endpoint)
+            .map(|c| c.fingerprint.as_str())
+            .unwrap_or("<unknown>");
+        info!("Client {} requested return to local (edge)", fingerprint);
+        self.update_current_client(None).await;
     }
 
     /// App-level liveness check (see ServerEvent::Ping): called every
@@ -4012,6 +4045,39 @@ mod tests {
         let state = &rotation.liveness[&endpoint];
         assert!(state.silenced_since.is_some());
         assert_eq!(state.recovery_pongs, 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn switch_request_from_current_client_switches_local() {
+        let (dir, mut rotation, grab_rx) = liveness_rotation("switch-request").await;
+        let endpoint: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        rotation.current_client = Some(endpoint);
+
+        // The current client asks for the return: input goes local and the
+        // devices ungrab (the fabricated endpoint's Switch(false) send fails
+        // benignly, like the liveness tests).
+        rotation.switch_request_from_client(endpoint).await;
+        assert_eq!(rotation.current_client, None);
+        assert!(!grab_rx.borrow().client_active);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn switch_request_from_non_current_client_is_ignored() {
+        let (dir, mut rotation, _grab_rx) = liveness_rotation("switch-request-stale").await;
+        let current: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let other: SocketAddr = "127.0.0.1:1235".parse().unwrap();
+        rotation.current_client = Some(current);
+
+        // A request from a client that doesn't have input changes nothing.
+        rotation.switch_request_from_client(other).await;
+        assert_eq!(rotation.current_client, Some(current));
+
+        // Nor does any request while input is already local.
+        rotation.current_client = None;
+        rotation.switch_request_from_client(other).await;
+        assert_eq!(rotation.current_client, None);
         let _ = fs::remove_dir_all(&dir);
     }
 

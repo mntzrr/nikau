@@ -254,8 +254,14 @@ undeliverable on Hyprland), 2-poll debounce, multi-monitor exposed-edge
 computation with corner dead zones (~8%/end),
 250 ms dwell (`--edge-dwell-ms`) plus 1s re-arm cooldown, targets resolve to
 a fingerprint at switch time from the live client list (prefix / `auto` /
-hostname→IP). No protocol change: the switch reuses `set_client`. Later
-phases may add other compositors and client-side (edge-of-client) switching.
+hostname→IP). No protocol change: the switch reuses `set_client`.
+Phase 9B (client-initiated return) implemented 2026-07-22 (v4.0.0, protocol
+v11) — the client runs the same edge detection on its own machine
+(`monux client --edge-map left=auto`, `auto` only); a completed dwell sends
+the new `ClientEvent::SwitchRequest { y_fraction }` (the crossing fraction
+along the edge, reserved for future cursor warping), which the server honors
+only from the current client, switching back to local through the normal
+rotation path. Later phases may add other compositors.
 
 Move cursor off a screen edge to switch machines. Hyprland-only initially
 (compositor IPC for cursor position/monitor layout); needs edge resistance,

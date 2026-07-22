@@ -118,6 +118,8 @@ pub async fn run<O: output::OutputHandler>(
     scroll_scale: f64,
     control_state: Arc<crate::control::ClientStateMirror>,
     bulk_throttle_mbps: Option<f64>,
+    edge_map: Option<crate::edge::EdgeMap>,
+    edge_dwell: Duration,
 ) -> Result<()> {
     let (mut client, connect_time) = Connection::new(
         server_addr,
@@ -143,6 +145,15 @@ pub async fn run<O: output::OutputHandler>(
     // legitimately exceeds them, so it only runs in Local mode.
     if mode == transport::NetworkMode::Local {
         task::spawn(monitor_link(client.conn().clone()));
+    }
+    // Screen-edge switching back to the server (opt-in via --edge-map): the
+    // detector runs per connection and queues the edge-crossing fraction
+    // here; the step loop turns it into a SwitchRequest on the events
+    // stream. Dropping the receiver (connection teardown) quiets it.
+    if let Some(map) = edge_map {
+        let (request_tx, request_rx) = mpsc::unbounded_channel::<f64>();
+        task::spawn(crate::edge::run_client(map, edge_dwell, request_tx));
+        client.switch_request_rx = Some(request_rx);
     }
     loop {
         if let Err(e) = client
@@ -220,6 +231,11 @@ struct Connection {
     /// Live-state mirror for the control socket (control.rs): Switch events
     /// update `active`; the lifecycle in main.rs drives (dis)connected.
     control_state: Arc<crate::control::ClientStateMirror>,
+    /// Receives edge-crossing fractions from the screen-edge detector
+    /// (edge.rs, --edge-map), which the step loop turns into SwitchRequest
+    /// messages on the events stream. None when the feature is off (no
+    /// --edge-map, or the detector exited on an unavailable Hyprland IPC).
+    switch_request_rx: Option<mpsc::UnboundedReceiver<f64>>,
 }
 
 impl Connection {
@@ -356,6 +372,7 @@ impl Connection {
                 fresh_activation: true,
                 scaler: DeltaScaler::new(mouse_scale, scroll_scale),
                 control_state,
+                switch_request_rx: None,
             },
             connect_time,
         ))
@@ -482,6 +499,21 @@ impl Connection {
                     trace!("Received {} bytes from bulk stream", resp.bytes.len());
                     self.handle_bulk_data_or_messages(Some(local_clipboard), resp.bytes).await?;
                 },
+                switch_request = async {
+                    match &mut self.switch_request_rx {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match switch_request {
+                        // The screen-edge detector fired: ask the server to
+                        // take input back (see ClientEvent::SwitchRequest).
+                        Some(y_fraction) => self.send_switch_request(y_fraction).await?,
+                        // The detector is gone (Hyprland IPC unavailable):
+                        // the feature turns off, the connection is unaffected.
+                        None => self.switch_request_rx = None,
+                    }
+                },
             }
         } else {
             // Local clipboard disabled: Don't select on local clipboard events
@@ -516,9 +548,38 @@ impl Connection {
                     trace!("Received {} bytes from bulk stream: {:X?}", resp.bytes.len(), &*resp.bytes);
                     self.handle_bulk_data_or_messages(None, resp.bytes).await?;
                 },
+                switch_request = async {
+                    match &mut self.switch_request_rx {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match switch_request {
+                        // The screen-edge detector fired: ask the server to
+                        // take input back (see ClientEvent::SwitchRequest).
+                        Some(y_fraction) => self.send_switch_request(y_fraction).await?,
+                        // The detector is gone (Hyprland IPC unavailable):
+                        // the feature turns off, the connection is unaffected.
+                        None => self.switch_request_rx = None,
+                    }
+                },
             }
         }
         Ok(())
+    }
+
+    /// Asks the server to switch input back to the local machine (see
+    /// ClientEvent::SwitchRequest), on the ordered, reliable events stream.
+    async fn send_switch_request(&mut self, y_fraction: f64) -> Result<()> {
+        debug!("Sending switch request to server (y fraction {:.2})", y_fraction);
+        let serializedmsg = postcard::to_stdvec_cobs(&event::ClientEvent::SwitchRequest {
+            y_fraction,
+        })
+        .map_err(|e| anyhow!("Failed to serialize switch request message: {:?}", e))?;
+        self.events_send
+            .write_all(&serializedmsg)
+            .await
+            .context("Failed to send switch request message")
     }
 
     async fn handle_event_messages<O: output::OutputHandler>(

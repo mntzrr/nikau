@@ -299,6 +299,21 @@ struct ClientArgs {
     #[arg(long, default_value_t = 40.0, value_name = "mbps", value_parser = parse_bulk_throttle)]
     bulk_throttle_mbps: f64,
 
+    /// Switching BACK to the server by screen edge (Hyprland only for now):
+    /// while this client has input, pushing the cursor against this screen
+    /// edge and dwelling there asks the server to take input back. Same
+    /// syntax as the server's --edge-map, but the only valid target is
+    /// 'auto' (the server — a client has exactly one peer). Multi-monitor
+    /// setups expose only the outer edge segments; ~8% at each end of a
+    /// segment is a corner dead zone.
+    #[arg(long, value_name = "direction=auto")]
+    edge_map: Option<Vec<String>>,
+
+    /// How long the cursor must dwell on a mapped screen edge before the
+    /// return request fires, in milliseconds (see --edge-map)
+    #[arg(long, default_value_t = 250, value_name = "ms")]
+    edge_dwell_ms: u64,
+
     /// Disable the automatic background update (on by default): a daily check
     /// at low CPU priority, then an automatic restart into the new binary.
     /// The session resumes automatically on reconnect.
@@ -737,6 +752,13 @@ fn main() -> Result<()> {
                     mbps
                 );
             }
+            // Screen-edge switching back to the server is opt-in: no
+            // --edge-map, no edge detection. Client targets are validated at
+            // startup ('auto' only), not at fire time.
+            let edge_map = match &args.edge_map {
+                Some(specs) => Some(monux::edge::parse_client_edge_map(specs)?),
+                None => None,
+            };
             rt.block_on(async {
                 client(
                     config_dir,
@@ -748,6 +770,8 @@ fn main() -> Result<()> {
                     args.mouse_scale,
                     args.scroll_scale,
                     bulk_throttle_mbps,
+                    edge_map,
+                    Duration::from_millis(args.edge_dwell_ms),
                     !args.no_auto_update,
                     !args.no_indicator,
                 )
@@ -1121,6 +1145,8 @@ async fn client(
     mouse_scale: f64,
     scroll_scale: f64,
     bulk_throttle_mbps: Option<f64>,
+    edge_map: Option<monux::edge::EdgeMap>,
+    edge_dwell: Duration,
     auto_update: bool,
     auto_indicator: bool,
 ) -> Result<()> {
@@ -1186,6 +1212,8 @@ async fn client(
                 scroll_scale,
                 control_state.clone(),
                 bulk_throttle_mbps,
+                edge_map.clone(),
+                edge_dwell,
             ) => {
                 // client::run only returns on failure (its loop never exits otherwise).
                 if let Err(e) = run_result {
@@ -1339,6 +1367,37 @@ mod tests {
         let cli = Cli::try_parse_from(["monux", "server"]).unwrap();
         let Commands::Server(args) = cli.command else {
             panic!("expected the server subcommand")
+        };
+        assert!(args.edge_map.is_none());
+        assert_eq!(args.edge_dwell_ms, 250);
+    }
+
+    #[test]
+    fn client_accepts_edge_map_and_dwell() {
+        let cli = Cli::try_parse_from([
+            "monux",
+            "client",
+            "10.0.0.1",
+            "--edge-map",
+            "left=auto",
+            "--edge-map",
+            "top=auto",
+            "--edge-dwell-ms",
+            "400",
+        ])
+        .unwrap();
+        let Commands::Client(args) = cli.command else {
+            panic!("expected the client subcommand")
+        };
+        let specs = args.edge_map.expect("edge map should be set");
+        assert_eq!(specs, vec!["left=auto", "top=auto"]);
+        assert_eq!(args.edge_dwell_ms, 400);
+        assert!(monux::edge::parse_client_edge_map(&specs).is_ok());
+
+        // Defaults: no edge map, 250ms dwell.
+        let cli = Cli::try_parse_from(["monux", "client", "10.0.0.1"]).unwrap();
+        let Commands::Client(args) = cli.command else {
+            panic!("expected the client subcommand")
         };
         assert!(args.edge_map.is_none());
         assert_eq!(args.edge_dwell_ms, 250);

@@ -555,6 +555,16 @@ async fn handle_event_messages(
                 // handle_connection (ClientHeardFrom); nothing else to do.
                 trace!("Got pong from client {}", source);
             }
+            event::ClientEvent::SwitchRequest { .. } => {
+                // Client-initiated return to the local machine (screen-edge
+                // detection on the client). y_fraction is reserved for future
+                // cursor warping and ignored for now; the rotation honors the
+                // request only when this client is the current one.
+                debug!("Got switch request from client {}", source);
+                rotation_tx
+                    .send(rotation::RotationEvent::SwitchRequest { endpoint: source })
+                    .await?;
+            }
             event::ClientEvent::ClipboardTypes(t) => {
                 // Client broadcasted new clipboard types for server (and other clients) to advertise.
                 // An empty types string (the client's clipboard was cleared) splits

@@ -22,14 +22,14 @@ mod golden_tests {
     /// The update gate keys on the protocol version: bumping it must be a
     /// conscious red test (and per AGENTS.md a MAJOR crate version bump).
     #[test]
-    fn protocol_version_is_10() {
-        assert_eq!(shared::PROTOCOL_VERSION, 10);
+    fn protocol_version_is_11() {
+        assert_eq!(shared::PROTOCOL_VERSION, 11);
     }
 
     #[test]
     fn golden_version_bootstrap() {
-        let msg = shared::VersionBootstrapMessage { version: 10 };
-        assert_eq!(cobs_hex(&msg), "020a00");
+        let msg = shared::VersionBootstrapMessage { version: 11 };
+        assert_eq!(cobs_hex(&msg), "020b00");
     }
 
     #[test]
@@ -84,6 +84,14 @@ mod golden_tests {
     fn golden_client_event_pong() {
         let msg = event::ClientEvent::Pong;
         assert_eq!(cobs_hex(&msg), "020100");
+    }
+
+    #[test]
+    fn golden_client_event_switch_request() {
+        // Appended variant (protocol v11): variant index 2 followed by the
+        // f64 fraction little-endian.
+        let msg = event::ClientEvent::SwitchRequest { y_fraction: 0.5 };
+        assert_eq!(cobs_hex(&msg), "0202010101010103e03f00");
     }
 
     #[test]

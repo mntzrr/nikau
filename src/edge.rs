@@ -1,9 +1,18 @@
-//! Server-side screen-edge switching (opt-in via --edge-map): when the local
-//! cursor is pushed against a configured screen edge and dwells there, input
-//! switches to the client mapped to that edge — the classic "screen-edge KVM"
-//! behavior. The switch itself reuses the existing rotation path
-//! (Event::SwitchTo → Rotation::set_client), so debounce/pause/no-op cleanup
-//! all apply for free; there is no protocol change.
+//! Screen-edge switching (opt-in via --edge-map), in two modes sharing one
+//! detection machinery:
+//!
+//! SERVER: when the local cursor is pushed against a configured screen edge
+//! and dwells there, input switches to the client mapped to that edge — the
+//! classic "screen-edge KVM" behavior. The switch itself reuses the existing
+//! rotation path (Event::SwitchTo → Rotation::set_client), so
+//! debounce/pause/no-op cleanup all apply for free.
+//!
+//! CLIENT (run_client): when the cursor is pushed against a configured edge
+//! of the CLIENT machine and dwells there, the client asks the server to
+//! take input back (ClientEvent::SwitchRequest, carrying the fraction along
+//! the edge where the cursor crossed — reserved for future cursor warping).
+//! The only valid target on a client is `auto` (its one peer, the server);
+//! the server honors the request only from the current client.
 //!
 //! Detection polls the cursor position from Hyprland's IPC every
 //! POLL_INTERVAL (Hyprland delivers no usable pointer enter/leave at screen
@@ -126,6 +135,24 @@ pub fn parse_edge_map(specs: &[String]) -> Result<EdgeMap> {
     }
     if map.targets.is_empty() {
         bail!("--edge-map requires at least one direction=target entry");
+    }
+    Ok(map)
+}
+
+/// Parses --edge-map on the CLIENT: same syntax as the server's, but the
+/// only valid target is `auto` (meaning "the server" — a client has exactly
+/// one peer), so a fingerprint/hostname target is a config error at startup
+/// here rather than a runtime resolution failure.
+pub fn parse_client_edge_map(specs: &[String]) -> Result<EdgeMap> {
+    let map = parse_edge_map(specs)?;
+    for (dir, target) in &map.targets {
+        if *target != EdgeTarget::Auto {
+            bail!(
+                "invalid --edge-map target '{}' for the {} edge: on a client the only valid target is 'auto' (the server)",
+                target,
+                dir.as_str()
+            );
+        }
     }
     Ok(map)
 }
@@ -608,6 +635,19 @@ fn zone_contains(zone: &EdgeZone, x: i32, y: i32) -> bool {
     }
 }
 
+/// Where along a zone's range the cursor at (x, y) sits, as a fraction
+/// (0.0..=1.0): the y fraction for left/right edges, the x fraction for
+/// top/bottom. Sent with the client's return request (see
+/// ClientEvent::SwitchRequest; reserved for future cursor warping — the
+/// server ignores it for now).
+fn edge_fraction(zone: &EdgeZone, x: i32, y: i32) -> f64 {
+    let along = match zone.direction {
+        Direction::Left | Direction::Right => y,
+        Direction::Top | Direction::Bottom => x,
+    };
+    ((along - zone.start) as f64 / zone.len as f64).clamp(0.0, 1.0)
+}
+
 /// Turns a layout into trigger zones for the mapped directions: exposed
 /// segments only, corner dead zones applied.
 fn edge_zones(map: &EdgeMap, layout: &[OutputRect]) -> Vec<EdgeZone> {
@@ -715,15 +755,49 @@ impl EdgeDebounce {
 /// trigger zones.
 const LAYOUT_REQUERY_INTERVAL: Duration = Duration::from_secs(30);
 
-/// The edge manager task: spawns the cursor poller, owns the trigger zones,
-/// the dwell state machines, target resolution, and the periodic layout
-/// re-query. Exits (disabling the feature) when Hyprland's IPC is
-/// unavailable; otherwise runs until the server shuts down.
+/// What a completed dwell fires. Server mode resolves the edge's target and
+/// fires Event::SwitchTo into the rotation; client mode asks the server to
+/// take input back, carrying the fraction along the edge where the cursor
+/// crossed (see ClientEvent::SwitchRequest).
+enum Fire {
+    /// Server mode: the rotation's event queue.
+    Event(mpsc::Sender<Event>),
+    /// Client mode: the queue the client connection's event loop drains onto
+    /// its events stream; closed means the connection (and with it the
+    /// receiver) is gone — detection goes quiet while disconnected.
+    Request(mpsc::UnboundedSender<f64>),
+}
+
+/// The edge manager task, server mode: spawns the cursor poller, owns the
+/// trigger zones, the dwell state machines, target resolution, and the
+/// periodic layout re-query. Exits (disabling the feature) when Hyprland's
+/// IPC is unavailable; otherwise runs until the server shuts down.
 pub async fn run(
     map: EdgeMap,
     dwell: Duration,
     event_tx: mpsc::Sender<Event>,
-    mut clients_rx: watch::Receiver<Vec<(SocketAddr, String)>>,
+    clients_rx: watch::Receiver<Vec<(SocketAddr, String)>>,
+) {
+    run_inner(map, dwell, Fire::Event(event_tx), Some(clients_rx)).await
+}
+
+/// The edge manager task, client mode: same detection as the server, but a
+/// completed dwell sends the server a return request (the fraction along the
+/// edge) instead of switching to a client. Spawned per connection: it exits
+/// when the connection's request receiver is dropped, so detection is quiet
+/// while disconnected.
+pub async fn run_client(map: EdgeMap, dwell: Duration, request_tx: mpsc::UnboundedSender<f64>) {
+    run_inner(map, dwell, Fire::Request(request_tx), None).await
+}
+
+/// The shared edge manager loop (see run / run_client). `clients_rx` is the
+/// live client list the server resolves targets against; None in client
+/// mode, where the one peer (the server) needs no resolution.
+async fn run_inner(
+    map: EdgeMap,
+    dwell: Duration,
+    fire: Fire,
+    mut clients_rx: Option<watch::Receiver<Vec<(SocketAddr, String)>>>,
 ) {
     let layout = match hyprland_layout() {
         Ok(layout) if !layout.is_empty() => layout,
@@ -774,7 +848,12 @@ pub async fn run(
             )
         })
         .collect();
-    log_edge_resolutions(&map, &clients_rx.borrow());
+    if let Some(rx) = &clients_rx {
+        log_edge_resolutions(&map, &rx.borrow());
+    }
+    // The last polled cursor position: client mode reads the crossing
+    // fraction off it at fire time.
+    let mut last_pos: Option<(i32, i32)> = None;
 
     let mut requery = time::interval(LAYOUT_REQUERY_INTERVAL);
     // Skip the immediate first tick; the startup query just ran.
@@ -787,6 +866,7 @@ pub async fn run(
                     warn!("Screen-edge switching disabled: the cursor poller is gone");
                     return;
                 };
+                last_pos = Some((x, y));
                 let now = Instant::now();
                 for (dir, state) in dirs.iter_mut() {
                     let on = zones
@@ -802,12 +882,32 @@ pub async fn run(
                     }
                 }
             }
-            changed = clients_rx.changed() => {
+            // Server mode only: re-log target resolutions on client
+            // (dis)connect. Pending forever in client mode (no client list).
+            changed = async {
+                match &mut clients_rx {
+                    Some(rx) => rx.changed().await,
+                    None => std::future::pending().await,
+                }
+            } => {
                 if changed.is_err() {
                     // The rotation loop is gone: the server is shutting down.
                     return;
                 }
-                log_edge_resolutions(&map, &clients_rx.borrow());
+                if let Some(rx) = &clients_rx {
+                    log_edge_resolutions(&map, &rx.borrow());
+                }
+            }
+            // Client mode only: the request receiver was dropped with the
+            // connection — go quiet until a new connection respawns us.
+            _ = async {
+                match &fire {
+                    Fire::Request(request_tx) => request_tx.closed().await,
+                    Fire::Event(_) => std::future::pending().await,
+                }
+            } => {
+                debug!("Screen-edge switching: connection gone, edge detection off");
+                return;
             }
             _ = requery.tick() => {
                 match hyprland_layout() {
@@ -850,17 +950,44 @@ pub async fn run(
                     }
                     // Fired: the timer reset and started its re-arm cooldown.
                     state.deadline = None;
-                    let clients = clients_rx.borrow().clone();
-                    let target = &map.targets[dir];
-                    match resolve_edge_target(target, &clients, &resolve_hostname) {
-                        Ok(fingerprint) => {
-                            info!("Edge switch to client {} via {} edge", fingerprint, dir.as_str());
-                            if let Err(e) = event_tx.send(Event::SwitchTo(fingerprint)).await {
-                                warn!("Failed to submit edge switch event: {:?}", e);
+                    match &fire {
+                        Fire::Event(event_tx) => {
+                            let clients = clients_rx
+                                .as_ref()
+                                .expect("server mode always carries the client list")
+                                .borrow()
+                                .clone();
+                            let target = &map.targets[dir];
+                            match resolve_edge_target(target, &clients, &resolve_hostname) {
+                                Ok(fingerprint) => {
+                                    info!("Edge switch to client {} via {} edge", fingerprint, dir.as_str());
+                                    if let Err(e) = event_tx.send(Event::SwitchTo(fingerprint)).await {
+                                        warn!("Failed to submit edge switch event: {:?}", e);
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("Edge switch via {} edge did not fire: {}", dir.as_str(), e);
+                                }
                             }
                         }
-                        Err(e) => {
-                            warn!("Edge switch via {} edge did not fire: {}", dir.as_str(), e);
+                        Fire::Request(request_tx) => {
+                            // Where along the edge the cursor crossed, off the
+                            // last polled position inside this direction's
+                            // zone (0.5 if it slipped out between polls).
+                            let y_fraction = last_pos
+                                .and_then(|(x, y)| {
+                                    zones
+                                        .iter()
+                                        .find(|zone| zone.direction == *dir && zone_contains(zone, x, y))
+                                        .map(|zone| edge_fraction(zone, x, y))
+                                })
+                                .unwrap_or(0.5);
+                            info!("Edge switch request to server via {} edge", dir.as_str());
+                            if request_tx.send(y_fraction).is_err() {
+                                // The connection (and its receiver) is gone.
+                                debug!("Screen-edge switching: connection gone, edge detection off");
+                                return;
+                            }
                         }
                     }
                 }
@@ -1275,6 +1402,51 @@ mod tests {
         assert!(parse_edge_map(&["right=auto,right=laptop".to_string()]).is_err());
         // Nothing usable at all.
         assert!(parse_edge_map(&["".to_string()]).is_err());
+    }
+
+    #[test]
+    fn client_edge_map_accepts_only_auto() {
+        // 'auto' on one or several edges is fine, in both syntax forms.
+        let map = parse_client_edge_map(&["left=auto".to_string()]).unwrap();
+        assert_eq!(map.targets[&Direction::Left], EdgeTarget::Auto);
+        let map = parse_client_edge_map(&["left=auto".to_string(), "top=auto,bottom=auto".to_string()])
+            .unwrap();
+        assert_eq!(map.targets.len(), 3);
+        // A fingerprint prefix or a hostname is a config error on the client:
+        // its only peer is the server.
+        assert!(parse_client_edge_map(&["left=aa11bb".to_string()]).is_err());
+        assert!(parse_client_edge_map(&["left=laptop".to_string()]).is_err());
+        // ... even mixed with a valid entry.
+        assert!(parse_client_edge_map(&["left=auto,right=laptop".to_string()]).is_err());
+        // The base syntax errors still apply.
+        assert!(parse_client_edge_map(&["left".to_string()]).is_err());
+    }
+
+    #[test]
+    fn edge_fraction_tracks_the_along_axis() {
+        // A left/right zone reads the y fraction of its range.
+        let zone = EdgeZone {
+            direction: Direction::Left,
+            output: "A".to_string(),
+            edge: 0,
+            start: 100,
+            len: 200,
+        };
+        assert_eq!(edge_fraction(&zone, 0, 100), 0.0);
+        assert_eq!(edge_fraction(&zone, 0, 200), 0.5);
+        assert_eq!(edge_fraction(&zone, 0, 299), 0.995);
+        // Out-of-range positions clamp into 0.0..=1.0.
+        assert_eq!(edge_fraction(&zone, 0, 50), 0.0);
+        assert_eq!(edge_fraction(&zone, 0, 400), 1.0);
+        // A top/bottom zone reads the x fraction instead.
+        let zone = EdgeZone {
+            direction: Direction::Top,
+            output: "A".to_string(),
+            edge: 0,
+            start: 1000,
+            len: 500,
+        };
+        assert_eq!(edge_fraction(&zone, 1250, 0), 0.5);
     }
 
     #[test]

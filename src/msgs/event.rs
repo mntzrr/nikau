@@ -46,6 +46,15 @@ pub enum ClientEvent<'a> {
     /// message counts as liveness on the server; Pong exists so that an
     /// otherwise idle client has something to say. Appended variant.
     Pong,
+
+    /// Asks the server to switch input back to the local machine, sent by
+    /// the client's own screen-edge detection when the cursor dwells on a
+    /// mapped edge of the client machine (see edge.rs). `y_fraction`
+    /// (0.0..=1.0) is where along the edge the cursor crossed, reserved for
+    /// future cursor warping — the server ignores it for now. The server
+    /// honors the request only when this client is the current one.
+    /// Appended variant (protocol v11).
+    SwitchRequest { y_fraction: f64 },
 }
 
 impl<'a> std::fmt::Display for ClientEvent<'a> {
@@ -53,6 +62,9 @@ impl<'a> std::fmt::Display for ClientEvent<'a> {
         match self {
             ClientEvent::ClipboardTypes(e) => e.fmt(f),
             ClientEvent::Pong => f.write_str("Pong"),
+            ClientEvent::SwitchRequest { y_fraction } => {
+                f.write_str(format!("SwitchRequest(y_fraction={})", y_fraction).as_str())
+            }
         }
     }
 }
@@ -353,6 +365,15 @@ mod tests {
         // survive the postcard + COBS round trip like any payload message.
         assert_cobs_roundtrip!(ServerEvent, ServerEvent::Ping);
         assert_cobs_roundtrip!(ClientEvent, ClientEvent::Pong);
+    }
+
+    #[test]
+    fn switch_request_roundtrip() {
+        // The client-initiated return (protocol v11): the fraction must
+        // survive intact at the range extremes and in between.
+        for y_fraction in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            assert_cobs_roundtrip!(ClientEvent, ClientEvent::SwitchRequest { y_fraction });
+        }
     }
 
     #[test]
