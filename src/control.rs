@@ -237,11 +237,15 @@ impl std::fmt::Display for State {
                 }
                 writeln!(f, "clients ({}):", s.clients.len())?;
                 for c in &s.clients {
+                    // Lead with the fingerprint prefix that --edge-map and
+                    // --shortcut-goto accept, so it's copy-paste ready.
+                    let prefix: String = c.fingerprint.chars().take(8).collect();
                     writeln!(
                         f,
-                        "  {} fingerprint {} connected {}s ago, rtt {}",
+                        "  {} fingerprint {} (prefix: {}) connected {}s ago, rtt {}",
                         c.addr,
                         c.fingerprint,
+                        prefix,
                         c.connected_since_secs,
                         c.rtt_ms
                             .map(|rtt| format!("{}ms", rtt))
@@ -1351,7 +1355,9 @@ mod tests {
         assert!(text.contains("current target: 10.0.0.2:1213"));
         assert!(text.contains("paused:         yes"));
         assert!(text.contains("available (abc123)"));
-        assert!(text.contains("10.0.0.2:1213 fingerprint d1d88653 connected 42s ago, rtt 1ms"));
+        assert!(text.contains(
+            "10.0.0.2:1213 fingerprint d1d88653 (prefix: d1d88653) connected 42s ago, rtt 1ms"
+        ));
         assert!(text.contains("owner:          local"));
 
         let client: State = serde_json::from_str(
