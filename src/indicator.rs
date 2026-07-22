@@ -231,8 +231,14 @@ fn details_of(state: &State) -> String {
 enum MenuRow {
     /// A disabled informative row.
     Label(String),
-    /// An enabled row triggering a control-socket action.
-    Action(String, MenuAction),
+    /// A row triggering a control-socket action; `enabled: false` renders it
+    /// greyed out (used for switch rows while the server is paused: rotation
+    /// drops switches then, so a clickable row would silently do nothing).
+    Action {
+        label: String,
+        action: MenuAction,
+        enabled: bool,
+    },
     Separator,
 }
 
@@ -277,31 +283,38 @@ fn menu_rows(state: Option<&State>) -> Vec<MenuRow> {
         Some(State::Server(s)) => {
             rows.push(MenuRow::Label(format!("Input: {}", s.current_target)));
             rows.push(MenuRow::Separator);
+            // While paused, rotation drops switch events (the paused guard),
+            // so the switch rows are greyed out: a clickable row would ack
+            // the command yet visibly do nothing. Resume stays enabled.
+            let switching_enabled = !s.paused;
             if s.current_target != "local" {
-                rows.push(MenuRow::Action(
-                    "Switch to local".to_string(),
-                    MenuAction::SwitchLocal,
-                ));
+                rows.push(MenuRow::Action {
+                    label: "Switch to local".to_string(),
+                    action: MenuAction::SwitchLocal,
+                    enabled: switching_enabled,
+                });
             }
             for client in &s.clients {
                 // No switch row for the client that already owns input.
                 if client.addr == s.current_target {
                     continue;
                 }
-                rows.push(MenuRow::Action(
-                    format!("Switch to {}", client.addr),
+                rows.push(MenuRow::Action {
+                    label: format!("Switch to {}", client.addr),
                     // The full fingerprint is always a unique prefix.
-                    MenuAction::SwitchTo(client.fingerprint.clone()),
-                ));
+                    action: MenuAction::SwitchTo(client.fingerprint.clone()),
+                    enabled: switching_enabled,
+                });
             }
-            rows.push(MenuRow::Action(
-                if s.paused { "Resume" } else { "Pause" }.to_string(),
-                if s.paused {
+            rows.push(MenuRow::Action {
+                label: if s.paused { "Resume" } else { "Pause" }.to_string(),
+                action: if s.paused {
                     MenuAction::Resume
                 } else {
                     MenuAction::Pause
                 },
-            ));
+                enabled: true,
+            });
             rows.push(MenuRow::Separator);
             for client in &s.clients {
                 rows.push(MenuRow::Label(format!(
@@ -314,25 +327,33 @@ fn menu_rows(state: Option<&State>) -> Vec<MenuRow> {
             rows.push(MenuRow::Label(format!("Clipboard: {}", clipboard_summary(s))));
             rows.push(MenuRow::Separator);
             match &s.update_available {
-                Some(sha) => rows.push(MenuRow::Action(
-                    format!("Update available: {} — update now", sha),
-                    MenuAction::UpdateNow,
-                )),
-                None => rows.push(MenuRow::Action(
-                    "Check for update now".to_string(),
-                    MenuAction::UpdateNow,
-                )),
+                Some(sha) => rows.push(MenuRow::Action {
+                    label: format!("Update available: {} — update now", sha),
+                    action: MenuAction::UpdateNow,
+                    enabled: true,
+                }),
+                None => rows.push(MenuRow::Action {
+                    label: "Check for update now".to_string(),
+                    action: MenuAction::UpdateNow,
+                    enabled: true,
+                }),
             }
-            rows.push(MenuRow::Action(
-                "Copy diagnostics".to_string(),
-                MenuAction::CopyDiagnostics,
-            ));
+            rows.push(MenuRow::Action {
+                label: "Copy diagnostics".to_string(),
+                action: MenuAction::CopyDiagnostics,
+                enabled: true,
+            });
             rows.push(MenuRow::Separator);
-            rows.push(MenuRow::Action(
-                "Restart monux".to_string(),
-                MenuAction::Restart,
-            ));
-            rows.push(MenuRow::Action("Exit monux".to_string(), MenuAction::Exit));
+            rows.push(MenuRow::Action {
+                label: "Restart monux".to_string(),
+                action: MenuAction::Restart,
+                enabled: true,
+            });
+            rows.push(MenuRow::Action {
+                label: "Exit monux".to_string(),
+                action: MenuAction::Exit,
+                enabled: true,
+            });
         }
         Some(State::Client(c)) => {
             rows.push(MenuRow::Label(format!("Server: {}", c.server)));
@@ -355,20 +376,27 @@ fn menu_rows(state: Option<&State>) -> Vec<MenuRow> {
             rows.push(MenuRow::Separator);
             // The client state has no update_available field, so this is
             // always the plain manual check.
-            rows.push(MenuRow::Action(
-                "Check for update now".to_string(),
-                MenuAction::UpdateNow,
-            ));
-            rows.push(MenuRow::Action(
-                "Copy diagnostics".to_string(),
-                MenuAction::CopyDiagnostics,
-            ));
+            rows.push(MenuRow::Action {
+                label: "Check for update now".to_string(),
+                action: MenuAction::UpdateNow,
+                enabled: true,
+            });
+            rows.push(MenuRow::Action {
+                label: "Copy diagnostics".to_string(),
+                action: MenuAction::CopyDiagnostics,
+                enabled: true,
+            });
             rows.push(MenuRow::Separator);
-            rows.push(MenuRow::Action(
-                "Restart monux".to_string(),
-                MenuAction::Restart,
-            ));
-            rows.push(MenuRow::Action("Exit monux".to_string(), MenuAction::Exit));
+            rows.push(MenuRow::Action {
+                label: "Restart monux".to_string(),
+                action: MenuAction::Restart,
+                enabled: true,
+            });
+            rows.push(MenuRow::Action {
+                label: "Exit monux".to_string(),
+                action: MenuAction::Exit,
+                enabled: true,
+            });
         }
     }
     rows
@@ -387,8 +415,13 @@ fn to_ksni_menu(rows: Vec<MenuRow>) -> Vec<ksni::menu::MenuItem<MonuxTray>> {
                 ..Default::default()
             }
             .into(),
-            MenuRow::Action(label, action) => StandardItem {
+            MenuRow::Action {
                 label,
+                action,
+                enabled,
+            } => StandardItem {
+                label,
+                enabled,
                 activate: Box::new(move |tray: &mut MonuxTray| run_action(tray, &action)),
                 ..Default::default()
             }
@@ -689,6 +722,11 @@ fn copy_to_clipboard(text: &str) -> Result<&'static str> {
     bail!("no clipboard tool available (tried wl-copy, xclip, xsel)");
 }
 
+/// Longest we wait for a clipboard tool to exit before killing it. All three
+/// tools daemonize after taking the selection and exit in milliseconds; a
+/// wedged compositor must not freeze the tray's service thread in wait().
+const CLIPBOARD_TOOL_TIMEOUT: Duration = Duration::from_secs(5);
+
 fn pipe_into(tool: &str, args: &[&str], text: &str) -> Result<()> {
     use std::io::Write;
     let mut child = Command::new(tool)
@@ -706,13 +744,35 @@ fn pipe_into(tool: &str, args: &[&str], text: &str) -> Result<()> {
         .expect("stdin is piped")
         .write_all(text.as_bytes())
         .with_context(|| format!("failed to write to {}", tool))?;
-    let status = child
-        .wait()
-        .with_context(|| format!("failed to wait on {}", tool))?;
-    if !status.success() {
-        bail!("{} exited with {}", tool, status);
+    match wait_with_timeout(&mut child, CLIPBOARD_TOOL_TIMEOUT)? {
+        Some(status) if status.success() => Ok(()),
+        Some(status) => bail!("{} exited with {}", tool, status),
+        None => {
+            // Wedged: kill and reap, then report like any other tool failure.
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("{} did not exit within {:?}", tool, CLIPBOARD_TOOL_TIMEOUT)
+        }
     }
-    Ok(())
+}
+
+/// child.wait() with a deadline: Ok(None) when it expires (the caller then
+/// kills and reaps). try_wait polling is plenty for a process that exits in
+/// milliseconds in the common case.
+fn wait_with_timeout(
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> Result<Option<std::process::ExitStatus>> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().context("failed to poll child")? {
+            return Ok(Some(status));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 /// Runs the indicator until the tray service shuts down. With no D-Bus
@@ -853,33 +913,31 @@ mod tests {
         assert!(rows.contains(&MenuRow::Label("Input: local".to_string())));
         // Local input: no "Switch to local", one switch row per client
         // carrying the full fingerprint as the target.
-        assert!(!rows.iter().any(|r| matches!(r, MenuRow::Action(_, MenuAction::SwitchLocal))));
-        assert!(rows.contains(&MenuRow::Action(
-            "Switch to 10.0.0.2:1213".to_string(),
-            MenuAction::SwitchTo("fp-10.0.0.2:1213".to_string())
+        assert!(!rows
+            .iter()
+            .any(|r| matches!(r, MenuRow::Action { action: MenuAction::SwitchLocal, .. })));
+        assert!(rows.contains(&action_row(
+            "Switch to 10.0.0.2:1213",
+            MenuAction::SwitchTo("fp-10.0.0.2:1213".to_string()),
+            true
         )));
-        assert!(rows.contains(&MenuRow::Action(
-            "Switch to 10.0.0.3:1213".to_string(),
-            MenuAction::SwitchTo("fp-10.0.0.3:1213".to_string())
+        assert!(rows.contains(&action_row(
+            "Switch to 10.0.0.3:1213",
+            MenuAction::SwitchTo("fp-10.0.0.3:1213".to_string()),
+            true
         )));
         // Not paused: the Pause action is offered.
-        assert!(rows.contains(&MenuRow::Action("Pause".to_string(), MenuAction::Pause)));
+        assert!(rows.contains(&action_row("Pause", MenuAction::Pause, true)));
         // Per-client connection rows and the clipboard row are disabled labels.
         assert!(rows.contains(&MenuRow::Label(
             "Connection: 10.0.0.2:1213 — rtt 3ms, up 42s".to_string()
         )));
         assert!(rows.contains(&MenuRow::Label("Clipboard: none".to_string())));
         // No update pending: plain manual check.
-        assert!(rows.contains(&MenuRow::Action(
-            "Check for update now".to_string(),
-            MenuAction::UpdateNow
-        )));
-        assert!(rows.contains(&MenuRow::Action(
-            "Copy diagnostics".to_string(),
-            MenuAction::CopyDiagnostics
-        )));
-        assert!(rows.contains(&MenuRow::Action("Restart monux".to_string(), MenuAction::Restart)));
-        assert!(rows.contains(&MenuRow::Action("Exit monux".to_string(), MenuAction::Exit)));
+        assert!(rows.contains(&action_row("Check for update now", MenuAction::UpdateNow, true)));
+        assert!(rows.contains(&action_row("Copy diagnostics", MenuAction::CopyDiagnostics, true)));
+        assert!(rows.contains(&action_row("Restart monux", MenuAction::Restart, true)));
+        assert!(rows.contains(&action_row("Exit monux", MenuAction::Exit, true)));
     }
 
     #[test]
@@ -896,29 +954,55 @@ mod tests {
         }
         let rows = menu_rows(Some(&state));
         assert!(rows.contains(&MenuRow::Label("Input: 10.0.0.2:1213".to_string())));
-        // Remote input: switching back to local is offered...
-        assert!(rows.contains(&MenuRow::Action(
-            "Switch to local".to_string(),
-            MenuAction::SwitchLocal
+        // Remote input: switching back to local is listed...
+        assert!(rows.contains(&action_row("Switch to local", MenuAction::SwitchLocal, false)));
+        // ...but the client already owning input has no switch row...
+        assert!(!rows
+            .iter()
+            .any(|r| matches!(r, MenuRow::Action { label, .. } if label == "Switch to 10.0.0.2:1213")));
+        // ...and while paused every switch row is DISABLED (rotation drops
+        // switches then; a clickable row would silently do nothing)...
+        assert!(rows.contains(&action_row(
+            "Switch to 10.0.0.3:1213",
+            MenuAction::SwitchTo("fp-10.0.0.3:1213".to_string()),
+            false
         )));
-        // ...but the client already owning input has no switch row.
-        assert!(!rows.contains(&MenuRow::Action(
-            "Switch to 10.0.0.2:1213".to_string(),
-            MenuAction::SwitchTo("fp-10.0.0.2:1213".to_string())
-        )));
-        assert!(rows.contains(&MenuRow::Action(
-            "Switch to 10.0.0.3:1213".to_string(),
-            MenuAction::SwitchTo("fp-10.0.0.3:1213".to_string())
-        )));
-        // Paused: Resume. Update pending: the sha is in the label.
-        assert!(rows.contains(&MenuRow::Action("Resume".to_string(), MenuAction::Resume)));
-        assert!(rows.contains(&MenuRow::Action(
-            "Update available: abc123 — update now".to_string(),
-            MenuAction::UpdateNow
+        // ...while the Resume row stays enabled.
+        assert!(rows.contains(&action_row("Resume", MenuAction::Resume, true)));
+        assert!(rows
+            .iter()
+            .all(|r| !matches!(r, MenuRow::Action { action: MenuAction::SwitchLocal | MenuAction::SwitchTo(_), enabled: true, .. })));
+        // Update pending: the sha is in the label.
+        assert!(rows.contains(&action_row(
+            "Update available: abc123 — update now",
+            MenuAction::UpdateNow,
+            true
         )));
         assert!(rows.contains(&MenuRow::Label(
             "Clipboard: local (text/plain)".to_string()
         )));
+        // Unpausing re-enables the switch rows.
+        let state = server_state(
+            false,
+            "10.0.0.2:1213",
+            vec![("10.0.0.2:1213", Some(3)), ("10.0.0.3:1213", Some(7))],
+        );
+        let rows = menu_rows(Some(&state));
+        assert!(rows.contains(&action_row("Switch to local", MenuAction::SwitchLocal, true)));
+        assert!(rows.contains(&action_row(
+            "Switch to 10.0.0.3:1213",
+            MenuAction::SwitchTo("fp-10.0.0.3:1213".to_string()),
+            true
+        )));
+    }
+
+    /// Builds an Action menu row concisely for the assertions.
+    fn action_row(label: &str, action: MenuAction, enabled: bool) -> MenuRow {
+        MenuRow::Action {
+            label: label.to_string(),
+            action,
+            enabled,
+        }
     }
 
     #[test]
@@ -929,7 +1013,7 @@ mod tests {
         assert!(rows.contains(&MenuRow::Label("Input: here".to_string())));
         // Rotation and pause are server concepts: absent on the client menu.
         for row in &rows {
-            if let MenuRow::Action(_, action) = row {
+            if let MenuRow::Action { action, enabled, .. } = row {
                 assert!(matches!(
                     action,
                     MenuAction::UpdateNow
@@ -937,6 +1021,7 @@ mod tests {
                         | MenuAction::Restart
                         | MenuAction::Exit
                 ));
+                assert!(enabled);
             }
         }
         // A disconnected client still gets the lifecycle actions.
@@ -1016,5 +1101,24 @@ mod tests {
         let mut d2 = d.clone();
         d2.recent_logs = vec![];
         assert!(format_diagnostics_bundle(&d2).contains("<no log lines captured>"));
+    }
+
+    #[test]
+    fn wait_with_timeout_returns_status_or_none_on_expiry() {
+        // A child that exits promptly: status comes back well within the
+        // timeout.
+        let mut fast = Command::new("true").spawn().unwrap();
+        let status = wait_with_timeout(&mut fast, Duration::from_secs(5)).unwrap();
+        assert!(status.expect("fast child must have exited").success());
+
+        // A child that never exits on its own: Ok(None) after the timeout,
+        // and the caller can kill + reap it.
+        let mut slow = Command::new("sleep").arg("30").spawn().unwrap();
+        let start = std::time::Instant::now();
+        let status = wait_with_timeout(&mut slow, Duration::from_millis(150)).unwrap();
+        assert!(status.is_none(), "wedged child must hit the timeout");
+        assert!(start.elapsed() < Duration::from_secs(5));
+        slow.kill().unwrap();
+        slow.wait().unwrap();
     }
 }

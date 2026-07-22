@@ -93,7 +93,7 @@ use std::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tracing::{debug, info};
 
@@ -101,8 +101,10 @@ use crate::device::Event;
 use crate::msgs::shared::PROTOCOL_VERSION;
 use crate::rotation::DiagnosticsMirror;
 
-/// Longest accepted request line. Requests are tiny; this only stops a
-/// same-user process from growing our read buffer without bound.
+/// Longest accepted request line, ENFORCED by capping the read itself (see
+/// serve_connection: take() presents EOF at the cap, so a same-user peer
+/// sending a never-terminated line gets a protocol error instead of growing
+/// our read buffer without bound). Requests are tiny; the cap is generous.
 const MAX_REQUEST_LINE: usize = 8192;
 
 /// Which daemon a control socket belongs to.
@@ -674,10 +676,20 @@ impl Drop for Listener {
 /// line each out, until the peer closes or misbehaves.
 async fn serve_connection(stream: tokio::net::UnixStream, handler: Arc<Handler>) -> Result<()> {
     let (read, mut write) = stream.into_split();
-    let mut lines = tokio::io::BufReader::new(read);
+    let mut read = read;
     loop {
         let mut line = String::new();
-        let n = lines.read_line(&mut line).await?;
+        // Bound the read itself, not just the result: take() presents EOF at
+        // the cap, so read_line stops there instead of buffering a
+        // never-terminated line without bound. The capacity-1 buffer reads
+        // byte-by-byte, so it never swallows bytes belonging to the NEXT
+        // request line (a connection may carry several, pipelined).
+        let n = {
+            let limited = AsyncReadExt::take(&mut read, MAX_REQUEST_LINE as u64 + 1);
+            tokio::io::BufReader::with_capacity(1, limited)
+                .read_line(&mut line)
+                .await?
+        };
         if n == 0 {
             return Ok(()); // peer closed
         }
@@ -1095,6 +1107,65 @@ mod tests {
         assert!(err.to_string().contains("Refusing"));
         drop(listener);
         assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn pipelined_requests_work_and_oversized_lines_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("client.sock");
+        let listener = Listener::bind_at(&path, "client").unwrap();
+        let (handler, _mirror) = client_handler(true);
+        let task = tokio::spawn(listener.run(handler));
+
+        // Two requests written in one go (pipelined) on a single connection
+        // each get their response: the bounded per-line read must not swallow
+        // bytes belonging to the next line.
+        let path2 = path.clone();
+        let lines = tokio::task::spawn_blocking(move || {
+            use std::io::{BufRead, BufReader, Write};
+            let stream = std::os::unix::net::UnixStream::connect(&path2).unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            writer
+                .write_all(b"{\"cmd\":\"status\"}\n{\"cmd\":\"status\"}\n")
+                .unwrap();
+            writer.flush().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut first = String::new();
+            reader.read_line(&mut first).unwrap();
+            let mut second = String::new();
+            reader.read_line(&mut second).unwrap();
+            (first, second)
+        })
+        .await
+        .unwrap();
+        assert!(lines.0.contains("\"ok\":true"), "{}", lines.0);
+        assert!(lines.1.contains("\"ok\":true"), "{}", lines.1);
+
+        // A never-terminated line longer than MAX_REQUEST_LINE is a protocol
+        // error: the daemon closes the connection instead of buffering the
+        // line without bound.
+        let path3 = path.clone();
+        tokio::task::spawn_blocking(move || {
+            use std::io::{BufRead, BufReader, Write};
+            let stream = std::os::unix::net::UnixStream::connect(&path3).unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            writer
+                .write_all(&vec![b'a'; MAX_REQUEST_LINE + 100])
+                .unwrap();
+            writer.flush().unwrap();
+            let mut line = String::new();
+            match BufReader::new(stream).read_line(&mut line) {
+                // Orderly close, or a reset from closing with our unread
+                // bytes still queued: both mean no response was served.
+                Ok(0) | Err(_) => {}
+                Ok(n) => panic!("oversized line got {} response bytes: {:?}", n, line),
+            }
+        })
+        .await
+        .unwrap();
+
+        task.abort();
+        let _ = task.await;
     }
 
     #[test]

@@ -1444,7 +1444,12 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                         .collect::<Vec<String>>()
                         .join(", ")
                 );
-                notify_switch(&format!("Input on {}", new_client.ip()));
+                // No "Input on X" notification while paused: input isn't going
+                // anywhere. The resume notification already announces the
+                // return to the active target.
+                if !self.paused {
+                    notify_switch(&format!("Input on {}", new_client.ip()));
+                }
             }
         } else {
             info!(
@@ -1455,7 +1460,9 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                     .collect::<Vec<String>>()
                     .join(", ")
             );
-            notify_switch("Input on this machine");
+            if !self.paused {
+                notify_switch("Input on this machine");
+            }
         }
 
         // AFTER setting up the new client, lets send enabled=false to the old client.

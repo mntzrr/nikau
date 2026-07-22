@@ -242,15 +242,24 @@ fn chown_best_effort(path: &Path, uid: u32, gid: u32) {
 
 fn write_unit_file(path: &Path, role: Role, owner: Option<(u32, u32)>) -> Result<()> {
     if let Some(parent) = path.parent() {
+        // ~/.config may not exist yet; note it BEFORE create_dir_all creates
+        // it, so we chown only a ~/.config we created ourselves — never a
+        // pre-existing one (that directory isn't ours to touch).
+        let config_dir = parent.parent().and_then(|p| p.parent());
+        let config_dir_existed = config_dir.map(|dir| dir.exists());
         std::fs::create_dir_all(parent)
             .with_context(|| format!("could not create {}", parent.display()))?;
         // Directories we may have just created must stay user-manageable when
-        // running as root: chown the two levels this feature owns
-        // (.config/systemd and .config/systemd/user).
+        // running as root: chown the levels this feature owns
+        // (.config/systemd and .config/systemd/user, plus ~/.config itself
+        // when we just created it).
         if let Some((uid, gid)) = owner {
             chown_best_effort(parent, uid, gid);
             if let Some(grandparent) = parent.parent() {
                 chown_best_effort(grandparent, uid, gid);
+            }
+            if let (Some(dir), Some(false)) = (config_dir, config_dir_existed) {
+                chown_best_effort(dir, uid, gid);
             }
         }
     }
