@@ -73,6 +73,10 @@ enum SystemCommands {
     /// connected clients, clipboard owner, update availability.
     Status(StatusArgs),
 
+    /// Lists the server's connected clients with fingerprint prefixes and
+    /// resolved edge directions — the reference for configuring --edge-map.
+    Clients(ClientsArgs),
+
     /// Runs a StatusNotifierItem tray indicator for the local monux daemon:
     /// a colored dot (green = input local, blue = input on a client, grey =
     /// paused, red = degraded link / client not connected, hollow "?" = monux
@@ -97,6 +101,14 @@ enum SystemCommands {
     /// system settings persisted by 'monux system setup'. Asks before also
     /// removing ~/.config/monux (identity keypair and peer approvals).
     Uninstall,
+}
+
+#[derive(Args)]
+struct ClientsArgs {
+    /// Query this explicit control socket path instead of the default
+    /// $XDG_RUNTIME_DIR/monux/server.sock location
+    #[arg(long, value_name = "path")]
+    socket: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -516,6 +528,11 @@ fn main() -> Result<()> {
                     args.socket.as_deref(),
                     args.json,
                 )?;
+                println!("{}", out);
+                return Ok(());
+            }
+            SystemCommands::Clients(args) => {
+                let out = monux::control::clients_cli(args.socket.as_deref())?;
                 println!("{}", out);
                 return Ok(());
             }

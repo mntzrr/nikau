@@ -183,6 +183,10 @@ pub struct ServerClientState {
     pub fingerprint: String,
     pub connected_since_secs: u64,
     pub rtt_ms: Option<u64>,
+    /// The edge-map direction this client resolves to on the server, if any
+    /// (for verifying --edge-map without testing edges).
+    #[serde(default)]
+    pub edge: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -863,6 +867,46 @@ pub fn tray_cli(hide: bool, socket: Option<&Path>) -> Result<String> {
     } else {
         "Tray indicator shown".to_string()
     })
+}
+
+/// Implements `monux system clients`: lists the server's connected clients
+/// with fingerprint prefixes and resolved edge directions — the reference for
+/// configuring and verifying --edge-map.
+pub fn clients_cli(socket: Option<&Path>) -> Result<String> {
+    let candidates: Vec<PathBuf> = match socket {
+        Some(path) => vec![path.to_path_buf()],
+        None => vec![socket_path(Role::Server)],
+    };
+    let (path, raw) = query_first(&candidates, r#"{"cmd":"status"}"#)?;
+    let response: RawResponse = serde_json::from_str(&raw)
+        .with_context(|| format!("Malformed response from {}: {}", path.display(), raw))?;
+    if !response.ok {
+        bail!(
+            "The daemon reported an error: {}",
+            response.error.unwrap_or_default()
+        );
+    }
+    let state: State = serde_json::from_value(
+        response.state.context("The daemon returned no state")?,
+    )
+    .with_context(|| format!("Unrecognized state from {}", path.display()))?;
+    let State::Server(server) = state else {
+        bail!("This machine is running a monux client, not a server");
+    };
+    if server.clients.is_empty() {
+        return Ok("No clients connected.".to_string());
+    }
+    let mut out = String::from("prefix   addr                     rtt    edge\n");
+    for c in &server.clients {
+        let prefix: String = c.fingerprint.chars().take(8).collect();
+        let edge = c.edge.as_deref().unwrap_or("-");
+        let rtt = c
+            .rtt_ms
+            .map(|r| format!("{}ms", r))
+            .unwrap_or_else(|| "?".to_string());
+        out.push_str(&format!("{:<8} {:<24} {:<6} {}\n", prefix, c.addr, rtt, edge));
+    }
+    Ok(out.trim_end().to_string())
 }
 
 /// Sends `request` to the first candidate socket that answers, returning the

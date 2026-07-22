@@ -832,6 +832,7 @@ mod tests {
                     fingerprint: format!("fp-{}", addr),
                     connected_since_secs: 42,
                     rtt_ms,
+                    edge: None,
                 })
                 .collect(),
             clipboard: ServerClipboardState {

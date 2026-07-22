@@ -2354,11 +2354,28 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             clients: self
                 .clients
                 .iter()
-                .map(|c| crate::control::ServerClientState {
-                    addr: c.endpoint.to_string(),
-                    fingerprint: c.fingerprint.clone(),
-                    connected_since_secs: c.connected_at.elapsed().as_secs(),
-                    rtt_ms: Some(c.conn.stats().path.rtt.as_millis() as u64),
+                .map(|c| {
+                    let edge = self.edge_map.as_ref().and_then(|map| {
+                        let dirs = edge_info_directions(
+                            map,
+                            &self.edge_client_entries(),
+                            &c.fingerprint,
+                            &edge::resolve_hostname,
+                        );
+                        (!dirs.is_empty()).then(|| {
+                            dirs.iter()
+                                .map(|d| d.as_str())
+                                .collect::<Vec<&str>>()
+                                .join("+")
+                        })
+                    });
+                    crate::control::ServerClientState {
+                        addr: c.endpoint.to_string(),
+                        fingerprint: c.fingerprint.clone(),
+                        connected_since_secs: c.connected_at.elapsed().as_secs(),
+                        rtt_ms: Some(c.conn.stats().path.rtt.as_millis() as u64),
+                        edge,
+                    }
                 })
                 .collect(),
             clipboard: match &self.clipboard_target {
