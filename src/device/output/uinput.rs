@@ -292,6 +292,7 @@ impl OutputHandler for VirtualUInputDevices {
                     }
                 } else if let Some(e) = &event.inputi32 {
                     let evdev_event = e.to_evdev();
+                    check_discrete_axis_range(&evdev_event);
                     if let Some(dest) = self.route_event(evdev_event) {
                         Some((evdev_event, dest))
                     } else {
@@ -617,6 +618,49 @@ pub fn mouse(
     Ok((device, keys, misc, axes))
 }
 
+/// The discrete absolute axes (those util::axis_scale_type returns
+/// AxisScale::Discrete for) advertised by the virtual touchpad, with their
+/// (min, max) ranges. Discrete events are forwarded raw from the capture
+/// side, so these ranges must cover whatever values real devices emit.
+const DISCRETE_AXES: &[(AbsoluteAxisCode, i32, i32)] = &[
+    // max: arbitrarily big in case some real device uses big values?
+    (AbsoluteAxisCode::ABS_MISC, -1, 1048576),
+    // max: if this is too big then something panics
+    (AbsoluteAxisCode::ABS_MT_SLOT, 0, 32),
+    (AbsoluteAxisCode::ABS_MT_TOOL_TYPE, 0, 4095),
+    // max: arbitrarily big in case some real device uses big IDs
+    (AbsoluteAxisCode::ABS_MT_BLOB_ID, -1, 1048576),
+    // max: arbitrarily big in case some real device uses big IDs
+    (AbsoluteAxisCode::ABS_MT_TRACKING_ID, -1, 1048576),
+];
+
+/// The advertised (min, max) range for a discrete axis on the virtual
+/// touchpad, if the axis is one of the DISCRETE_AXES.
+fn discrete_axis_range(code: AbsoluteAxisCode) -> Option<(i32, i32)> {
+    DISCRETE_AXES
+        .iter()
+        .find(|(axis, _, _)| *axis == code)
+        .map(|(_, min, max)| (*min, *max))
+}
+
+/// Loudly logs when a raw discrete-axis event falls outside the range the
+/// virtual touchpad advertises for it. Shouldn't happen — the capture side
+/// forwards these raw and real devices stay within the advertised ranges —
+/// but if a future device exceeds them, libinput would silently drop the
+/// event (dead multitouch), so make the mismatch visible.
+fn check_discrete_axis_range(event: &evdev::InputEvent) {
+    if let EventSummary::AbsoluteAxis(_, code, value) = event.destructure() {
+        if let Some((min, max)) = discrete_axis_range(code) {
+            if value < min || value > max {
+                debug!(
+                    "Discrete axis {:?} value {} is outside the virtual touchpad's advertised range {}..={} and will likely be dropped by libinput",
+                    code, value, min, max
+                );
+            }
+        }
+    }
+}
+
 pub fn touchpad(
     pid: u32,
 ) -> Result<(
@@ -654,45 +698,14 @@ pub fn touchpad(
         "{} multi touchpad for pid {}",
         VIRTUAL_DEVICE_NAME_PREFIX, pid
     );
-    // These are the valid axes that util::axis_scale_type returns DISCRETE
+    // These are the axes that util::axis_scale_type returns Discrete for,
+    // declared from the shared DISCRETE_AXES table so that raw forwarded
+    // values always land within an advertised range.
     let mut axis_codes = AttributeSet::<AbsoluteAxisCode>::new();
-    let mut axes = vec![
-        abs_axis(
-            AbsoluteAxisCode::ABS_MISC,
-            -1,      // min
-            1048576, // max (arbitrarily big in case some real device uses big values?)
-            0,       // res
-            &mut axis_codes,
-        ),
-        abs_axis(
-            AbsoluteAxisCode::ABS_MT_SLOT,
-            0,  // min
-            32, // max (if this is too big then something panics)
-            0,  // res
-            &mut axis_codes,
-        ),
-        abs_axis(
-            AbsoluteAxisCode::ABS_MT_TOOL_TYPE,
-            0,    // min
-            4095, // max
-            0,    // res
-            &mut axis_codes,
-        ),
-        abs_axis(
-            AbsoluteAxisCode::ABS_MT_BLOB_ID,
-            -1,      // min
-            1048576, // max (arbitrarily big in case some real device uses big IDs)
-            0,       // res
-            &mut axis_codes,
-        ),
-        abs_axis(
-            AbsoluteAxisCode::ABS_MT_TRACKING_ID,
-            -1,      // min
-            1048576, // max (arbitrarily big in case some real device uses big IDs)
-            0,       // res
-            &mut axis_codes,
-        ),
-    ];
+    let mut axes: Vec<evdev::UinputAbsSetup> = DISCRETE_AXES
+        .iter()
+        .map(|(axis, min, max)| abs_axis(*axis, *min, *max, 0, &mut axis_codes))
+        .collect();
     for i in 0..libc::ABS_MAX + 1 {
         let axis = AbsoluteAxisCode::from_index(i as usize);
         match util::axis_scale_type(axis) {
@@ -763,4 +776,73 @@ fn abs_axis(
             res, // res
         ),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every axis classified Discrete must be advertised (with a raw range)
+    /// on the virtual touchpad, and nothing else may be in the table: the
+    /// capture side forwards exactly the classified-discrete axes raw.
+    #[test]
+    fn discrete_axes_match_classification() {
+        for i in 0..libc::ABS_MAX + 1 {
+            let axis = AbsoluteAxisCode::from_index(i as usize);
+            assert_eq!(
+                util::axis_scale_type(axis) == util::AxisScale::Discrete,
+                discrete_axis_range(axis).is_some(),
+                "classification/advertisement mismatch for {:?}",
+                axis
+            );
+        }
+    }
+
+    /// Raw values a capture device legitimately emits must fit the advertised
+    /// ranges — the -1 tracking-id liftoff marker and small slot indexes in
+    /// particular.
+    #[test]
+    fn advertised_ranges_cover_raw_values() {
+        let (min, max) = discrete_axis_range(AbsoluteAxisCode::ABS_MT_TRACKING_ID).unwrap();
+        assert!(min <= -1 && -1 <= max);
+        let (min, max) = discrete_axis_range(AbsoluteAxisCode::ABS_MT_SLOT).unwrap();
+        assert!(min <= 3 && 3 <= max);
+    }
+
+    /// The injection path emits inputi32 events untouched: no clamping or
+    /// remapping of raw discrete values on their way to the virtual device.
+    #[test]
+    fn raw_discrete_values_are_emitted_untouched() {
+        for (code, value) in [
+            (AbsoluteAxisCode::ABS_MT_TRACKING_ID.0, -1),
+            (AbsoluteAxisCode::ABS_MT_SLOT.0, 3),
+        ] {
+            let raw = event::InputI32 {
+                type_: evdev::EventType::ABSOLUTE.0,
+                code,
+                value,
+            };
+            let ev = raw.to_evdev();
+            assert_eq!(ev.code(), code);
+            assert_eq!(ev.value(), value);
+        }
+    }
+
+    /// The out-of-range guard accepts in-range values for every discrete
+    /// axis without logging (it only fires outside the advertised range).
+    #[test]
+    fn range_check_accepts_in_range_values() {
+        for (axis, min, max) in DISCRETE_AXES {
+            for value in [*min, *max] {
+                // Must not panic; the interesting property (no log) can't be
+                // captured without a tracing subscriber, so this pins the
+                // boundary values as accepted by construction.
+                check_discrete_axis_range(&evdev::InputEvent::new(
+                    evdev::EventType::ABSOLUTE.0,
+                    axis.0,
+                    value,
+                ));
+            }
+        }
+    }
 }

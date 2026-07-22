@@ -12,7 +12,10 @@ pub enum AxisScale {
     Y,
     /// Continous values against other axes/scales
     Other,
-    /// Values that aren't continuous along an axis
+    /// Values that aren't continuous along an axis. These are forwarded
+    /// raw (inputi32) rather than scaled to [0.0, 1.0]: normalizing e.g.
+    /// ABS_MT_SLOT or ABS_MT_TRACKING_ID would mangle slot indexes and the
+    /// -1 liftoff marker once the client re-expands them to its own ranges.
     Discrete,
     /// Not known axis values
     Invalid,
@@ -163,4 +166,46 @@ fn device_info_string(device: &Device, dims: &BTreeMap<u16, (i32, i32)>) -> Stri
         abs_entries,
         dims,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The discrete set is the kernel-ABI list of absolute axes whose values
+    /// are indexes/IDs rather than positions along an axis. Both the capture
+    /// side (device/input.rs) and the injection side (device/output/uinput.rs)
+    /// key their raw-vs-scaled handling off this classification.
+    #[test]
+    fn discrete_axes_classification() {
+        for axis in [
+            AbsoluteAxisCode::ABS_MT_SLOT,
+            AbsoluteAxisCode::ABS_MT_TRACKING_ID,
+            AbsoluteAxisCode::ABS_MT_BLOB_ID,
+            AbsoluteAxisCode::ABS_MT_TOOL_TYPE,
+            AbsoluteAxisCode::ABS_MISC,
+        ] {
+            assert_eq!(axis_scale_type(axis), AxisScale::Discrete, "{:?}", axis);
+        }
+    }
+
+    /// Continuous axes (positions, pressure, touch sizes, ...) must NOT be
+    /// classified discrete: they keep the [0.0, 1.0] normalization.
+    #[test]
+    fn continuous_axes_are_not_discrete() {
+        for axis in [
+            AbsoluteAxisCode::ABS_X,
+            AbsoluteAxisCode::ABS_Y,
+            AbsoluteAxisCode::ABS_MT_POSITION_X,
+            AbsoluteAxisCode::ABS_MT_POSITION_Y,
+            AbsoluteAxisCode::ABS_MT_PRESSURE,
+            AbsoluteAxisCode::ABS_MT_TOUCH_MAJOR,
+            AbsoluteAxisCode::ABS_MT_TOUCH_MINOR,
+            AbsoluteAxisCode::ABS_MT_TOOL_X,
+            AbsoluteAxisCode::ABS_MT_TOOL_Y,
+            AbsoluteAxisCode::ABS_PRESSURE,
+        ] {
+            assert_ne!(axis_scale_type(axis), AxisScale::Discrete, "{:?}", axis);
+        }
+    }
 }

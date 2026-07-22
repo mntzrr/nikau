@@ -450,26 +450,7 @@ fn convert_device_event(
     device_info: &util::DeviceInfo,
 ) -> event::InputEvent {
     // Convert the original event before any combo-generated events.
-    let net_event = if let evdev::EventSummary::AbsoluteAxis(_evt, axis, _val) = event.destructure() {
-        // Special handling for evdev absolute axis (e.g. touchpad) events
-        if let Some((axis_min, axis_max)) = device_info.dims.get(&axis.0) {
-            // Apply scaling from hardware width to [0.0, 1.0]
-            event::InputEvent {
-                inputi32: None,
-                inputf64: Some(event::InputF64::from_evdev(event, *axis_min, *axis_max)),
-            }
-        } else {
-            event::InputEvent {
-                inputi32: Some(event::InputI32::from_evdev(event)),
-                inputf64: None,
-            }
-        }
-    } else {
-        event::InputEvent {
-            inputi32: Some(event::InputI32::from_evdev(event)),
-            inputf64: None,
-        }
-    };
+    let net_event = convert_axis_event(event, device_info);
     trace!(
         "Input event @ {}: {} -> {:?}",
         device.name().unwrap_or("(Unnamed device)"),
@@ -477,4 +458,102 @@ fn convert_device_event(
         net_event
     );
     net_event
+}
+
+/// Converts a captured evdev event for the wire. Continuous absolute axes
+/// (ABS_X, ABS_MT_POSITION_X, ... — anything util::axis_scale_type doesn't
+/// call Discrete) are scaled to [0.0, 1.0] against the device's own range;
+/// discrete absolute axes (ABS_MT_SLOT, ABS_MT_TRACKING_ID, ...) travel as
+/// raw i32 values, since scaling them against the capture device's range and
+/// re-expanding on the client would mangle slot indexes and the -1
+/// tracking-id liftoff marker.
+fn convert_axis_event(event: evdev::InputEvent, device_info: &util::DeviceInfo) -> event::InputEvent {
+    // Special handling for evdev absolute axis (e.g. touchpad) events
+    if let evdev::EventSummary::AbsoluteAxis(_evt, axis, _val) = event.destructure() {
+        if util::axis_scale_type(axis) != util::AxisScale::Discrete {
+            if let Some((axis_min, axis_max)) = device_info.dims.get(&axis.0) {
+                // Apply scaling from hardware width to [0.0, 1.0]
+                return event::InputEvent {
+                    inputi32: None,
+                    inputf64: Some(event::InputF64::from_evdev(event, *axis_min, *axis_max)),
+                };
+            }
+        }
+    }
+    event::InputEvent {
+        inputi32: Some(event::InputI32::from_evdev(event)),
+        inputf64: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use evdev::AbsoluteAxisCode;
+    use std::collections::BTreeMap;
+
+    fn device_info_with_dims(dims: &[(u16, (i32, i32))]) -> util::DeviceInfo {
+        util::DeviceInfo {
+            dims: BTreeMap::from_iter(dims.iter().copied()),
+            is_grabbed: false,
+        }
+    }
+
+    fn abs_event(code: AbsoluteAxisCode, value: i32) -> evdev::InputEvent {
+        evdev::InputEvent::new(evdev::EventType::ABSOLUTE.0, code.0, value)
+    }
+
+    /// Discrete MT axes travel raw even when the capture device's range for
+    /// them is known: normalizing an ABS_MT_SLOT index to [0.0, 1.0] would
+    /// expand to a far-out-of-range value on the client's virtual touchpad.
+    #[test]
+    fn discrete_slot_event_stays_raw() {
+        let info = device_info_with_dims(&[(AbsoluteAxisCode::ABS_MT_SLOT.0, (0, 10))]);
+        let converted = convert_axis_event(abs_event(AbsoluteAxisCode::ABS_MT_SLOT, 3), &info);
+        assert!(converted.inputf64.is_none());
+        let raw = converted.inputi32.expect("slot event must be inputi32");
+        assert_eq!(raw.code, AbsoluteAxisCode::ABS_MT_SLOT.0);
+        assert_eq!(raw.value, 3);
+    }
+
+    /// The -1 tracking-id liftoff marker must survive untouched; scaling it
+    /// against the device's range would map it to 0 (a live touch) and leave
+    /// the client with a stuck touch.
+    #[test]
+    fn discrete_tracking_id_liftoff_stays_raw() {
+        let info = device_info_with_dims(&[(AbsoluteAxisCode::ABS_MT_TRACKING_ID.0, (-1, 65535))]);
+        let converted =
+            convert_axis_event(abs_event(AbsoluteAxisCode::ABS_MT_TRACKING_ID, -1), &info);
+        assert!(converted.inputf64.is_none());
+        let raw = converted
+            .inputi32
+            .expect("tracking-id event must be inputi32");
+        assert_eq!(raw.value, -1);
+    }
+
+    /// Continuous MT position axes keep the existing [0.0, 1.0] scaling.
+    #[test]
+    fn continuous_mt_position_still_scales() {
+        let info = device_info_with_dims(&[(AbsoluteAxisCode::ABS_MT_POSITION_X.0, (0, 4096))]);
+        let converted =
+            convert_axis_event(abs_event(AbsoluteAxisCode::ABS_MT_POSITION_X, 2048), &info);
+        assert!(converted.inputi32.is_none());
+        let scaled = converted
+            .inputf64
+            .expect("position event must be inputf64");
+        assert_eq!(scaled.code, AbsoluteAxisCode::ABS_MT_POSITION_X.0);
+        assert_eq!(scaled.value, 0.5);
+    }
+
+    /// Single-touch absolute position axes keep the existing scaling too.
+    #[test]
+    fn continuous_abs_x_still_scales() {
+        let info = device_info_with_dims(&[(AbsoluteAxisCode::ABS_X.0, (0, 200))]);
+        let converted = convert_axis_event(abs_event(AbsoluteAxisCode::ABS_X, 50), &info);
+        assert!(converted.inputi32.is_none());
+        let scaled = converted
+            .inputf64
+            .expect("ABS_X event must be inputf64");
+        assert_eq!(scaled.value, 0.25);
+    }
 }

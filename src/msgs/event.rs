@@ -153,9 +153,13 @@ pub fn motion_event(code: u16, value: i32) -> InputEvent {
 /// An input event to be written to a virtual device indicated by the target.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct InputEvent {
-    /// For discrete unscaled values
+    /// For discrete unscaled values: keys, relative axes, and discrete
+    /// absolute axes (ABS_MT_SLOT, ABS_MT_TRACKING_ID, ... — the axes
+    /// device::util::axis_scale_type classifies as Discrete), which travel
+    /// raw so slot indexes and the -1 liftoff marker survive the round trip.
     pub inputi32: Option<InputI32>,
-    /// For continuous values, this is scaled from 0.0 to 1.0
+    /// For continuous values (e.g. touchpad positions), this is scaled from
+    /// 0.0 to 1.0
     pub inputf64: Option<InputF64>,
 }
 
@@ -212,7 +216,9 @@ impl InputI32 {
 
 /// Equivalent to a uinput event for the client to emit locally.
 /// Omits the timestamp since it isn't required.
-/// Used for absolute coordinates, with a scale of [0.0, 1.0] to be resized by the client.
+/// Used for continuous absolute coordinates, with a scale of [0.0, 1.0] to
+/// be resized by the client. Discrete absolute axes travel raw via InputI32
+/// instead.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct InputF64 {
     pub type_: u16,
