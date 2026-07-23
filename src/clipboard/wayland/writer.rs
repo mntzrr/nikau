@@ -33,7 +33,7 @@ struct State {
 /// replaces the PreparedCopyState and with it this map), so clipboard
 /// managers cycling A,B,A,B over the advertised types pay the serialized
 /// fetch only once per type per advertisement.
-type ClipboardCache = std::sync::Arc<std::sync::Mutex<HashMap<String, Vec<u8>>>>;
+type ClipboardCache = std::sync::Arc<std::sync::Mutex<HashMap<String, std::sync::Arc<[u8]>>>>;
 
 /// Maximum number of paste (Send) requests served concurrently. Clipboard
 /// managers (wl-clip-persist, wl-paste --watch) can fire dozens of Send
@@ -137,7 +137,7 @@ fn spawn_fetch(
     std::thread::spawn(move || {
         if let Some(d) = fetch_sync(&mime_type, &fetch_data_tx, max_uncompressed_size_bytes, &config_dir, &serve_runtime) {
             debug!("Background-fetched clipboard type {}: {} bytes", d.requested_type, d.bytes.len());
-            clipboard_data.lock().unwrap().insert(d.requested_type, d.bytes);
+            clipboard_data.lock().unwrap().insert(d.requested_type, std::sync::Arc::<[u8]>::from(d.bytes));
         }
     });
 }
@@ -267,7 +267,7 @@ fn serve_send(
     serve_runtime: Arc<tokio::runtime::Runtime>,
 ) {
     let started = std::time::Instant::now();
-    let bytes = {
+    let bytes: std::sync::Arc<[u8]> = {
         let cached = clipboard_data.lock().unwrap().get(&mime_type).cloned();
         match cached {
             Some(cached_bytes) => {
@@ -278,12 +278,12 @@ fn serve_send(
                 match fetch_sync(&mime_type, &fetch_data_tx, max_uncompressed_size_bytes, &config_dir, &serve_runtime) {
                     Some(d) => {
                         debug!("Background-fetched clipboard type {}: {} bytes", d.requested_type, d.bytes.len());
-                        let bytes = d.bytes;
-                        clipboard_data.lock().unwrap().insert(d.requested_type, bytes.clone());
+                        let bytes = std::sync::Arc::<[u8]>::from(d.bytes);
+                        clipboard_data.lock().unwrap().insert(d.requested_type, std::sync::Arc::clone(&bytes));
                         bytes
                     }
                     // Retryable fetch failure: serve empty, the next request retries.
-                    None => Vec::new(),
+                    None => std::sync::Arc::<[u8]>::from(Vec::new()),
                 }
             }
         }
