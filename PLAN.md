@@ -504,14 +504,20 @@ STATUS: All 19 non-MOOT P1 items fixed across four commits (device/ops, connecti
   compare advertised IPs against local addresses. [S]
   — DONE (42a062c): compares resolved service IPs against local_ipv4_addrs.
 
-### P2 — hygiene and nits
+### P2 — hygiene and nits — DONE (2024c5e, ad73fb2)
+STATUS: All P2 items addressed across two commits (trivial fixes + documentation, and medium correctness fixes). Build zero-warning, 271/271 tests pass.
 - Chord with a duplicated key ("shift,shift,p") never fires, silently: dedup
   or bail at parse. [trivial]
+  — DONE (2024c5e): dedup keys after sort in parse_action.
 - Heartbeat logs every 10s whenever the (ungrabbed) mouse moves while local:
   treat ungrabbed-only activity as idle. [trivial]
+  — DONE (2024c5e): idle guard now keys off physical_grabbed instead of physical.
 - Chords don't work across keyboards: document (wontfix). [trivial]
+  — DONE (2024c5e): documented the per-device ComboState constraint.
 - Motion-before-click ordering comment overpromises (datagram races stream);
   document, or fall back to stream when a non-motion batch is pending. [S/M]
+  — DONE (2024c5e): softened the comment — datagrams race the stream, so the
+  ordering is best-effort, not guaranteed.
 - datagrams_ok fallback is effectively dead (peers must match exactly):
   document as defense-only. ensure_compatible_version after PeerVersions is
   unreachable. MAX_REQUEST_LINE off-by-one (exactly-8192+newline rejected).
@@ -523,6 +529,15 @@ STATUS: All 19 non-MOOT P1 items fixed across four commits (device/ops, connecti
   shutdown up to 5s (select with shutdown). prompt_active can wedge true on
   lock poisoning (scope guard). install_root doesn't trim " (deleted)".
   recv_version reads exactly one chunk (loop on has_complete_cobs_frame).
+  — DONE (2024c5e + ad73fb2): datagrams_ok documented as defense-only;
+  unreachable ensure_compatible_version dropped; MAX_REQUEST_LINE off-by-one
+  fixed (+1 for newline, also reject truncated lines); work_active fix uses
+  catch_unwind in the worker so mark_dead runs even on cancel+panic;
+  convert.rs keeps 5 generations + sweeps all clipboard-* dirs regardless of
+  PID; empty-entry URL stripped in read_gnome_file_paths + skipped in
+  build_zip_payload; backoff sleep raced against shutdown; prompt_active
+  force-reset on lock poisoning; install_root trims " (deleted)";
+  recv_version loops until has_complete_cobs_frame.
 - Log typos + comment drift — DONE (4eb6358): "Comfirm"→"Confirm"
   (approval.rs), "adverstised"→"advertised" (bulk.rs), stray ", :" (input.rs),
   layer-shell→cursorpos-poller (main.rs), "nikau"→"monux" (watch.rs), control.rs
