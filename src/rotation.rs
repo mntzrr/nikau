@@ -18,7 +18,7 @@ use crate::clipboard::{CLIPBOARD_SERVE_TIMEOUT_SECS, data, server};
 use crate::device;
 use crate::edge;
 use crate::msgs::{bulk, event};
-use crate::network::throttle::BulkThrottle;
+use crate::network::throttle;
 use crate::network::transport::NetworkMode;
 
 /// If the selected client reconnects within this long after being removed, then reselect it
@@ -997,37 +997,24 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         // payload by writing queued byte blobs sequentially. The queue is
         // bounded (bulk::BULK_QUEUE_CAPACITY): senders fail fast when the
         // client can't drain, and the client is dropped like a write failure.
-        let (bulk_tx, mut bulk_rx) = mpsc::channel::<Vec<u8>>(bulk::BULK_QUEUE_CAPACITY);
+        let (bulk_tx, bulk_rx) = mpsc::channel::<Vec<u8>>(bulk::BULK_QUEUE_CAPACITY);
         {
             let rotation_tx = self.rotation_tx.clone();
-            let mut bulk_send = bulk_send;
-            // Paces large frames so a clipboard transfer can't fill the
-            // kernel/WiFi driver FIFO ahead of latency-sensitive input
-            // (bufferbloat; see BulkThrottle). The wayland pre-fetch — pulling
-            // the whole clipboard, up to the max size, on every advertisement —
-            // flows through this same writer, so it is paced too.
-            let mut throttle = self.bulk_throttle_mbps.map(BulkThrottle::new);
-            task::spawn(async move {
-                while let Some(bytes) = bulk_rx.recv().await {
-                    trace!("Sending {} byte bulk message to {}", bytes.len(), endpoint);
-                    if let Err(e) = bulk_send.write_all(&bytes).await {
-                        warn!("Bulk stream to {} failed, removing client: {:?}", endpoint, e);
-                        let _ = rotation_tx
-                            .send(RotationEvent::RemoveClient {
-                                endpoint,
-                                conn_token,
-                            })
-                            .await;
-                        return;
-                    }
-                    if let Some(throttle) = &mut throttle {
-                        let wait = throttle.charge(bytes.len(), Instant::now());
-                        if !wait.is_zero() {
-                            tokio::time::sleep(wait).await;
-                        }
-                    }
-                }
-            });
+            throttle::spawn_bulk_writer(
+                bulk_send,
+                bulk_rx,
+                self.bulk_throttle_mbps,
+                endpoint,
+                move |_len, e| async move {
+                    warn!("Bulk stream to {} failed, removing client: {:?}", endpoint, e);
+                    let _ = rotation_tx
+                        .send(RotationEvent::RemoveClient {
+                            endpoint,
+                            conn_token,
+                        })
+                        .await;
+                },
+            );
         }
         let info = ClientInfo {
             endpoint,

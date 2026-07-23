@@ -14,7 +14,7 @@ use tracing::{debug, error, info, trace, warn};
 use crate::clipboard::{CLIPBOARD_SERVE_TIMEOUT_SECS, client, data};
 use crate::device::output;
 use crate::msgs::{bulk, event, shared};
-use crate::network::{approval, throttle::BulkThrottle, transport};
+use crate::network::{approval, throttle, transport};
 use crate::notify;
 
 /// Client-side scaling for relative pointer/scroll deltas (--mouse-scale,
@@ -373,33 +373,18 @@ impl Connection {
         // teardown) or when the stream fails. The queue is bounded
         // (bulk::BULK_QUEUE_CAPACITY): senders fail fast instead of queueing
         // clipboard payloads without limit behind a server that can't drain.
-        let (bulk_tx, mut bulk_rx) = mpsc::channel::<Vec<u8>>(bulk::BULK_QUEUE_CAPACITY);
-        {
-            let mut bulk_send = bulk_send;
-            // Paces large frames so a clipboard transfer can't fill the
-            // kernel/WiFi driver FIFO ahead of latency-sensitive input
-            // (bufferbloat; see BulkThrottle). The wayland pre-fetch — pulling
-            // the whole clipboard, up to the max size, on every advertisement —
-            // flows through this same writer, so it is paced too.
-            let mut throttle = bulk_throttle_mbps.map(BulkThrottle::new);
-            task::spawn(async move {
-                while let Some(bytes) = bulk_rx.recv().await {
-                    trace!("Sending {} byte bulk message", bytes.len());
-                    if let Err(e) = bulk_send.write_all(&bytes).await {
-                        // A broken stream also fails the step loop's read
-                        // side, which resets the connection.
-                        error!("Failed to write {} bytes to the bulk stream: {:?}", bytes.len(), e);
-                        return;
-                    }
-                    if let Some(throttle) = &mut throttle {
-                        let wait = throttle.charge(bytes.len(), Instant::now());
-                        if !wait.is_zero() {
-                            tokio::time::sleep(wait).await;
-                        }
-                    }
-                }
-            });
-        }
+        let (bulk_tx, bulk_rx) = mpsc::channel::<Vec<u8>>(bulk::BULK_QUEUE_CAPACITY);
+        throttle::spawn_bulk_writer(
+            bulk_send,
+            bulk_rx,
+            bulk_throttle_mbps,
+            conn.remote_address(),
+            |len, e| async move {
+                // A broken stream also fails the step loop's read side, which
+                // resets the connection.
+                error!("Failed to write {} bytes to the bulk stream: {:?}", len, e);
+            },
+        );
 
         Ok((
             Self {

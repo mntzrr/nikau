@@ -2,6 +2,9 @@
 
 use std::time::{Duration, Instant};
 
+use tokio::sync::mpsc;
+use tracing::trace;
+
 /// Debts below this are carried, not slept: sub-millisecond sleeps only add
 /// scheduler jitter without meaningfully draining the driver queue. The
 /// carried debt is amortized into the next frame's pause instead.
@@ -60,6 +63,49 @@ impl BulkThrottle {
             sleep
         }
     }
+}
+
+/// Spawns the dedicated writer task for a connection's bulk stream, shared by
+/// the server (one per client) and the client. Clipboard payloads can be
+/// megabytes, and writing them inline would suspend the owner's event loop —
+/// including input handling — for the whole transfer, so the event loop
+/// queues whole frames (each a header glued to its payload) and the task
+/// writes them sequentially, which also keeps overlapping transfers from
+/// interleaving on the stream. Large frames are paced (see BulkThrottle) so a
+/// transfer can't fill the kernel/WiFi driver FIFO ahead of latency-sensitive
+/// input; the wayland pre-fetch — pulling the whole clipboard, up to the max
+/// size, on every advertisement — flows through this same writer, so it is
+/// paced too. The task exits when the last sender is dropped (connection
+/// teardown) or when the stream fails; a write failure runs
+/// `on_failure(frame_len, error)` — the server removes the client over it,
+/// the client only logs (a broken stream also fails its step loop's read
+/// side, which resets the connection).
+pub fn spawn_bulk_writer<F, Fut>(
+    mut send_stream: quinn::SendStream,
+    mut rx: mpsc::Receiver<Vec<u8>>,
+    throttle_mbps: Option<f64>,
+    peer: std::net::SocketAddr,
+    on_failure: F,
+) where
+    F: FnOnce(usize, quinn::WriteError) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let mut throttle = throttle_mbps.map(BulkThrottle::new);
+    tokio::task::spawn(async move {
+        while let Some(bytes) = rx.recv().await {
+            trace!("Sending {} byte bulk message to {}", bytes.len(), peer);
+            if let Err(e) = send_stream.write_all(&bytes).await {
+                on_failure(bytes.len(), e).await;
+                return;
+            }
+            if let Some(throttle) = &mut throttle {
+                let wait = throttle.charge(bytes.len(), Instant::now());
+                if !wait.is_zero() {
+                    tokio::time::sleep(wait).await;
+                }
+            }
+        }
+    });
 }
 
 #[cfg(test)]
