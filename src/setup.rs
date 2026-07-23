@@ -13,6 +13,9 @@
 //! - raised net.core.rmem_max/wmem_max so the QUIC UDP socket buffers aren't
 //!   silently clamped to the stock ~208 KiB (clamped buffers drop packets
 //!   during clipboard bursts)
+//! - DSCP CS6 netfilter marking of monux's UDP traffic (the AP/router hop
+//!   picks its downlink queue from each packet's DSCP; quinn overwrites the
+//!   TOS byte per packet, so only netfilter can set it)
 //! - with `--autostart`, a per-user systemd service starting monux with the
 //!   graphical session (the only step that is NOT machine tuning; off by
 //!   default)
@@ -386,6 +389,61 @@ fn setup_autostart(choice: Option<Autostart>, failures: &mut u32) {
 /// SO_RCVBUF to these sysctls).
 const SOCK_MEM_MAX: u64 = 2_621_440;
 
+/// The nftables table monux's DSCP marks live in. A dedicated table makes the
+/// feature atomic to install and to remove — `nft delete table` undoes
+/// everything without touching anyone else's rules.
+pub(crate) const NFT_QOS_TABLE: &str = "monux-qos";
+
+/// The UDP port the QoS marks match: the default monux listen port. A server
+/// on a custom --port needs matching custom rules.
+const QOS_MARK_PORT: u16 = 1213;
+
+/// The nftables commands installing monux's DSCP marks, in order (one `nft`
+/// invocation per entry). nft takes a whole command as a single argument, so
+/// no shell quoting is involved.
+pub(crate) fn nft_qos_install_cmds() -> Vec<String> {
+    vec![
+        format!("add table inet {}", NFT_QOS_TABLE),
+        format!(
+            "add chain inet {} output {{ type filter hook output priority mangle; policy accept; }}",
+            NFT_QOS_TABLE
+        ),
+        format!(
+            "add rule inet {} output udp sport {} ip dscp set cs6",
+            NFT_QOS_TABLE, QOS_MARK_PORT
+        ),
+        format!(
+            "add rule inet {} output udp dport {} ip dscp set cs6",
+            NFT_QOS_TABLE, QOS_MARK_PORT
+        ),
+    ]
+}
+
+/// Whether `nft list table inet <table>` output already carries both marks.
+fn nft_ruleset_has_marks(ruleset: &str) -> bool {
+    ruleset.contains("udp sport 1213")
+        && ruleset.contains("udp dport 1213")
+        && ruleset.contains("cs6")
+}
+
+/// The two iptables rules (everything after `iptables -t mangle <verb>
+/// OUTPUT`) matching monux's DSCP marks.
+pub(crate) fn iptables_qos_rule_specs() -> [Vec<String>; 2] {
+    ["--sport", "--dport"].map(|side| {
+        [
+            "-p".to_string(),
+            "udp".to_string(),
+            side.to_string(),
+            QOS_MARK_PORT.to_string(),
+            "-j".to_string(),
+            "DSCP".to_string(),
+            "--set-dscp-class".to_string(),
+            "CS6".to_string(),
+        ]
+        .to_vec()
+    })
+}
+
 fn powersave_conf_content() -> &'static str {
     "[connection]\nwifi.powersave = 2\n"
 }
@@ -417,11 +475,12 @@ pub fn run(autostart: Option<Autostart>) -> Result<()> {
     setup_uinput_access(&mut failures);
     setup_wifi_powersave(&mut failures);
     setup_socket_buffers(&mut failures);
+    setup_qos_marking(&mut failures);
     setup_autostart(autostart, &mut failures);
 
     println!();
     if failures == 0 {
-        println!("All done. Undo any of these by removing the files listed above and/or removing the user from the 'input' group.");
+        println!("All done. Undo any of these by removing the files listed above, removing the user from the 'input' group, and/or deleting the QoS rules ('sudo nft delete table inet {}' or the iptables -D equivalents).", NFT_QOS_TABLE);
     } else {
         println!("Done with {} failed step(s); see messages above.", failures);
     }
@@ -607,6 +666,81 @@ fn setup_wifi_powersave(failures: &mut u32) {
     }
 }
 
+/// Installs DSCP CS6 netfilter marking for monux's UDP traffic. SO_PRIORITY
+/// (set by monux itself in local mode) already covers this machine's own
+/// wireless egress queue, but the AP/router hop picks its downlink queue from
+/// each packet's DSCP — and quinn overwrites the TOS byte per packet with its
+/// ECN codepoint, so only netfilter can set a wire-level mark. nftables is
+/// preferred (a dedicated table is atomic to install and remove); iptables is
+/// the fallback. Idempotent; the rules don't persist across reboots.
+fn setup_qos_marking(failures: &mut u32) {
+    if run_cmd("nft", &["--version"]).is_ok() {
+        // A complete existing install is left alone; a partial one (older
+        // version, manual edits) is replaced wholesale.
+        match run_cmd("nft", &[&format!("list table inet {}", NFT_QOS_TABLE)]) {
+            Ok(ruleset) if nft_ruleset_has_marks(&ruleset) => {
+                println!(
+                    "[ok]   qos marking: DSCP CS6 rules already installed (nftables table inet {})",
+                    NFT_QOS_TABLE
+                );
+                return;
+            }
+            Ok(_) => {
+                let _ = run_cmd("nft", &[&format!("delete table inet {}", NFT_QOS_TABLE)]);
+            }
+            Err(_) => {}
+        }
+        for cmd in nft_qos_install_cmds() {
+            if let Err(e) = run_cmd("nft", &[&cmd]) {
+                *failures += 1;
+                println!("[fail] qos marking: nft {}: {}", cmd, e);
+                // Don't leave a half-installed table behind.
+                let _ = run_cmd("nft", &[&format!("delete table inet {}", NFT_QOS_TABLE)]);
+                return;
+            }
+        }
+        println!(
+            "[done] qos marking: monux UDP marked CS6 via nftables (table inet {}; covers both server and client roles; does not persist across reboots)",
+            NFT_QOS_TABLE
+        );
+        return;
+    }
+    if run_cmd("iptables", &["--version"]).is_ok() {
+        let mut added = 0;
+        for spec in iptables_qos_rule_specs() {
+            let check: Vec<&str> = ["-t", "mangle", "-C", "OUTPUT"]
+                .into_iter()
+                .chain(spec.iter().map(String::as_str))
+                .collect();
+            if run_cmd("iptables", &check).is_ok() {
+                continue;
+            }
+            let add: Vec<&str> = ["-t", "mangle", "-A", "OUTPUT"]
+                .into_iter()
+                .chain(spec.iter().map(String::as_str))
+                .collect();
+            match run_cmd("iptables", &add) {
+                Ok(_) => added += 1,
+                Err(e) => {
+                    *failures += 1;
+                    println!("[fail] qos marking: iptables {}: {}", add.join(" "), e);
+                    return;
+                }
+            }
+        }
+        if added == 0 {
+            println!("[ok]   qos marking: DSCP CS6 rules already installed (iptables mangle OUTPUT)");
+        } else {
+            println!(
+                "[done] qos marking: monux UDP marked CS6 via iptables ({} rule(s) added to mangle OUTPUT; does not persist across reboots)",
+                added
+            );
+        }
+        return;
+    }
+    println!("[skip] qos marking: neither nft nor iptables found; monux's SO_PRIORITY WMM marking still covers this machine's own wireless egress");
+}
+
 /// Reads a numeric /proc sysctl value, e.g. /proc/sys/net/core/rmem_max.
 fn read_proc_sysctl(path: &str) -> Option<u64> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
@@ -670,6 +804,41 @@ mod tests {
         let content = sysctl_buf_conf_content();
         assert!(content.contains("net.core.rmem_max = 2621440"));
         assert!(content.contains("net.core.wmem_max = 2621440"));
+    }
+
+    #[test]
+    fn nft_install_cmds_build_table_chain_and_both_marks() {
+        let cmds = nft_qos_install_cmds();
+        assert_eq!(cmds.len(), 4);
+        assert!(cmds[0].contains(NFT_QOS_TABLE));
+        assert!(cmds[1].contains("type filter hook output priority mangle"));
+        assert!(cmds.iter().any(|c| c.contains("udp sport 1213")));
+        assert!(cmds.iter().any(|c| c.contains("udp dport 1213")));
+        assert!(cmds.iter().filter(|c| c.contains("cs6")).count() == 2);
+    }
+
+    #[test]
+    fn nft_ruleset_mark_detection() {
+        let installed = "table inet monux-qos {\n\tchain output {\n\t\ttype filter hook output priority mangle; policy accept;\n\t\tmeta l4proto udp udp sport 1213 ip dscp set cs6\n\t\tmeta l4proto udp udp dport 1213 ip dscp set cs6\n\t}\n}";
+        assert!(nft_ruleset_has_marks(installed));
+        // Only one direction marked: incomplete, gets replaced.
+        let partial = "table inet monux-qos {\n\tchain output {\n\t\tmeta l4proto udp udp sport 1213 ip dscp set cs6\n\t}\n}";
+        assert!(!nft_ruleset_has_marks(partial));
+        assert!(!nft_ruleset_has_marks(""));
+    }
+
+    #[test]
+    fn iptables_rule_specs_cover_both_directions() {
+        let specs = iptables_qos_rule_specs();
+        assert_eq!(specs.len(), 2);
+        for spec in &specs {
+            let joined = spec.join(" ");
+            assert!(joined.contains("-p udp"));
+            assert!(joined.contains("1213"));
+            assert!(joined.contains("-j DSCP --set-dscp-class CS6"));
+        }
+        assert!(specs[0].join(" ").contains("--sport 1213"));
+        assert!(specs[1].join(" ").contains("--dport 1213"));
     }
 
     #[test]

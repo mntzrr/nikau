@@ -7,9 +7,10 @@
 //!    server may hold input devices grabbed);
 //! 2. the user is asked about ~/.config/monux (identity keypair + peer
 //!    approvals) — only on a terminal, otherwise it is kept;
-//! 3. root-owned system settings persisted by `monux system setup` and the
-//!    /usr/local/bin link are removed via sudo subprocesses (unlike setup, no
-//!    sudo re-exec: uninstall must not swap its own process image mid-flight);
+//! 3. root-owned system settings persisted by `monux system setup` — the
+//!    files, plus the netfilter DSCP marks — and the /usr/local/bin link are
+//!    removed via sudo subprocesses (unlike setup, no sudo re-exec: uninstall
+//!    must not swap its own process image mid-flight);
 //! 4. the running binary itself plus stale copies are removed (self-delete is
 //!    fine on Linux: the file unlinks while the process keeps running);
 //! 5. ~/.config/monux is removed, only if the user said yes.
@@ -143,6 +144,7 @@ fn same_file(a: &Path, b: &Path) -> bool {
 
 fn execute(plan: &Plan) {
     remove_root_owned(&plan.root_owned);
+    remove_qos_marking();
 
     for path in &plan.user_binaries {
         match fs::remove_file(path) {
@@ -209,6 +211,45 @@ fn remove_root_owned(paths: &[PathBuf]) {
     {
         println!("note: WiFi powersave re-enables on next NetworkManager restart/reboot.");
     }
+}
+
+/// Removes the netfilter DSCP marks 'monux system setup' installs. The rules
+/// are self-describing (our own nftables table; two exact iptables rules), so
+/// removal is idempotent and needs no state. Non-interactive: when sudo would
+/// have to ask for a password (nothing earlier in the uninstall warmed the
+/// credential cache), the rules are left alone with a manual hint instead —
+/// an unexpected prompt mid-uninstall is worse than leftover QoS marks, which
+/// are inert without monux traffic.
+fn remove_qos_marking() {
+    let sudo_ready = Command::new("sudo")
+        .args(["-n", "true"])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if !sudo_ready {
+        println!("note: DSCP QoS rules (if any were installed) were left in place; remove them with:");
+        println!(
+            "  sudo nft delete table inet {}  # or:",
+            setup::NFT_QOS_TABLE
+        );
+        for spec in setup::iptables_qos_rule_specs() {
+            println!("  sudo iptables -t mangle -D OUTPUT {}", spec.join(" "));
+        }
+        return;
+    }
+    // nftables variant: one delete undoes the whole feature. iptables variant:
+    // delete both exact rules. Absence of either backend or rule is fine.
+    let _ = Command::new("sudo")
+        .args(["nft", "delete", "table", "inet", setup::NFT_QOS_TABLE])
+        .status();
+    for spec in setup::iptables_qos_rule_specs() {
+        let _ = Command::new("sudo")
+            .arg("iptables")
+            .args(["-t", "mangle", "-D", "OUTPUT"])
+            .args(&spec)
+            .status();
+    }
+    println!("Removed DSCP QoS marking rules (if any were installed).");
 }
 
 /// Asks any running monux server and client to shut down gracefully, waiting
