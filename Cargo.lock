@@ -1033,7 +1033,7 @@ dependencies = [
 
 [[package]]
 name = "monux"
-version = "5.4.3"
+version = "5.4.4"
 dependencies = [
  "anyhow",
  "async-trait",

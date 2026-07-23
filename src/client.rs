@@ -453,153 +453,123 @@ impl Connection {
         output_handler: &mut O,
         connect_time: &Instant,
     ) -> Result<()> {
-        if let Some(local_clipboard) = local_clipboard {
-            // Local clipboard enabled: Include watching for local clipboard events
-            tokio::select! {
-                local_fetch_request = local_clipboard.clipboard_fetch_rx.recv() => {
-                    // Send fetch request to server, keep request and its nested oneshot for handling the response
-                    if let Some(local_fetch_request) = local_fetch_request {
-                        let request_id = self.next_fetch_id;
-                        self.next_fetch_id = self.next_fetch_id.wrapping_add(1);
-                        let msg = bulk::ClientBulk::ClipboardRequest(bulk::ClientClipboardRequest{
-                            requested_type: &local_fetch_request.requested_type,
-                            max_size_bytes: self.max_clipboard_size_bytes as u64,
-                            request_id,
-                        });
-                        let serializedmsg = postcard::to_stdvec_cobs(&msg)
-                            .map_err(|e| anyhow!("Failed to serialize clipboard request message: {:?}", e))?;
-                        trace!(
-                            "Sending {} byte clipboard content request: {:X?}",
-                            serializedmsg.len(),
-                            &serializedmsg
-                        );
-                        // Drop fetches whose requester already timed out, then track this one.
-                        self.pending_fetches.retain(|_, f| !f.fetch_result_tx.is_closed());
-                        self.pending_fetches.insert(request_id, local_fetch_request);
-                        // Queue the whole frame for the bulk writer task: a
-                        // direct write here would suspend the whole select —
-                        // including input application — behind any in-flight
-                        // clipboard payload. try_send keeps the loop from
-                        // parking on a full queue: a server that isn't
-                        // draining leaves the connection wedged (it would die
-                        // on the idle timeout anyway), so fail and reconnect.
-                        self.bulk_tx
-                            .try_send(serializedmsg)
-                            .context("Failed to queue clipboard request message (bulk queue full or closed)")?;
+        // The clipboard channels get the same Option treatment as
+        // switch_request_rx below: with no local clipboard they pend forever,
+        // so a single select covers both cases.
+        let (fetch_rx, types_rx) = match local_clipboard.as_mut() {
+            Some(lc) => (
+                Some(&mut lc.clipboard_fetch_rx),
+                Some(&mut lc.local_types_rx),
+            ),
+            None => (None, None),
+        };
+        tokio::select! {
+            local_fetch_request = async {
+                match fetch_rx {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                // Send fetch request to server, keep request and its nested oneshot for handling the response
+                if let Some(local_fetch_request) = local_fetch_request {
+                    let request_id = self.next_fetch_id;
+                    self.next_fetch_id = self.next_fetch_id.wrapping_add(1);
+                    let msg = bulk::ClientBulk::ClipboardRequest(bulk::ClientClipboardRequest{
+                        requested_type: &local_fetch_request.requested_type,
+                        max_size_bytes: self.max_clipboard_size_bytes as u64,
+                        request_id,
+                    });
+                    let serializedmsg = postcard::to_stdvec_cobs(&msg)
+                        .map_err(|e| anyhow!("Failed to serialize clipboard request message: {:?}", e))?;
+                    trace!(
+                        "Sending {} byte clipboard content request: {:X?}",
+                        serializedmsg.len(),
+                        &serializedmsg
+                    );
+                    // Drop fetches whose requester already timed out, then track this one.
+                    self.pending_fetches.retain(|_, f| !f.fetch_result_tx.is_closed());
+                    self.pending_fetches.insert(request_id, local_fetch_request);
+                    // Queue the whole frame for the bulk writer task: a
+                    // direct write here would suspend the whole select —
+                    // including input application — behind any in-flight
+                    // clipboard payload. try_send keeps the loop from
+                    // parking on a full queue: a server that isn't
+                    // draining leaves the connection wedged (it would die
+                    // on the idle timeout anyway), so fail and reconnect.
+                    self.bulk_tx
+                        .try_send(serializedmsg)
+                        .context("Failed to queue clipboard request message (bulk queue full or closed)")?;
+                } else {
+                    bail!("Clipboard fetch request queue has closed");
+                }
+            },
+            types_notify = async {
+                match types_rx {
+                    Some(rx) => rx.changed().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                // Local machine has a new clipboard entry.
+                // If we're currently active, then store it until we're deactivated by a switch.
+                // Ignore clipboard changes when inactive: Avoid polluting the rotation with "external" clipboards.
+                if let Err(e) = types_notify {
+                    warn!("local_types_rx is closed: {:?}", e);
+                    return Err(anyhow!(e));
+                }
+                if self.active {
+                    if let Some(lc) = local_clipboard {
+                        lc.set_local_clipboard();
+                    }
+                }
+            },
+            event_result = self.events_recv.read_chunk(16384, true) => {
+                // Incoming data may contain one or more messages, but I've never seen fragments of messages.
+                let resp = event_result
+                    .with_context(|| if is_new_connection(connect_time) {
+                        // Additional help for typical behavior when setting things up
+                        "Lost events connection, does server need to approve our fingerprint?"
                     } else {
-                        bail!("Clipboard fetch request queue has closed");
-                    }
-                },
-                types_notify = local_clipboard.local_types_rx.changed() => {
-                    // Local machine has a new clipboard entry.
-                    // If we're currently active, then store it until we're deactivated by a switch.
-                    // Ignore clipboard changes when inactive: Avoid polluting the rotation with "external" clipboards.
-                    if let Err(e) = types_notify {
-                        warn!("local_types_rx is closed: {:?}", e);
-                        return Err(anyhow!(e));
-                    }
-                    if self.active {
-                        local_clipboard.set_local_clipboard();
-                    }
-                },
-                event_result = self.events_recv.read_chunk(16384, true) => {
-                    // Incoming data may contain one or more messages, but I've never seen fragments of messages.
-                    let resp = event_result
-                        .with_context(|| if is_new_connection(connect_time) {
-                            // Additional help for typical behavior when setting things up
-                            "Lost events connection, does server need to approve our fingerprint?"
-                        } else {
-                            "Lost events connection"
-                        })?
-                        .context("Server closed events connection")?;
-                    trace!("Received {} bytes from events stream: {:X?}", resp.bytes.len(), &*resp.bytes);
-                    // Copy the immutable response data into a mutable buffer
-                    self.event_bytes.extend_from_slice(&resp.bytes);
-                    self.handle_event_messages(Some(local_clipboard), output_handler).await?;
-                },
-                datagram_result = self.quinn_conn.read_datagram() => {
-                    // Unreliable/unordered pointer motion (see MotionDatagram).
-                    let bytes = datagram_result.context("Lost datagram connection")?;
-                    self.handle_motion_datagram(&bytes, output_handler).await?;
-                },
-                bulk_result = self.bulk_recv.read_chunk(65536, true) => {
-                    let resp = bulk_result
-                        .with_context(|| if is_new_connection(connect_time) {
-                            // Additional help for typical behavior when setting things up
-                            "Lost bulk connection, does server need to approve our fingerprint?"
-                        } else {
-                            "Lost bulk connection"
-                        })?
-                        .context("Server closed bulk connection")?;
-                    // Don't log the bytes themselves, there can be a lot for larger file copies
-                    trace!("Received {} bytes from bulk stream", resp.bytes.len());
-                    self.handle_bulk_data_or_messages(Some(local_clipboard), resp.bytes).await?;
-                },
-                switch_request = async {
-                    match &mut self.switch_request_rx {
-                        Some(rx) => rx.recv().await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    match switch_request {
-                        // The screen-edge detector fired: ask the server to
-                        // take input back (see ClientEvent::SwitchRequest).
-                        Some(y_fraction) => self.send_switch_request(y_fraction).await?,
-                        // The detector is gone (Hyprland IPC unavailable):
-                        // the feature turns off, the connection is unaffected.
-                        None => self.switch_request_rx = None,
-                    }
-                },
-            }
-        } else {
-            // Local clipboard disabled: Don't select on local clipboard events
-            tokio::select! {
-                event_result = self.events_recv.read_chunk(16384, true) => {
-                    // Incoming data may contain one or more messages, but I've never seen fragments of messages.
-                    let resp = event_result
-                        .with_context(|| if is_new_connection(connect_time) {
-                            "Lost events connection, does server need to approve our fingerprint?"
-                        } else {
-                            "Lost events connection"
-                        })?
-                        .context("Server closed events connection")?;
-                    trace!("Received {} bytes from events stream: {:X?}", resp.bytes.len(), &*resp.bytes);
-                    // Copy the immutable response data into a mutable buffer
-                    self.event_bytes.extend_from_slice(&resp.bytes);
-                    self.handle_event_messages(None, output_handler).await?;
-                },
-                datagram_result = self.quinn_conn.read_datagram() => {
-                    // Unreliable/unordered pointer motion (see MotionDatagram).
-                    let bytes = datagram_result.context("Lost datagram connection")?;
-                    self.handle_motion_datagram(&bytes, output_handler).await?;
-                },
-                bulk_result = self.bulk_recv.read_chunk(65536, true) => {
-                    let resp = bulk_result
-                        .with_context(|| if is_new_connection(connect_time) {
-                            "Lost bulk connection, does server need to approve our fingerprint?"
-                        } else {
-                            "Lost bulk connection"
-                        })?
-                        .context("Server closed bulk connection")?;
-                    trace!("Received {} bytes from bulk stream: {:X?}", resp.bytes.len(), &*resp.bytes);
-                    self.handle_bulk_data_or_messages(None, resp.bytes).await?;
-                },
-                switch_request = async {
-                    match &mut self.switch_request_rx {
-                        Some(rx) => rx.recv().await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    match switch_request {
-                        // The screen-edge detector fired: ask the server to
-                        // take input back (see ClientEvent::SwitchRequest).
-                        Some(y_fraction) => self.send_switch_request(y_fraction).await?,
-                        // The detector is gone (Hyprland IPC unavailable):
-                        // the feature turns off, the connection is unaffected.
-                        None => self.switch_request_rx = None,
-                    }
-                },
-            }
+                        "Lost events connection"
+                    })?
+                    .context("Server closed events connection")?;
+                trace!("Received {} bytes from events stream: {:X?}", resp.bytes.len(), &*resp.bytes);
+                // Copy the immutable response data into a mutable buffer
+                self.event_bytes.extend_from_slice(&resp.bytes);
+                self.handle_event_messages(local_clipboard.as_mut(), output_handler).await?;
+            },
+            datagram_result = self.quinn_conn.read_datagram() => {
+                // Unreliable/unordered pointer motion (see MotionDatagram).
+                let bytes = datagram_result.context("Lost datagram connection")?;
+                self.handle_motion_datagram(&bytes, output_handler).await?;
+            },
+            bulk_result = self.bulk_recv.read_chunk(65536, true) => {
+                let resp = bulk_result
+                    .with_context(|| if is_new_connection(connect_time) {
+                        // Additional help for typical behavior when setting things up
+                        "Lost bulk connection, does server need to approve our fingerprint?"
+                    } else {
+                        "Lost bulk connection"
+                    })?
+                    .context("Server closed bulk connection")?;
+                // Don't log the bytes themselves, there can be a lot for larger file copies
+                trace!("Received {} bytes from bulk stream", resp.bytes.len());
+                self.handle_bulk_data_or_messages(local_clipboard.as_mut(), resp.bytes).await?;
+            },
+            switch_request = async {
+                match &mut self.switch_request_rx {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match switch_request {
+                    // The screen-edge detector fired: ask the server to
+                    // take input back (see ClientEvent::SwitchRequest).
+                    Some(y_fraction) => self.send_switch_request(y_fraction).await?,
+                    // The detector is gone (Hyprland IPC unavailable):
+                    // the feature turns off, the connection is unaffected.
+                    None => self.switch_request_rx = None,
+                }
+            },
         }
         Ok(())
     }
