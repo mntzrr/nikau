@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -607,6 +607,10 @@ pub struct Rotation<O: device::output::OutputHandler> {
     /// EdgeDirectionsCache): re-resolved only on client add/remove and from
     /// set_edge_map, so building server_state never hits DNS.
     edge_dirs: EdgeDirectionsCache,
+    /// Last advertised EdgeInfo directions per client, so unchanged maps
+    /// aren't re-sent on topology changes (each re-advertise respawns the
+    /// client's edge detector, resetting any in-progress dwell).
+    edge_info_sent: HashMap<SocketAddr, BTreeSet<event::Direction>>,
     /// When the diagnostics mirror was last refreshed (see
     /// DIAGNOSTICS_REFRESH_INTERVAL); None until the first refresh.
     last_diagnostics_refresh: Option<Instant>,
@@ -825,6 +829,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             edge_client_tx: None,
             edge_map: None,
             edge_dirs: EdgeDirectionsCache::default(),
+            edge_info_sent: HashMap::new(),
             last_diagnostics_refresh: None,
         })
     }
@@ -868,12 +873,21 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         let Some(map) = &self.edge_map else {
             return;
         };
-        let directions = edge_info_directions(
+        let directions: BTreeSet<event::Direction> = edge_info_directions(
             map,
             &self.edge_client_entries(),
             fingerprint,
             &edge::resolve_hostname,
-        );
+        )
+        .into_iter()
+        .collect();
+        // Dedup: skip if the resolved directions haven't changed since the
+        // last advertise. Each re-advertise respawns the client's edge
+        // detector, resetting any in-progress dwell.
+        if self.edge_info_sent.get(endpoint) == Some(&directions) {
+            return;
+        }
+        self.edge_info_sent.insert(*endpoint, directions.clone());
         for direction in directions {
             info!(
                 "Telling client {} it is our {}-hand neighbor",
@@ -2914,6 +2928,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         // with the clients list (a removal for a never-added endpoint just
         // finds no entry).
         self.liveness.remove(endpoint);
+        self.edge_info_sent.remove(endpoint);
         // Always refetch the idx to avoid issues if there was an await in which the client was
         // removed behind our back.
         match self.clients.binary_search_by(|c| c.endpoint.cmp(&endpoint)) {

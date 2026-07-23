@@ -195,11 +195,15 @@ pub(crate) fn exposed_segments(outputs: &[OutputRect]) -> Vec<EdgeSegment> {
                 if i == j || q.width <= 0 || q.height <= 0 {
                     continue;
                 }
+                // Tolerate ±1px: fractional scales round each output's
+                // dimensions independently, so abutting monitors can be off
+                // by a pixel — an exact equality would manufacture a
+                // mid-desktop trigger zone in the gap.
                 let shares_boundary = match direction {
-                    Direction::Right => q.x == r.x + r.width,
-                    Direction::Left => q.x + q.width == r.x,
-                    Direction::Bottom => q.y == r.y + r.height,
-                    Direction::Top => q.y + q.height == r.y,
+                    Direction::Right => (q.x - (r.x + r.width)).abs() <= 1,
+                    Direction::Left => ((q.x + q.width) - r.x).abs() <= 1,
+                    Direction::Bottom => (q.y - (r.y + r.height)).abs() <= 1,
+                    Direction::Top => ((q.y + q.height) - r.y).abs() <= 1,
                 };
                 if !shares_boundary {
                     continue;
@@ -325,12 +329,19 @@ fn parse_monitors_json(json: &str) -> Result<Vec<OutputRect>> {
                 .as_i64()
                 .with_context(|| format!("Hyprland monitor '{}' lacks '{}'", name, key))
         };
-        let (x, y, width, height) = (
+        let (x, y, mut width, mut height) = (
             get_i64("x")?,
             get_i64("y")?,
             get_i64("width")?,
             get_i64("height")?,
         );
+        // Hyprland reports the native (pre-rotation) mode size. Odd transforms
+        // (90°/270° and their flipped variants) rotate the output, so the
+        // logical width and height are swapped relative to the mode.
+        let transform = monitor["transform"].as_i64().unwrap_or(0);
+        if transform % 2 == 1 {
+            std::mem::swap(&mut width, &mut height);
+        }
         let scale = monitor["scale"]
             .as_f64()
             .filter(|s| *s > 0.0)
@@ -786,14 +797,19 @@ async fn run_inner(
             return;
         }
     };
-    let layout = match hyprland_layout(&socket) {
-        Ok(layout) if !layout.is_empty() => layout,
-        Ok(_) => {
+    let socket_for_layout = socket.clone();
+    let layout = match tokio::task::spawn_blocking(move || hyprland_layout(&socket_for_layout)).await {
+        Ok(Ok(layout)) if !layout.is_empty() => layout,
+        Ok(Ok(_)) => {
             warn!("Screen-edge switching disabled: Hyprland reports no outputs");
             return;
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             warn!("Screen-edge switching disabled: {:#}", e);
+            return;
+        }
+        Err(e) => {
+            warn!("Screen-edge switching disabled: layout query panicked: {:#}", e);
             return;
         }
     };
@@ -898,8 +914,9 @@ async fn run_inner(
                 return;
             }
             _ = requery.tick() => {
-                match hyprland_layout(&socket) {
-                    Ok(new_layout) if !new_layout.is_empty() => {
+                let socket_for_requery = socket.clone();
+                match tokio::task::spawn_blocking(move || hyprland_layout(&socket_for_requery)).await {
+                    Ok(Ok(new_layout)) if !new_layout.is_empty() => {
                         if new_layout != current_layout {
                             info!("Screen-edge switching: monitor layout changed, recomputing edge zones");
                             log_layout(&new_layout);
@@ -915,11 +932,14 @@ async fn run_inner(
                             }
                         }
                     }
-                    Ok(_) => {
+                    Ok(Ok(_)) => {
                         warn!("Screen-edge switching: Hyprland layout re-query returned no outputs, keeping existing zones");
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         warn!("Screen-edge switching: Hyprland layout re-query failed ({:#}), keeping existing zones", e);
+                    }
+                    Err(e) => {
+                        warn!("Screen-edge switching: Hyprland layout re-query panicked ({:#}), keeping existing zones", e);
                     }
                 }
             }
@@ -938,6 +958,16 @@ async fn run_inner(
                     }
                     // Fired: the timer reset and started its re-arm cooldown.
                     state.deadline = None;
+                    // Require fresh contact at fire time: the debounce needs
+                    // STABLE_POLLS consecutive off-polls to commit a leave,
+                    // so the dwell deadline can arrive before leave() is
+                    // called. If the cursor already left the zone, skip.
+                    if let Some((x, y)) = last_pos {
+                        if !zones.iter().any(|zone| zone.direction == *dir && zone_contains(zone, x, y)) {
+                            debug!("Edge switch via {} edge skipped: cursor left before the dwell completed", dir.as_str());
+                            continue;
+                        }
+                    }
                     match &fire {
                         Fire::Event(event_tx) => {
                             let clients = clients_rx
@@ -945,16 +975,24 @@ async fn run_inner(
                                 .expect("server mode always carries the client list")
                                 .borrow()
                                 .clone();
-                            let target = &map.targets[dir];
-                            match resolve_edge_target(target, &clients, &resolve_hostname) {
-                                Ok(fingerprint) => {
+                            let target = map.targets[dir].clone();
+                            // resolve_hostname does blocking getaddrinfo — run
+                            // it off the async executor (only 2 worker threads;
+                            // one may already be blockable by cert prompts).
+                            match tokio::task::spawn_blocking(move || {
+                                resolve_edge_target(&target, &clients, &resolve_hostname)
+                            }).await {
+                                Ok(Ok(fingerprint)) => {
                                     info!("Edge switch to client {} via {} edge", fingerprint, dir.as_str());
                                     if let Err(e) = event_tx.send(Event::SwitchTo(fingerprint)).await {
                                         warn!("Failed to submit edge switch event: {:?}", e);
                                     }
                                 }
-                                Err(e) => {
+                                Ok(Err(e)) => {
                                     warn!("Edge switch via {} edge did not fire: {}", dir.as_str(), e);
+                                }
+                                Err(e) => {
+                                    warn!("Edge switch via {} edge resolution panicked: {:#}", dir.as_str(), e);
                                 }
                             }
                         }
