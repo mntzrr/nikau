@@ -35,7 +35,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -147,7 +147,7 @@ pub fn parse_client_edge_map(specs: &[String]) -> Result<EdgeMap> {
 /// space (scale already applied). Injectable so the geometry is testable
 /// without a running compositor.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OutputRect {
+pub(crate) struct OutputRect {
     pub name: String,
     pub x: i32,
     pub y: i32,
@@ -159,7 +159,7 @@ pub struct OutputRect {
 /// abuts it, so the cursor jams against it (and a trigger zone there sees it).
 /// `start`/`len` run along the edge axis in global layout coordinates.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EdgeSegment {
+pub(crate) struct EdgeSegment {
     pub direction: Direction,
     pub output: String,
     pub start: i32,
@@ -171,7 +171,7 @@ pub struct EdgeSegment {
 /// monitors side by side at (0,0) and (1920,0) yield the right edge only on
 /// the rightmost monitor, the left edge only on the leftmost, and full
 /// top/bottom edges on both. Pure over the layout so tests need no Hyprland.
-pub fn exposed_segments(outputs: &[OutputRect]) -> Vec<EdgeSegment> {
+pub(crate) fn exposed_segments(outputs: &[OutputRect]) -> Vec<EdgeSegment> {
     let mut segments = Vec::new();
     for (i, r) in outputs.iter().enumerate() {
         if r.width <= 0 || r.height <= 0 {
@@ -240,7 +240,7 @@ pub fn exposed_segments(outputs: &[OutputRect]) -> Vec<EdgeSegment> {
 /// Every segment end is a desktop-outline corner or an abutment step — both
 /// are points the cursor jams into when flung diagonally (or aimed at corner
 /// UI), so both get the dead zone: corners never trigger a switch.
-pub const CORNER_TRIM_PERCENT: i32 = 8;
+pub(crate) const CORNER_TRIM_PERCENT: i32 = 8;
 
 /// Trims CORNER_TRIM_PERCENT off both ends of an exposed segment (see
 /// CORNER_TRIM_PERCENT). Returns None if nothing usable remains.
@@ -271,27 +271,36 @@ fn hyprland_socket_path() -> Result<PathBuf> {
         .join(".socket.sock"))
 }
 
-/// Queries the monitor layout from Hyprland's IPC socket (see
-/// hyprland_socket_path). Errors when not running under Hyprland.
-pub fn hyprland_layout() -> Result<Vec<OutputRect>> {
-    let socket = hyprland_socket_path()?;
-    let mut stream = UnixStream::connect(&socket)
+/// Runs one command against Hyprland's IPC socket: connect, send the
+/// command, half-close the write side, read the reply to EOF. One-shot per
+/// query: the compositor closes the connection after each reply (verified
+/// empirically — hyprctl --batch's single connection works only because all
+/// its commands go out in ONE write), so each query reconnects.
+fn hyprland_query(socket: &Path, cmd: &[u8]) -> Result<String> {
+    let mut stream = UnixStream::connect(socket)
         .with_context(|| format!("Failed to connect to Hyprland IPC at {}", socket.display()))?;
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .context("Failed to configure Hyprland IPC socket")?;
-    // "j/monitors" is the JSON variant of the monitors request.
+    let query = String::from_utf8_lossy(cmd);
     stream
-        .write_all(b"j/monitors")
-        .context("Failed to query Hyprland monitors")?;
+        .write_all(cmd)
+        .with_context(|| format!("Failed to query Hyprland '{}'", query))?;
     stream
         .shutdown(std::net::Shutdown::Write)
-        .context("Failed to finish Hyprland monitors query")?;
+        .with_context(|| format!("Failed to finish the Hyprland '{}' query", query))?;
     let mut reply = String::new();
     stream
         .read_to_string(&mut reply)
-        .context("Failed to read Hyprland monitors reply")?;
-    parse_monitors_json(&reply)
+        .with_context(|| format!("Failed to read the Hyprland '{}' reply", query))?;
+    Ok(reply)
+}
+
+/// Queries the monitor layout from Hyprland's IPC socket (see
+/// hyprland_socket_path). Errors when not running under Hyprland.
+pub(crate) fn hyprland_layout(socket: &Path) -> Result<Vec<OutputRect>> {
+    // "j/monitors" is the JSON variant of the monitors request.
+    parse_monitors_json(&hyprland_query(socket, b"j/monitors")?)
 }
 
 /// Parses Hyprland's JSON monitors reply into logical output rectangles
@@ -346,7 +355,7 @@ const REARM_COOLDOWN: Duration = Duration::from_secs(1);
 /// timer, a leave before the deadline cancels it, a completed dwell fires
 /// once and the re-arm cooldown blocks immediate refires. Pure over `now`
 /// instants so the state machine is testable without sleeping.
-pub struct DwellTimer {
+pub(crate) struct DwellTimer {
     dwell: Duration,
     cooldown: Duration,
     /// When the cursor entered (dwell in progress), None while disarmed.
@@ -517,28 +526,10 @@ const POLL_INTERVAL: Duration = Duration::from_millis(40);
 /// How long the poller waits after a failed query before retrying.
 const POLL_FAILURE_BACKOFF: Duration = Duration::from_millis(500);
 
-/// Queries the cursor position from Hyprland's IPC. One-shot, exactly like
-/// the layout query: the compositor closes the connection after each reply
-/// (verified empirically — hyprctl --batch's single connection works only
-/// because all its commands go out in ONE write), so each poll reconnects.
-fn cursor_position() -> Result<(i32, i32)> {
-    let socket = hyprland_socket_path()?;
-    let mut stream = UnixStream::connect(&socket)
-        .with_context(|| format!("Failed to connect to Hyprland IPC at {}", socket.display()))?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .context("Failed to configure Hyprland IPC socket")?;
-    stream
-        .write_all(b"cursorpos")
-        .context("Failed to query the Hyprland cursor position")?;
-    stream
-        .shutdown(std::net::Shutdown::Write)
-        .context("Failed to finish the Hyprland cursor position query")?;
-    let mut reply = String::new();
-    stream
-        .read_to_string(&mut reply)
-        .context("Failed to read the Hyprland cursor position reply")?;
-    parse_cursorpos(&reply)
+/// Queries the cursor position from Hyprland's IPC (see hyprland_query for
+/// why each poll reconnects).
+fn cursor_position(socket: &Path) -> Result<(i32, i32)> {
+    parse_cursorpos(&hyprland_query(socket, b"cursorpos")?)
 }
 
 /// Parses Hyprland's cursorpos reply ("x, y"; coordinates can be negative
@@ -563,9 +554,9 @@ fn parse_cursorpos(reply: &str) -> Result<(i32, i32)> {
 /// manager; a failed query is logged at debug and retried after
 /// POLL_FAILURE_BACKOFF. Runs on its own thread (blocking socket IO) and
 /// ends when the edge manager is gone (server shutting down).
-fn run_cursor_poller(pos_tx: mpsc::UnboundedSender<(i32, i32)>) {
+fn run_cursor_poller(socket: PathBuf, pos_tx: mpsc::UnboundedSender<(i32, i32)>) {
     loop {
-        match cursor_position() {
+        match cursor_position(&socket) {
             Ok(pos) => {
                 if pos_tx.send(pos).is_err() {
                     return;
@@ -586,7 +577,7 @@ fn run_cursor_poller(pos_tx: mpsc::UnboundedSender<(i32, i32)>) {
 /// How far beyond an edge line the cursor still counts as "on the edge", in
 /// logical pixels. 0 = the cursor must reach the very edge: left x <= 0,
 /// right x >= the output's last column (and likewise for top/bottom rows).
-pub const EDGE_TRIGGER_PX: i32 = 0;
+pub(crate) const EDGE_TRIGGER_PX: i32 = 0;
 
 /// A trigger zone: one exposed, corner-trimmed segment of one output's edge,
 /// in global layout coordinates. The cursor is on the zone's edge when its
@@ -785,7 +776,17 @@ async fn run_inner(
     fire: Fire,
     mut clients_rx: Option<watch::Receiver<Vec<(SocketAddr, String)>>>,
 ) {
-    let layout = match hyprland_layout() {
+    // The socket path is resolved once here, at manager start, instead of on
+    // every 40ms cursor poll (the env vars it derives from are fixed for the
+    // lifetime of the session).
+    let socket = match hyprland_socket_path() {
+        Ok(socket) => socket,
+        Err(e) => {
+            warn!("Screen-edge switching disabled: {:#}", e);
+            return;
+        }
+    };
+    let layout = match hyprland_layout(&socket) {
         Ok(layout) if !layout.is_empty() => layout,
         Ok(_) => {
             warn!("Screen-edge switching disabled: Hyprland reports no outputs");
@@ -808,7 +809,8 @@ async fn run_inner(
     );
     log_layout(&layout);
     let (pos_tx, mut pos_rx) = mpsc::unbounded_channel::<(i32, i32)>();
-    std::thread::spawn(move || run_cursor_poller(pos_tx));
+    let poller_socket = socket.clone();
+    std::thread::spawn(move || run_cursor_poller(poller_socket, pos_tx));
     let mut zones = edge_zones(&map, &layout);
     log_zones(&zones);
     let mut current_layout = layout;
@@ -896,7 +898,7 @@ async fn run_inner(
                 return;
             }
             _ = requery.tick() => {
-                match hyprland_layout() {
+                match hyprland_layout(&socket) {
                     Ok(new_layout) if !new_layout.is_empty() => {
                         if new_layout != current_layout {
                             info!("Screen-edge switching: monitor layout changed, recomputing edge zones");
