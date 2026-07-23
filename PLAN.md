@@ -362,3 +362,9 @@ Recorded 2026-07-22; no plan order — take any when wanted.
 - Two-connection events/bulk split — QUIC already provides stream
   priority + per-stream flow control; a second connection adds
   self-competition and duplicated handshake state for no measurable gain.
+4. **Adaptive motion coalescing.** Today motion coalesces at a fixed 250Hz
+   (office mode). Scale the rate with link health: full 250Hz when RTT is
+   clean, back off (~60Hz) when the link monitor reports degradation
+   (RTT/loss over the warn thresholds), restore when it recovers. Serves
+   the recurring WiFi pain directly: fewer datagrams fighting a bad link
+   means smoother cursor at exactly the moments the link is worst.
