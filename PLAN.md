@@ -325,3 +325,40 @@ unlocks, in rough priority order:
   as explicit signals rather than inferred from timeouts.
 Build it when one of these decisions actually needs it, so a real
 requirement pressure-tests the extension points.
+
+## Optional polish (user-approved, unscheduled)
+
+Recorded 2026-07-22; no plan order — take any when wanted.
+
+1. **Cursor warp on arrival.** When the server switches input to a client,
+   the client's cursor warps to the matching edge at the Y fraction the
+   server crossed at, completing the spatial illusion (the return trip
+   needs nothing: the server's cursor is frozen at its edge). The fraction
+   already rides the wire in SwitchRequest (y_fraction); the server→client
+   direction needs the fraction passed with the switch, and the client
+   warps via absolute-axis injection (the touchpad ABS mechanism from
+   Phase 5). Fullscreen/multi-monitor edge cases: clamp to the mapped
+   output's segment.
+2. **Fullscreen-game edge-switch suppression.** Edge switching should not
+   fire while a fullscreen window is focused (a game slamming the pointer
+   into an edge must not yank input). Hyprland IPC reports fullscreen
+   state; the poller already talks to it. Interim workaround documented in
+   README: pause monux before gaming (pause is opt-in since 4712899).
+3. **Stale-current-client navigation skip.** Pre-existing: with
+   current_client no longer in the sorted clients list, next_client steps
+   idx+1 past the insertion point and can skip one entry (pinned by
+   next_prev_targets_stale_current_uses_its_sort_position in
+   src/rotation.rs tests). Decide whether insert-position or skip is the
+   intended semantic, then align code and test.
+
+## Considered and rejected — addendum (2026-07-22)
+
+- `--no-encryption` flag (for events or clipboard) — QUIC has no plaintext
+  mode; the traffic is the most sensitive on the machine (keystrokes,
+  clipboard), and the CPU cost on LAN is unmeasurable.
+- QoS/DSCP marking — single QUIC connection can't split input from bulk
+  per-packet via quinn; the bulk throttle already solves the real delay
+  (bufferbloat); consumer-AP WMM honoring is a coin flip.
+- Two-connection events/bulk split — QUIC already provides stream
+  priority + per-stream flow control; a second connection adds
+  self-competition and duplicated handshake state for no measurable gain.
