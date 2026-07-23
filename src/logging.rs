@@ -104,12 +104,6 @@ pub fn init_logging() {
             "quinn_proto=info"
                 .parse()
                 .expect("Failed to parse quinn_proto directive"),
-        )
-        // x11rb_async: Gets very noisy when copying/pasting things during LOG_LEVEL=trace
-        .add_directive(
-            "x11rb_async=info"
-                .parse()
-                .expect("Failed to parse x11rb_async directive"),
         );
 
     use tracing_subscriber::layer::SubscriberExt;

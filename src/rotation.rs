@@ -71,6 +71,13 @@ const SWITCH_DEBOUNCE: Duration = Duration::from_millis(500);
 /// — the heartbeat fires every 10s, so healthy links must stay silent.
 const HEARTBEAT_LINK_RTT_WARN: Duration = Duration::from_millis(50);
 
+/// Minimum spacing between diagnostics mirror refreshes (see
+/// update_diagnostics). The refresh builds the full control-socket snapshot
+/// and is invoked after EVERY rotation loop iteration — thousands of times a
+/// second at high input rates. 10Hz is plenty for a diagnostics mirror: the
+/// SIGHUP dump and the control status simply run up to 100ms stale.
+const DIAGNOSTICS_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
+
 /// Channels for communicating with a connected client.
 #[derive(Debug)]
 struct ClientInfo {
@@ -391,8 +398,9 @@ struct InputCounts {
 /// itself is stalled — that scenario is exactly what it exists to debug — so
 /// nothing here touches the loop's channels: an atomic liveness timestamp
 /// plus a pre-formatted state string behind a std Mutex that is only held for
-/// a swap/clone. The rotation loop refreshes it after every iteration (see
-/// Rotation::update_diagnostics).
+/// a swap/clone. The rotation loop refreshes it after its iterations,
+/// rate-limited to ~10Hz (see Rotation::update_diagnostics), so the contents
+/// may lag the loop by up to 100ms.
 ///
 /// The same mirror also carries the STRUCTURED snapshot served by the control
 /// socket (control.rs): updated in the same refresh, so a status request
@@ -400,9 +408,10 @@ struct InputCounts {
 pub struct DiagnosticsMirror {
     /// Base for the liveness timestamp.
     started: Instant,
-    /// Milliseconds since `started` when the rotation loop last completed an
-    /// iteration. The loop wakes at least every 10s (input-status heartbeat),
-    /// so a value much older than that in a dump means the loop is stuck.
+    /// Milliseconds since `started` when the mirror was last refreshed. The
+    /// refresh is rate-limited (~10Hz under load), but the loop wakes at
+    /// least every 10s (input-status heartbeat), so a value much older than
+    /// that in a dump means the loop is stuck.
     last_iteration_ms: AtomicU64,
     /// The dumpable state, formatted by the loop after each iteration.
     state: Mutex<String>,
@@ -587,6 +596,13 @@ pub struct Rotation<O: device::output::OutputHandler> {
     /// client can infer the return-trip edge without its own --edge-map.
     /// None when --edge-map isn't in use.
     edge_map: Option<edge::EdgeMap>,
+    /// Cached per-client edge directions for the control-socket status (see
+    /// EdgeDirectionsCache): re-resolved only on client add/remove and from
+    /// set_edge_map, so building server_state never hits DNS.
+    edge_dirs: EdgeDirectionsCache,
+    /// When the diagnostics mirror was last refreshed (see
+    /// DIAGNOSTICS_REFRESH_INTERVAL); None until the first refresh.
+    last_diagnostics_refresh: Option<Instant>,
 }
 
 /// Computes the target of a previous-client switch (None = local machine).
@@ -690,6 +706,59 @@ fn edge_info_directions(
         .collect()
 }
 
+/// Cached --edge-map resolutions for the control-socket status
+/// (Rotation::server_state). Resolution can hit DNS — edge::resolve_hostname
+/// does a blocking getaddrinfo per hostname target — so it must never run
+/// per rotation-loop iteration (thousands of lookups a second at 8kHz
+/// input, on a shared tokio worker). Refreshed ONLY when the resolution can
+/// change: a client add/remove (including an in-place reconnect replace,
+/// which may carry a new fingerprint) or set_edge_map. Reads are free.
+#[derive(Default)]
+struct EdgeDirectionsCache {
+    /// endpoint -> the edge directions that client sits beyond (empty vec =
+    /// connected but unmapped). One entry per connected client, rebuilt
+    /// wholesale on refresh.
+    directions: HashMap<SocketAddr, Vec<event::Direction>>,
+}
+
+impl EdgeDirectionsCache {
+    /// Re-resolves every client's directions against the current client list
+    /// — one target resolution per (direction, client) pair, tolerable on
+    /// topology changes. With no edge map the cache just empties.
+    fn refresh(
+        &mut self,
+        map: Option<&edge::EdgeMap>,
+        clients: &[(SocketAddr, String)],
+        resolve_host: &dyn Fn(&str) -> Vec<IpAddr>,
+    ) {
+        self.directions.clear();
+        let Some(map) = map else {
+            return;
+        };
+        for (endpoint, fingerprint) in clients {
+            self.directions.insert(
+                *endpoint,
+                edge_info_directions(map, clients, fingerprint, resolve_host),
+            );
+        }
+    }
+
+    /// The cached directions for the control status as a "top+left"-style
+    /// string; None when the client is unmapped (or unknown to the cache).
+    fn edge_string(&self, endpoint: &SocketAddr) -> Option<String> {
+        let dirs = self.directions.get(endpoint)?;
+        if dirs.is_empty() {
+            return None;
+        }
+        Some(
+            dirs.iter()
+                .map(|d| d.as_str())
+                .collect::<Vec<&str>>()
+                .join("+"),
+        )
+    }
+}
+
 impl<O: device::output::OutputHandler> Rotation<O> {
     pub async fn new(
         grab_tx: watch::Sender<device::GrabState>,
@@ -746,6 +815,8 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             diagnostics,
             edge_client_tx: None,
             edge_map: None,
+            edge_dirs: EdgeDirectionsCache::default(),
+            last_diagnostics_refresh: None,
         })
     }
 
@@ -767,6 +838,17 @@ impl<O: device::output::OutputHandler> Rotation<O> {
     /// Called once from the server events loop when --edge-map is in use.
     pub fn set_edge_map(&mut self, map: edge::EdgeMap) {
         self.edge_map = Some(map);
+        // Seed the server_state cache (startup: the client list is empty).
+        self.refresh_edge_dirs();
+    }
+
+    /// Re-resolves the cached per-client edge directions (see
+    /// EdgeDirectionsCache). Called on client add/remove and from
+    /// set_edge_map — the only moments the resolution can change.
+    fn refresh_edge_dirs(&mut self) {
+        let entries = self.edge_client_entries();
+        self.edge_dirs
+            .refresh(self.edge_map.as_ref(), &entries, &edge::resolve_hostname);
     }
 
     /// Sends EdgeInfo for every edge-map direction resolving to this client,
@@ -972,6 +1054,9 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         // gets the full miss window before the silence detector can fire.
         self.liveness.insert(endpoint, LivenessState::new());
         self.publish_edge_clients();
+        // Client list changed: re-resolve the cached edge directions for the
+        // control status (an in-place replace may carry a new fingerprint).
+        self.refresh_edge_dirs();
 
         info!(
             "Added client {} @ {} to rotation: {}",
@@ -2355,20 +2440,11 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                 .clients
                 .iter()
                 .map(|c| {
-                    let edge = self.edge_map.as_ref().and_then(|map| {
-                        let dirs = edge_info_directions(
-                            map,
-                            &self.edge_client_entries(),
-                            &c.fingerprint,
-                            &edge::resolve_hostname,
-                        );
-                        (!dirs.is_empty()).then(|| {
-                            dirs.iter()
-                                .map(|d| d.as_str())
-                                .collect::<Vec<&str>>()
-                                .join("+")
-                        })
-                    });
+                    // Resolved edge directions come from the cache, refreshed
+                    // on topology changes only: resolving here would cost a
+                    // blocking DNS lookup per hostname target per refresh
+                    // (see EdgeDirectionsCache).
+                    let edge = self.edge_dirs.edge_string(&c.endpoint);
                     crate::control::ServerClientState {
                         addr: c.endpoint.to_string(),
                         fingerprint: c.fingerprint.clone(),
@@ -2395,12 +2471,26 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         }
     }
 
-    /// Refreshes the shared diagnostics mirror with the current state. Called
-    /// once per rotation loop iteration, so the SIGHUP dump (which reads the
-    /// mirror directly from the signal thread) keeps working when this loop
-    /// is stalled: the dump then shows the state as of the last completed
-    /// iteration plus how long the loop has been stuck.
-    pub fn update_diagnostics(&self) {
+    /// Refreshes the shared diagnostics mirror with the current state, at
+    /// most once per DIAGNOSTICS_REFRESH_INTERVAL. Called after EVERY
+    /// rotation loop iteration — thousands of times a second at 8kHz input —
+    /// and the refresh builds the full control-socket snapshot, so the cap
+    /// keeps that cost bounded. The mirror is a best-effort diagnostics
+    /// view: the SIGHUP dump (which reads the mirror directly from the
+    /// signal thread) and the control status may lag the loop by up to
+    /// 100ms, and a stalled loop still shows up via the liveness timestamp
+    /// of the last completed refresh. The first call always refreshes, so
+    /// the seeding call at server start (before the first event) still
+    /// lands.
+    pub fn update_diagnostics(&mut self) {
+        let now = Instant::now();
+        if self
+            .last_diagnostics_refresh
+            .is_some_and(|last| now.duration_since(last) < DIAGNOSTICS_REFRESH_INTERVAL)
+        {
+            return;
+        }
+        self.last_diagnostics_refresh = Some(now);
         let grab = format!("{:?}", *self.grab_tx.borrow());
         let mut state = format!(
             "current_client={:?} grab={} paused={} clients={:?} removed_current_client={:?} pending_resume_fingerprint={:?} clipboard_target={:?} pending_clipboard_requests={} motion_seq={} datagrams_ok={} counts={{physical={} forwarded={} emitted_local={}}}",
@@ -2622,6 +2712,25 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         }
         if let Some(endpoint) = self.current_client {
             // Remote client is active, send all input to client and not to local machine.
+            if !batch.is_grabbed {
+                // ...but only GRABBED input: an ungrabbed device already
+                // delivered this batch to the local compositor, so forwarding
+                // it too would double every event (seen as double pointer
+                // input while a mouse grab keeps failing — e.g. a foreign
+                // process holding the grab — or during the re-grab window on
+                // resume). Keyboards can't reach this arm ungrabbed: their
+                // grab failure blocks the reader task until the grab lands
+                // (grab_keyboard_when_quiescent), and the paused case
+                // returned above. This input belongs to the local system
+                // exclusively; drop it.
+                keytrace_route(&batch.events, "ungrabbed drop (client active)");
+                trace!(
+                    "Dropping {} ungrabbed input events while client {} is active (grab pending or failing; the local system already has them)",
+                    event_count,
+                    endpoint
+                );
+                return Ok(());
+            }
             let events = batch.events;
             keytrace_route(&events, "forward to client");
             if is_pure_pointer_motion(&events) {
@@ -2814,6 +2923,9 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             }
         }
         self.publish_edge_clients();
+        // Client list changed: re-resolve the cached edge directions for the
+        // control status (a peer's removal can make 'auto' resolve again).
+        self.refresh_edge_dirs();
         // Topology changed: re-advertise so remaining clients that have
         // become resolvable (e.g. 'auto' with one peer left) learn their
         // return edge too. Re-sends are idempotent on the client.
@@ -3276,7 +3388,9 @@ mod tests {
         .unwrap();
 
         // With a client "active" (no network attached), pure motion batches are
-        // accumulated instead of forwarded.
+        // accumulated instead of forwarded. (Grabbed: ungrabbed batches are
+        // dropped while a client is active — see
+        // client_active_drops_ungrabbed_batches.)
         rotation.current_client = Some("127.0.0.1:1234".parse().unwrap());
         let rel = evdev::EventType::RELATIVE.0;
         let rel_x = evdev::RelativeAxisCode::REL_X.0;
@@ -3285,7 +3399,7 @@ mod tests {
             rotation
                 .send_input_events(device::InputBatch {
                     events: vec![i32_event(rel, rel_x, dx), i32_event(rel, rel_y, dy)],
-                    is_grabbed: false,
+                    is_grabbed: true,
                 })
                 .await
                 .unwrap();
@@ -3301,6 +3415,62 @@ mod tests {
         rotation.flush_pending_motion().await;
         assert!(!rotation.motion_dirty());
         assert_eq!(rotation.pending_motion, (0, 0, 0));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn client_active_drops_ungrabbed_batches() {
+        let dir = temp_dir("ungrabbed-drop");
+        let (grab_tx, _grab_rx) = watch::channel(device::GrabState {
+            client_active: false,
+            paused: false,
+        });
+        let (rotation_tx, _rotation_rx) = mpsc::channel(8);
+        let mut rotation = Rotation::new(
+            grab_tx,
+            StubOutput { written: 0, released: 0 },
+            None,
+            &dir,
+            rotation_tx,
+            None,
+            None,
+            NetworkMode::Local,
+            Arc::new(DiagnosticsMirror::new("127.0.0.1:0".parse().unwrap())),
+        )
+        .await
+        .unwrap();
+
+        let endpoint: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        rotation.current_client = Some(endpoint);
+        // An ungrabbed batch while a client is active (mouse grab failing,
+        // e.g. a foreign process holding it, or the resume re-grab window)
+        // already went to the local compositor: it must NOT also be
+        // forwarded, or every event lands twice.
+        rotation
+            .send_input_events(device::InputBatch {
+                events: vec![i32_event(evdev::EventType::RELATIVE.0, 0, 5)],
+                is_grabbed: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(rotation.status_counts.physical, 1);
+        assert_eq!(rotation.status_counts.physical_grabbed, 0);
+        assert_eq!(rotation.status_counts.forwarded, 0);
+        assert_eq!(rotation.output_handler.written, 0);
+        // No forward attempt happened: a send to the fabricated endpoint
+        // would fail and recover by switching back to local.
+        assert_eq!(rotation.current_client, Some(endpoint));
+
+        // A grabbed batch takes the forward path as before (with the
+        // fabricated endpoint the send fails and falls back to local).
+        rotation
+            .send_input_events(device::InputBatch {
+                events: vec![i32_event(evdev::EventType::RELATIVE.0, 0, 5)],
+                is_grabbed: true,
+            })
+            .await
+            .unwrap();
+        assert_eq!(rotation.current_client, None);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -3554,6 +3724,66 @@ mod tests {
         );
         // The other client matches nothing ('auto' is ambiguous with two).
         assert!(edge_info_directions(&map, &clients, "aaaa1111", &resolver).is_empty());
+    }
+
+    #[test]
+    fn edge_dirs_cache_reads_never_resolve() {
+        // Reads serve the cached resolution verbatim: the resolver is not
+        // consulted again (the point of the cache — a read per control
+        // snapshot must not hit DNS).
+        let clients = edge_client_entries(&[
+            ("10.0.0.1:9000", "aaaa1111"),
+            ("10.0.0.2:9000", "bbbb2222"),
+        ]);
+        let map = edge_map_of(&["top=laptop,bottom=bbbb"]);
+        let resolves = std::cell::Cell::new(0u32);
+        let resolver = |name: &str| -> Vec<IpAddr> {
+            resolves.set(resolves.get() + 1);
+            match name {
+                "laptop" => vec!["10.0.0.2".parse().unwrap()],
+                _ => vec![],
+            }
+        };
+        let mut cache = EdgeDirectionsCache::default();
+        cache.refresh(Some(&map), &clients, &resolver);
+        let after_refresh = resolves.get();
+        assert!(after_refresh > 0);
+        assert_eq!(cache.edge_string(&clients[0].0), None);
+        assert_eq!(
+            cache.edge_string(&clients[1].0),
+            Some("top+bottom".to_string())
+        );
+        // An endpoint unknown to the cache gets nothing either.
+        assert_eq!(
+            cache.edge_string(&"10.0.0.9:9000".parse().unwrap()),
+            None
+        );
+        assert_eq!(resolves.get(), after_refresh);
+    }
+
+    #[test]
+    fn edge_dirs_cache_tracks_list_and_map_changes() {
+        let clients = edge_client_entries(&[("10.0.0.1:9000", "aaaa1111")]);
+        let mut cache = EdgeDirectionsCache::default();
+        // No edge map: the cache just empties.
+        cache.refresh(None, &clients, &no_ips);
+        assert_eq!(cache.edge_string(&clients[0].0), None);
+        // Map set: 'auto' resolves to the single client.
+        let map = edge_map_of(&["right=auto"]);
+        cache.refresh(Some(&map), &clients, &no_ips);
+        assert_eq!(cache.edge_string(&clients[0].0), Some("right".to_string()));
+        // A second client connects: 'auto' is ambiguous for everyone.
+        let clients = edge_client_entries(&[
+            ("10.0.0.1:9000", "aaaa1111"),
+            ("10.0.0.2:9000", "bbbb2222"),
+        ]);
+        cache.refresh(Some(&map), &clients, &no_ips);
+        assert_eq!(cache.edge_string(&clients[0].0), None);
+        assert_eq!(cache.edge_string(&clients[1].0), None);
+        // The second client leaves again: 'auto' resolves once more.
+        let clients = edge_client_entries(&[("10.0.0.1:9000", "aaaa1111")]);
+        cache.refresh(Some(&map), &clients, &no_ips);
+        assert_eq!(cache.edge_string(&clients[0].0), Some("right".to_string()));
     }
 
     #[tokio::test]
@@ -3970,6 +4200,10 @@ mod tests {
             .await
             .unwrap();
         rotation.toggle_pause().await;
+        // Step outside the rate-limit window: this second refresh comes
+        // microseconds after the first and would be skipped by design (see
+        // diagnostics_refresh_is_rate_limited).
+        rotation.last_diagnostics_refresh = None;
         rotation.update_diagnostics();
         let state = diagnostics.server_state().unwrap();
         assert!(state.paused);
@@ -3996,6 +4230,47 @@ mod tests {
         assert!(v.get("clients").is_some());
         assert_eq!(v["clipboard"]["owner"], "local");
         assert!(v.get("update_available").is_some());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn diagnostics_refresh_is_rate_limited() {
+        let dir = temp_dir("diag-ratelimit");
+        let (grab_tx, _grab_rx) = watch::channel(device::GrabState {
+            client_active: false,
+            paused: false,
+        });
+        let (rotation_tx, _rotation_rx) = mpsc::channel(8);
+        let diagnostics = Arc::new(DiagnosticsMirror::new("127.0.0.1:9999".parse().unwrap()));
+        let mut rotation = Rotation::new(
+            grab_tx,
+            StubOutput { written: 0, released: 0 },
+            None,
+            &dir,
+            rotation_tx,
+            None,
+            None,
+            NetworkMode::Local,
+            diagnostics.clone(),
+        )
+        .await
+        .unwrap();
+
+        // The first call always refreshes (the server start seeds the mirror
+        // this way, so a SIGHUP before the first event still dumps).
+        rotation.update_diagnostics();
+        assert!(!diagnostics.server_state().unwrap().paused);
+
+        // A refresh inside the window is skipped, even though state changed.
+        rotation.toggle_pause().await;
+        rotation.update_diagnostics();
+        assert!(!diagnostics.server_state().unwrap().paused);
+
+        // Outside the window the refresh lands again.
+        rotation.last_diagnostics_refresh =
+            Some(Instant::now() - DIAGNOSTICS_REFRESH_INTERVAL - Duration::from_millis(1));
+        rotation.update_diagnostics();
+        assert!(diagnostics.server_state().unwrap().paused);
         let _ = fs::remove_dir_all(&dir);
     }
 

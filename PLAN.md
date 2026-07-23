@@ -392,3 +392,147 @@ Ranked by real power cost:
    sends; the wire is already coalesced to 250Hz but capture is not.
    Coalesce redundant REL motion in the evdev read path before it reaches
    rotation.
+
+## Full review findings (2026-07-23, four-pass review of the whole tree)
+
+### P0 — fix first (user-visible or high impact)
+1. **notify.rs panics in the indicator process** — tokio::process::Command::spawn
+   needs a reactor; `monux system indicator` runs without one, so every tray
+   notification (copy-diagnostics success, action failure) panics the ksni
+   thread: tray dies, supervisor respawns 3x, gives up. Fix: std::process
+   spawn (fire-and-forget needs no runtime). [S]
+2. **Hostname --edge-map targets stall the rotation loop on DNS** —
+   update_diagnostics runs every loop iteration; server_state() re-resolves
+   hostnames via blocking getaddrinfo per iteration (thousands/sec at 8kHz
+   input). Fix: cache resolved edges (invalidate on client-list change) and
+   rate-limit update_diagnostics to ~10Hz. [S]
+3. **Wayland writer pre-fetches the full payload on every advertisement** —
+   copying a huge file zips+transfers+unpacks it on the peer even if never
+   pasted. Fix: skip pre-fetch for path-list types (or size-aware opt-in). [M]
+4. **Double input when a mouse grab fails with an active client** — events
+   forwarded to the client AND delivered locally (grab-failure window or a
+   foreign grabber). Fix: drop !is_grabbed batches while a client is active.
+   [trivial]
+5. **Wayland writer: unbounded thread+runtime pileup on paste storms** — one
+   thread + fresh tokio runtime per Send event, no cap; a `wl-paste --watch`
+   loop spawns hundreds. Fix: semaphore/serve-latest per type; share one
+   runtime. [S-M]
+6. **Server shutdown never closes QUIC gracefully** — close_loops drops the
+   endpoint; clients wait out the 25s idle timeout on every restart/takeover.
+   Fix: Endpoint::close + bounded wait_idle in the shutdown path. [M]
+
+### P1 — correctness worth fixing
+- PeerVersions keyed by addr:port: ephemeral-port churn breaks the refusal
+  rate limit, the upgrade note, and grows unbounded. Key by IP. [S]
+- Silence -> drop -> reconnect loses auto-reactivation (no defunct window
+  when removed while not current). Seed removed_current_client on
+  silence-armed removal. [S-M]
+- Rotated outputs: Hyprland `transform` never read; portrait monitors get
+  wrong rects/zones. Swap w/h for odd transforms. [S]
+- Fractional scales: abutment equality off by 1px can manufacture mid-desktop
+  trigger zones. Tolerate +/-1px (or match Hyprland's own rounding). [S-M]
+- Edge manager runs blocking syscalls (layout query, hostname DNS) on the
+  async executor (2 workers; one already blockable by cert prompts). Move to
+  spawn_blocking. [S]
+- Duplicate device Created events leak the old reader task (double-forward +
+  grab fight). Abort an existing handle for the path at insert. [trivial]
+- live_holder trusts a stale pid file with substring cmdline matching (pid
+  reuse; `monux client <host>` matches "client"). Verify with a flock probe.
+  [S]
+- Takeover vs pending auto-update restart: old instance re-execs and kills
+  the just-started manual instance (ping-pong). Loud log / skip re-exec when
+  the lock is contended. [S]
+- Update staging cleanup deletes ALL staging dirs incl. a concurrent
+  updater's. Skip dirs whose pid suffix is alive. [S]
+- Wayland writer dispatcher deadlock on wedged compositor + unbounded ad
+  queue. Roundtrip deadline + keep-latest queue semantics. [M]
+- Wayland type_watcher dies permanently on compositor error (no reconnect;
+  X11 watcher has backoff). Add reconnect. [M-L]
+- X11 backend: requestors hang probing unadvertised targets (bail before
+  SelectionNotify); watcher drops revocations (empty types); non-INCR
+  transfers registered for chunking; PROPERTY_CHANGE mask never removed. [S]
+- Supervisor spawn races (show vs respawn vs concurrent shows) leak an
+  unreaped child -> permanent zombie indicator. Re-check the slot under the
+  lock. [S]
+- pipe_into can block the tray thread forever on a >64K bundle written to a
+  wedged wl-copy. Bound the stdin write. [S]
+- Armed dwell can fire after the cursor already left (leave needs 2 stable
+  polls; poller stall leaves deadlines firing blind). Require fresh contact
+  at fire time. [M]
+- EdgeInfo has no revoke; each re-advertise resets the client's in-progress
+  dwell (detector respawn). Send revoke on un-resolution; dedup unchanged
+  maps. [M]
+- Silence recovery not tied to the silenced client: A silences, user picks B,
+  A recovers first -> input jumps to A. Store the silenced endpoint. [S]
+- No-op/debounced-chord Switch(false)+Switch(true) pair flaps clipboard
+  ownership (client re-announces on fake deactivation). Dedicated
+  release-keys signal or suppress announce on immediate re-activate. [S-M]
+- Unbounded partial-frame buffers from an authenticated peer (no COBS
+  terminator -> memory growth). Cap retained bytes, reset connection. [S]
+- mDNS own-advertisement skip matches hostname only (cloned images). Also
+  compare advertised IPs against local addresses. [S]
+
+### P2 — hygiene and nits
+- Chord with a duplicated key ("shift,shift,p") never fires, silently: dedup
+  or bail at parse. [trivial]
+- Heartbeat logs every 10s whenever the (ungrabbed) mouse moves while local:
+  treat ungrabbed-only activity as idle. [trivial]
+- Chords don't work across keyboards: document (wontfix). [trivial]
+- Motion-before-click ordering comment overpromises (datagram races stream);
+  document, or fall back to stream when a non-motion batch is pending. [S/M]
+- datagrams_ok fallback is effectively dead (peers must match exactly):
+  document as defense-only. ensure_compatible_version after PeerVersions is
+  unreachable. MAX_REQUEST_LINE off-by-one (exactly-8192+newline rejected).
+  reader work_active stuck on caller-cancel+worker-panic. convert.rs temp-dir
+  generations: 3rd unpack can delete one in use; pid-namespaced dirs never
+  cleaned. Empty-entry URL parse fails whole serve (trailing newline). x11
+  discovery drops shutdown-response receiver. Backoff sleep delays client
+  shutdown up to 5s (select with shutdown). prompt_active can wedge true on
+  lock poisoning (scope guard). install_root doesn't trim " (deleted)".
+  recv_version reads exactly one chunk (loop on has_complete_cobs_frame).
+- Log typos: "Comfirm" (approval.rs), "adverstised" (bulk.rs), stray ", :"
+  (input.rs). Comment drift: layer-shell mention (main.rs:995), "nikau"
+  (watch.rs:137), "X11" in rotation/client local-clipboard comments,
+  control.rs "future tray indicator" + query_first doc.
+- pub->pub(crate): edge.rs exposed_segments/EdgeSegment/OutputRect/DwellTimer
+  /CORNER_TRIM_PERCENT/EDGE_TRIGGER_PX/hyprland_layout; rotation
+  active_client_state_path/clear_active_client. Collapse single-variant
+  ClipboardType enum (wayland writer).
+
+### Optimizations (ordered by value)
+1. rustls ring-only features: drops aws-lc-rs + aws-lc-sys (heavy C build)
+   and prefer-post-quantum; we only use the ring provider. One line. [big]
+2. quinn feature trim: drop default platform-verifier (unused) ->
+   rustls-platform-verifier + webpki-root-certs out. One line. [S]
+3. Declare tokio `time` + `sync` features (used everywhere, only transitive
+   today — latent breakage). [trivial]
+4. Rate-limit update_diagnostics (~10Hz) + cache ServerState rebuild
+   (with P0.2). [S]
+5. Wayland writer: share one runtime, per-type serve cache map instead of
+   single-slot (A,B,A,B manager churn), Arc<[u8]> payload instead of clone. [S-M]
+6. client.rs step(): merge the two nearly identical select blocks (Option
+   pattern like switch_request_rx). [M — biggest duplication]
+7. Share the bulk-writer task between server and client (one helper, different
+   failure handling). [S]
+8. Collapse Hyprland IPC boilerplate into one hyprland_query() helper;
+   hoist hyprland_socket_path out of the 40ms poll. [trivial]
+9. Reuse a scratch buffer for postcard serialization on send paths (8kHz
+   motion datagrams + input batches); pre-size/reuse uinput write Vecs. [S-M]
+10. Routine `cargo update` for semver-compatible bumps. [routine]
+
+### Decisions to make
+- X11 clipboard backend (~950 lines + x11rb-async dep, has the bugs above):
+  keep as fallback or drop entirely (user is Wayland-only)?
+- Expose silenced-client state in the tray (new color/tooltip) — currently a
+  silenced current client looks healthy.
+
+### Checked out clean (no action)
+Chord state machine; grab-state single-source broadcast; capture->rotation->
+client ordering; MotionDatagram apply/heal; discrete-axis classification;
+RepeatCoalescer; exposed-segments zone math (negative coords/offsets/steps);
+serve-cache epoch + negative cache + trailing-edge interplay; control socket
+protocol/pipelining/oversized/PostAction/queue-full/stale-reclaim; bulk
+channel cap-4 policy both peers; liveness state machine + stall guard;
+approval TOFU flow; reconnect backoff; update gate semantics; atomic install;
+close_loops ordering + EADDRINUSE retry; single-instance verification;
+no fully-dead functions or unused dependencies found.

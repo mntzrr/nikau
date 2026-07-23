@@ -8,7 +8,6 @@ pub mod data;
 pub mod serve;
 pub mod server;
 pub mod wayland;
-pub mod x11;
 
 mod limited;
 

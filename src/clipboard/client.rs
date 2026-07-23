@@ -5,7 +5,7 @@ use anyhow::{Result};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
-use crate::clipboard::{data, filter_shareable_mime_types, serve, wayland, x11};
+use crate::clipboard::{data, filter_shareable_mime_types, serve, wayland};
 
 /// Wrapper around client-local clipboard storage, if available.
 pub struct LocalClipboard {
@@ -27,29 +27,20 @@ pub struct LocalClipboard {
 
 impl LocalClipboard {
     pub async fn new(config_dir: PathBuf, max_uncompressed_size_bytes: u64) -> Option<Self> {
-        match Self::new_wayland(config_dir.clone(), max_uncompressed_size_bytes).await {
+        match Self::new_wayland(config_dir, max_uncompressed_size_bytes).await {
             Ok(Some(c)) => {
                 info!("Using wayland clipboard");
                 return Some(c);
             }
             Ok(None) => {
-                info!("Unable to reach wayland clipboard, trying X11");
+                info!("Unable to reach wayland clipboard");
             }
             Err(e) => {
-                warn!("Failed to reach wayland clipboard, trying X11: {}", e);
+                warn!("Failed to reach wayland clipboard: {}", e);
             }
         };
-        match Self::new_x11(config_dir, max_uncompressed_size_bytes).await {
-            Ok(c) => {
-                info!("Using X11 clipboard");
-                Some(c)
-            }
-            Err(e) => {
-                warn!("Unable to reach X11 clipboard: {}", e);
-                warn!("CLIPBOARD SHARING DISABLED: no wayland or X11 clipboard is reachable. If monux is running under sudo, start it with 'sudo -E ...' to preserve the session environment (WAYLAND_DISPLAY, XDG_RUNTIME_DIR)");
-                None
-            }
-        }
+        warn!("CLIPBOARD SHARING DISABLED: no wayland clipboard is reachable. If monux is running under sudo, start it with 'sudo -E ...' to preserve the session environment (WAYLAND_DISPLAY, XDG_RUNTIME_DIR)");
+        None
     }
 
     async fn new_wayland(config_dir: PathBuf, max_uncompressed_size_bytes: u64) -> Result<Option<Self>> {
@@ -75,23 +66,6 @@ impl LocalClipboard {
             local_types: None,
             serving_remote_clipboard: false,
         }))
-    }
-
-    async fn new_x11(config_dir: PathBuf, max_uncompressed_size_bytes: u64) -> Result<Self> {
-        let reader = x11::reader::ClipboardReader::new().await?;
-        let (local_types_tx, local_types_rx) = watch::channel(vec![]);
-        x11::type_watcher::ClipboardTypeWatcher::start(local_types_tx).await?;
-        let (clipboard_fetch_tx, clipboard_fetch_rx) = mpsc::channel(32);
-        let writer =
-            x11::writer::ClipboardWriter::start(config_dir, max_uncompressed_size_bytes, clipboard_fetch_tx).await?;
-        Ok(Self {
-            reader: serve::SharedClipboardReader::new(Box::new(reader)),
-            types_tx: crate::clipboard::spawn_writer_dispatcher(Box::new(writer)),
-            clipboard_fetch_rx,
-            local_types_rx,
-            local_types: None,
-            serving_remote_clipboard: false,
-        })
     }
 
     /// Handle for sharing the clipboard reader with spawned serving tasks,

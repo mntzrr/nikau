@@ -6,7 +6,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task;
 use tracing::{debug, error, info, warn};
 
-use crate::clipboard::{ClipboardReader, ClipboardWriter, data, filter_shareable_mime_types, serve, wayland, x11};
+use crate::clipboard::{ClipboardReader, ClipboardWriter, data, filter_shareable_mime_types, serve, wayland};
 use crate::rotation;
 
 /// Wrapper around server-local clipboard storage, if available.
@@ -30,29 +30,20 @@ impl LocalClipboard {
         max_clipboard_size_bytes: u64,
         max_uncompressed_size_bytes: u64,
     ) -> Option<Self> {
-        match Self::new_wayland(config_dir.clone(), rotation_tx.clone(), max_clipboard_size_bytes, max_uncompressed_size_bytes).await {
+        match Self::new_wayland(config_dir, rotation_tx, max_clipboard_size_bytes, max_uncompressed_size_bytes).await {
             Ok(Some(c)) => {
                 info!("Using wayland clipboard");
                 return Some(c);
             }
             Ok(None) => {
-                info!("Unable to reach wayland clipboard, trying X11");
+                info!("Unable to reach wayland clipboard");
             }
             Err(e) => {
-                warn!("Failed to reach wayland clipboard, trying X11: {}", e);
+                warn!("Failed to reach wayland clipboard: {}", e);
             }
         };
-        match Self::new_x11(config_dir, rotation_tx, max_clipboard_size_bytes, max_uncompressed_size_bytes).await {
-            Ok(c) => {
-                info!("Using X11 clipboard");
-                Some(c)
-            }
-            Err(e) => {
-                warn!("Unable to reach X11 clipboard: {}", e);
-                warn!("CLIPBOARD SHARING DISABLED: no wayland or X11 clipboard is reachable. If monux is running under sudo, start it with 'sudo -E ...' to preserve the session environment (WAYLAND_DISPLAY, XDG_RUNTIME_DIR)");
-                None
-            }
-        }
+        warn!("CLIPBOARD SHARING DISABLED: no wayland clipboard is reachable. If monux is running under sudo, start it with 'sudo -E ...' to preserve the session environment (WAYLAND_DISPLAY, XDG_RUNTIME_DIR)");
+        None
     }
 
     async fn new_wayland(
@@ -83,31 +74,6 @@ impl LocalClipboard {
             clipboard_fetch_rx,
             local_regular_types_rx,
         ).await?))
-    }
-
-    async fn new_x11(
-        config_dir: PathBuf,
-        rotation_tx: mpsc::Sender<rotation::RotationEvent>,
-        max_clipboard_size_bytes: u64,
-        max_uncompressed_size_bytes: u64,
-    ) -> Result<Self> {
-        let (local_types_tx, local_types_rx) = watch::channel(vec![]);
-        x11::type_watcher::ClipboardTypeWatcher::start(local_types_tx).await?;
-        let reader = x11::reader::ClipboardReader::new().await?;
-        let (clipboard_fetch_tx, clipboard_fetch_rx) = mpsc::channel::<data::ClipboardFetch>(32);
-        let writer = x11::writer::ClipboardWriter::start(
-            config_dir,
-            max_uncompressed_size_bytes,
-            clipboard_fetch_tx,
-        ).await?;
-        Self::start_impl(
-            Box::new(reader),
-            Box::new(writer),
-            rotation_tx,
-            max_clipboard_size_bytes,
-            clipboard_fetch_rx,
-            local_types_rx,
-        ).await
     }
 
     async fn start_impl(
@@ -202,7 +168,7 @@ impl LocalClipboard {
     }
 
     /// Advertises to the local environment that we have a new clipboard entry
-    /// available. Non-blocking: the actual wayland/X11 work happens on the
+    /// available. Non-blocking: the actual wayland work happens on the
     /// writer dispatcher thread, so the rotation loop never stalls on it.
     pub fn store_types<K: Into<Vec<String>>>(&self, types: K) -> Result<()> {
         // Defense in depth: a client on an older build may still advertise

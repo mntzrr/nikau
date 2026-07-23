@@ -216,7 +216,8 @@ pub async fn run_server_events_loop<O: output::OutputHandler>(
         }
         // Refresh the mirrored state after every iteration: the SIGHUP handler
         // reads it directly from the signal thread, so the dump must not
-        // depend on this loop being alive.
+        // depend on this loop being alive. The call itself rate-limits the
+        // actual refresh to ~10Hz (see Rotation::update_diagnostics).
         rotation.update_diagnostics();
     }
 }
@@ -260,6 +261,12 @@ fn is_addr_in_use(e: &anyhow::Error) -> bool {
     })
 }
 
+/// Shared slot through which the connections loop publishes its QUIC
+/// endpoint once bound, so the shutdown path (main.rs close_loops) can close
+/// it gracefully: quinn sends no close frames when the endpoint is merely
+/// dropped, which would leave every client waiting out its idle timeout.
+pub type SharedEndpoint = Arc<Mutex<Option<quinn::Endpoint>>>;
+
 pub async fn run_server_connections_loop(
     listen_addr: &SocketAddr,
     cert_verifier: Arc<approval::MonuxCertVerification<'static>>,
@@ -267,8 +274,13 @@ pub async fn run_server_connections_loop(
     max_clipboard_size_bytes: u64,
     rotation_tx: mpsc::Sender<rotation::RotationEvent>,
     mode: transport::NetworkMode,
+    endpoint_slot: SharedEndpoint,
 ) -> Result<()> {
     let server_endpoint = bind_server_with_retry(listen_addr, cert_verifier, mode).await?;
+    // Publish the endpoint for the shutdown path (see SharedEndpoint).
+    *endpoint_slot
+        .lock()
+        .expect("server endpoint slot lock poisoned") = Some(server_endpoint.clone());
     // Protocol-version tracker: turns refusal spam into the self-healing
     // story (outdated client auto-updating) and notes when it catches up.
     let peer_versions = Arc::new(Mutex::new(PeerVersions::default()));

@@ -1049,6 +1049,11 @@ async fn server(
         )
         .await
     });
+    // Shared handle to the connections loop's QUIC endpoint, published once
+    // the bind succeeds, so the shutdown path can close it gracefully (see
+    // close_loops).
+    let server_endpoint = server::SharedEndpoint::default();
+    let server_endpoint2 = server_endpoint.clone();
     let mut server_connections_handle = task::spawn(async move {
         server::run_server_connections_loop(
             &listen_addr,
@@ -1057,6 +1062,7 @@ async fn server(
             max_clipboard_size_bytes,
             rotation_tx2,
             mode,
+            server_endpoint2,
         )
         .await
     });
@@ -1099,7 +1105,7 @@ async fn server(
                 info!("Exiting automatically as requested (--exit-secs={})", exit_secs);
             },
             _signal = shutdown_signal() => {
-                close_loops(watch_handle, server_events_handle, server_connections_handle).await;
+                close_loops(watch_handle, server_events_handle, server_connections_handle, server_endpoint).await;
                 // Dropping _mdns_registration here sends the mDNS goodbye.
                 // The active-client state file is deliberately left in place:
                 // a restart (e.g. after 'monux update') resumes the session
@@ -1121,7 +1127,7 @@ async fn server(
                 server_connections_exit?.context("Server connections loop failed, exiting early")?
             },
             _signal = shutdown_signal() => {
-                close_loops(watch_handle, server_events_handle, server_connections_handle).await;
+                close_loops(watch_handle, server_events_handle, server_connections_handle, server_endpoint).await;
                 // Dropping _mdns_registration here sends the mDNS goodbye.
                 // The active-client state file is deliberately left in place:
                 // a restart (e.g. after 'monux update') resumes the session
@@ -1135,16 +1141,48 @@ async fn server(
     Ok(())
 }
 
-/// Aborts the spawned loop tasks and waits for them to drop their state.
-/// The connections loop owns the UDP endpoint, and the single-instance lock
-/// is released as soon as server() returns — a socket that outlives the lock
-/// makes the next instance's bind fail with EADDRINUSE (seen in the wild when
-/// a manual start took over from an auto-update restart).
+/// How long the shutdown path lets the QUIC endpoint drain its close frames
+/// to clients before tearing down anyway (see close_loops).
+const ENDPOINT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Closes the QUIC endpoint gracefully, then aborts the spawned loop tasks
+/// and waits for them to drop their state. The graceful close comes FIRST,
+/// while the tasks are still alive and the runtime is pumping I/O: quinn
+/// sends no close frames when the endpoint is merely dropped, so without it
+/// every client waited out its 25s idle timeout on each restart/takeover.
+/// close() stops accepting and sends CONNECTION_CLOSE (code 0, normal) to
+/// all current connections; wait_idle() lets those frames drain, bounded so
+/// an unreachable client's drain can't hang shutdown.
+///
+/// All endpoint clones are gone once this returns (ours taken from the slot
+/// and dropped here, the connections loop's with its task below): the
+/// single-instance lock is released as soon as server() returns, and a
+/// socket that outlives the lock makes the next instance's bind fail with
+/// EADDRINUSE (seen in the wild when a manual start took over from an
+/// auto-update restart).
 async fn close_loops(
     watch_handle: task::JoinHandle<Result<()>>,
     server_events_handle: task::JoinHandle<Result<()>>,
     server_connections_handle: task::JoinHandle<Result<()>>,
+    server_endpoint: server::SharedEndpoint,
 ) {
+    // None when shutdown raced the bind retry loop: nothing to close then.
+    let endpoint = server_endpoint
+        .lock()
+        .expect("server endpoint slot lock poisoned")
+        .take();
+    if let Some(endpoint) = endpoint {
+        endpoint.close(quinn::VarInt::from_u32(0), b"server shutting down");
+        if time::timeout(ENDPOINT_DRAIN_TIMEOUT, endpoint.wait_idle())
+            .await
+            .is_err()
+        {
+            debug!(
+                "QUIC endpoint still draining after {:?}; finishing shutdown anyway",
+                ENDPOINT_DRAIN_TIMEOUT
+            );
+        }
+    }
     watch_handle.abort();
     server_events_handle.abort();
     server_connections_handle.abort();

@@ -760,7 +760,7 @@ impl Connection {
                         );
                     }
                     // Receiving types announcement from server (following recent activation)
-                    // Announce the types to X11 for local apps to see, and clear any prior types from local apps.
+                    // Announce the types to the local clipboard for local apps to see, and clear any prior types from local apps.
                     if let Some(local_clipboard) = &mut local_clipboard {
                         debug!("Got clipboard types from server: {}", types.types);
                         // An empty types string (clipboard clear) splits to no

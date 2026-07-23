@@ -8,7 +8,7 @@ use tracing::{debug, warn};
 
 use crate::clipboard::limited;
 
-/// X11 clipboard types for copying one or more files in a file manager.
+/// Clipboard types for copying one or more files in a file manager.
 /// In this case the payload is a list of paths, which doesn't work over the network.
 const PATHS_TARGET_GNOME: &str = "x-special/gnome-copied-files";
 const PATHS_TARGET_URIS: &str = "text/uri-list";

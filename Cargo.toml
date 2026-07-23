@@ -1,11 +1,11 @@
 [package]
 name = "monux"
-version = "5.3.0"
+version = "5.4.0"
 authors = ["Montazar <github.mdtk4@passmail.com>"]
 license = "AGPL-3.0-or-later"
 edition = "2021"
 readme = "README-CRATES.md"
-description = "Low-latency LAN KVM for Wayland/X11/Console: share keyboard, mouse, touchpad, and clipboard between machines over QUIC/TLS, with screen-edge switching (Hyprland)"
+description = "Low-latency LAN KVM for Wayland/Console: share keyboard, mouse, touchpad, and clipboard between machines over QUIC/TLS, with screen-edge switching (Hyprland)"
 documentation = "https://github.com/mntzrr/monux"
 homepage = "https://github.com/mntzrr/monux"
 repository = "https://github.com/mntzrr/monux"
@@ -43,7 +43,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2.4"
 walkdir = "2.3"
-x11rb-async = { version = "0.13", features = ["xfixes"] }
 zip = { version = "8.5", default-features = false, features = ["zstd"] }
 zstd = "0.13"
 

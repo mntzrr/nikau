@@ -59,7 +59,7 @@ systemctl --user status monux-server
 journalctl --user -u monux-server
 ```
 
-**Clipboard sharing caveat:** the service inherits the systemd user manager's environment, not your compositor's session. Clipboard sharing needs `WAYLAND_DISPLAY`/`DISPLAY`, `XDG_RUNTIME_DIR`, and `DBUS_SESSION_BUS_ADDRESS` imported into the user manager. Hyprland handles this when launched via UWSM, or with its systemd integration (`exec-once = dbus-update-activation-environment --systemd WAYLAND_DISPLAY XDG_CURRENT_DESKTOP`). Without it the service still works for input, but clipboard sharing stays disabled — exactly like running monux with `WAYLAND_DISPLAY` unset.
+**Clipboard sharing caveat:** the service inherits the systemd user manager's environment, not your compositor's session. Clipboard sharing needs `WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR`, and `DBUS_SESSION_BUS_ADDRESS` imported into the user manager. Hyprland handles this when launched via UWSM, or with its systemd integration (`exec-once = dbus-update-activation-environment --systemd WAYLAND_DISPLAY XDG_CURRENT_DESKTOP`). Without it the service still works for input, but clipboard sharing stays disabled — exactly like running monux with `WAYLAND_DISPLAY` unset.
 
 ### If you want a portable binary
 

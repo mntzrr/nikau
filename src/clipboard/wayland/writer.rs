@@ -3,6 +3,8 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{bail, Context, Result};
 use rustix::fs::{fcntl_setfl, OFlags};
@@ -35,6 +37,55 @@ struct State {
 /// waiting on a network/timeout fetch. Maps the requested mime type to its data.
 type ClipboardCache = std::sync::Arc<std::sync::Mutex<Option<(String, Vec<u8>)>>>;
 
+/// Maximum number of paste (Send) requests served concurrently. Clipboard
+/// managers (wl-clip-persist, wl-paste --watch) can fire dozens of Send
+/// events per second and every serve is a thread plus a network fetch that
+/// can live for seconds, so unbounded serving lets a storm pile up threads
+/// faster than they drain. Past the cap the NEWEST request is dropped: its
+/// fd closes unanswered, the requester times out and retries — the same
+/// outcome as a slow serve today.
+const MAX_CONCURRENT_SERVES: usize = 4;
+
+/// A held serve slot (see MAX_CONCURRENT_SERVES); dropping it frees the slot
+/// for the next Send event.
+struct ServePermit {
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl ServePermit {
+    /// Takes a serve slot, or returns None when MAX_CONCURRENT_SERVES serves
+    /// are already in flight.
+    fn try_acquire(in_flight: Arc<AtomicUsize>) -> Option<Self> {
+        let mut current = in_flight.load(Ordering::Acquire);
+        loop {
+            if current >= MAX_CONCURRENT_SERVES {
+                return None;
+            }
+            match in_flight.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(Self { in_flight }),
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
+impl Drop for ServePermit {
+    fn drop(&mut self) {
+        self.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Mime types whose payload is a list of local file paths — the same types
+/// convert.rs packs into a zip of the files' contents for the peer.
+fn is_file_list_mime_type(mime_type: &str) -> bool {
+    mime_type == "text/uri-list" || mime_type == "x-special/gnome-copied-files"
+}
+
 struct PreparedCopyState {
     mime_types: Vec<String>,
     fetch_data_tx: mpsc::Sender<data::ClipboardFetch>,
@@ -47,27 +98,25 @@ struct PreparedCopyState {
     /// Paste (Send) request count within the current one-second window, for
     /// detecting clipboard-manager storms (see the Send handler).
     send_stats: std::sync::Arc<std::sync::Mutex<(std::time::Instant, u32)>>,
+    /// Paste serves currently running, capped at MAX_CONCURRENT_SERVES (see
+    /// the Send handler).
+    serve_in_flight: Arc<AtomicUsize>,
+    /// One runtime shared by every fetch of this advertisement (pre-fetch and
+    /// paste serves): a fresh runtime per fetch let paste storms pile up
+    /// runtimes on top of the serve threads.
+    serve_runtime: Arc<tokio::runtime::Runtime>,
 }
 
-/// Runs a clipboard data fetch on the current (background) thread, using a
-/// short-lived runtime. Returns None on retryable failure.
+/// Runs a clipboard data fetch on the current (background) thread, driving
+/// the shared serve runtime. Returns None on retryable failure.
 fn fetch_sync(
     mime_type: &str,
     fetch_data_tx: &mpsc::Sender<data::ClipboardFetch>,
     max_uncompressed_size_bytes: u64,
     config_dir: &PathBuf,
+    serve_runtime: &tokio::runtime::Runtime,
 ) -> Option<data::ClipboardData> {
-    let rt = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
-            error!("Failed to create clipboard fetch runtime: {}", e);
-            return None;
-        }
-    };
-    rt.block_on(data::fetch_clipboard_data(
+    serve_runtime.block_on(data::fetch_clipboard_data(
         fetch_data_tx,
         mime_type,
         max_uncompressed_size_bytes,
@@ -85,9 +134,10 @@ fn spawn_fetch(
     max_uncompressed_size_bytes: u64,
     config_dir: PathBuf,
     clipboard_data: ClipboardCache,
+    serve_runtime: Arc<tokio::runtime::Runtime>,
 ) {
     std::thread::spawn(move || {
-        if let Some(d) = fetch_sync(&mime_type, &fetch_data_tx, max_uncompressed_size_bytes, &config_dir) {
+        if let Some(d) = fetch_sync(&mime_type, &fetch_data_tx, max_uncompressed_size_bytes, &config_dir, &serve_runtime) {
             debug!("Background-fetched clipboard type {}: {} bytes", d.requested_type, d.bytes.len());
             *clipboard_data.lock().unwrap() = Some((d.requested_type, d.bytes));
         }
@@ -168,6 +218,21 @@ impl_dispatch_source!(State, |state: &mut Self, source: data_control::Source, ev
             }
             debug!("Serving paste request for type {}", mime_type);
 
+            // Bound serve concurrency (see MAX_CONCURRENT_SERVES): at the
+            // cap, drop the newest request — returning here closes its fd,
+            // so the requester times out and retries exactly as it would
+            // after a slow serve.
+            let permit = match ServePermit::try_acquire(prepared_state.serve_in_flight.clone()) {
+                Some(permit) => permit,
+                None => {
+                    warn!(
+                        "Dropping paste request for type {}: {} serves already in flight",
+                        mime_type, MAX_CONCURRENT_SERVES
+                    );
+                    return;
+                }
+            };
+
             // Serve the paste on a background thread (fetch + write). The
             // dispatch thread must never block here: a slow fetch (remote
             // clipboard over a slow link) or a slow paste reader would
@@ -179,7 +244,12 @@ impl_dispatch_source!(State, |state: &mut Self, source: data_control::Source, ev
                 let config_dir = prepared_state.config_dir.clone();
                 let max_uncompressed_size_bytes = prepared_state.max_uncompressed_size_bytes;
                 let clipboard_data = prepared_state.clipboard_data.clone();
-                move || serve_send(mime_type, fd, fetch_data_tx, config_dir, max_uncompressed_size_bytes, clipboard_data)
+                let serve_runtime = prepared_state.serve_runtime.clone();
+                move || {
+                    // Holds the serve slot until the serve has finished.
+                    let _permit = permit;
+                    serve_send(mime_type, fd, fetch_data_tx, config_dir, max_uncompressed_size_bytes, clipboard_data, serve_runtime)
+                }
             });
         }
         Event::Cancelled => source.destroy(),
@@ -196,6 +266,7 @@ fn serve_send(
     config_dir: PathBuf,
     max_uncompressed_size_bytes: u64,
     clipboard_data: ClipboardCache,
+    serve_runtime: Arc<tokio::runtime::Runtime>,
 ) {
     let started = std::time::Instant::now();
     let bytes = {
@@ -206,7 +277,7 @@ fn serve_send(
                 cached_bytes
             }
             _ => {
-                match fetch_sync(&mime_type, &fetch_data_tx, max_uncompressed_size_bytes, &config_dir) {
+                match fetch_sync(&mime_type, &fetch_data_tx, max_uncompressed_size_bytes, &config_dir, &serve_runtime) {
                     Some(d) => {
                         debug!("Background-fetched clipboard type {}: {} bytes", d.requested_type, d.bytes.len());
                         let bytes = d.bytes;
@@ -337,6 +408,18 @@ fn write_clipboard(
         }
         debug!("Advertising {:?} clipboard to wayland: {:?}", clipboard_type, mime_types);
 
+        // One runtime shared by all fetches of this advertisement (pre-fetch
+        // and paste serves) — see PreparedCopyState::serve_runtime. Two
+        // workers suffice: a fetch is a channel round-trip that mostly idles
+        // waiting for the clipboard reader's response.
+        let serve_runtime = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .context("Failed to create clipboard fetch runtime")?,
+        );
+
         for device in state.seats.values() {
             let data_source = clipboard_manager.create_data_source(&queue.handle());
 
@@ -355,11 +438,21 @@ fn write_clipboard(
             max_uncompressed_size_bytes,
             clipboard_data: std::sync::Arc::new(std::sync::Mutex::new(None)),
             send_stats: std::sync::Arc::new(std::sync::Mutex::new((std::time::Instant::now(), 0))),
+            serve_in_flight: Arc::new(AtomicUsize::new(0)),
+            serve_runtime: serve_runtime.clone(),
         });
         // Pre-fetch the primary mime type in the background so the cache is
         // warm before the first paste request arrives (skipping our own
-        // ignored marker type).
-        if let Some(primary) = mime_types.iter().find(|t| **t != state::IGNORED_MIME_TYPE).cloned() {
+        // ignored marker type). File-list types are excluded: their payload
+        // is a zip of the copied files' contents, so pre-fetching on every
+        // advertisement would make the peer zip + transfer + unpack the files
+        // even if the user never pastes — those are served on demand at paste
+        // time. Small types keep the pre-fetch so pastes stay instant.
+        if let Some(primary) = mime_types
+            .iter()
+            .find(|t| **t != state::IGNORED_MIME_TYPE && !is_file_list_mime_type(t))
+            .cloned()
+        {
             let prepared = state.prepared_copy_state.as_ref().expect("just set");
             spawn_fetch(
                 primary,
@@ -367,6 +460,7 @@ fn write_clipboard(
                 max_uncompressed_size_bytes,
                 config_dir.clone(),
                 prepared.clipboard_data.clone(),
+                serve_runtime.clone(),
             );
         }
     }
@@ -454,5 +548,49 @@ impl ClipboardWriterTrait for ClipboardWriter {
             self.config_dir.clone(),
             self.max_uncompressed_size_bytes,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_list_mime_types_are_detected() {
+        // The types convert.rs treats as file lists (payload = zipped file
+        // contents) must be excluded from the advertisement pre-fetch.
+        assert!(is_file_list_mime_type("text/uri-list"));
+        assert!(is_file_list_mime_type("x-special/gnome-copied-files"));
+        // Small types keep the pre-fetch so pastes stay instant.
+        assert!(!is_file_list_mime_type("text/plain"));
+        assert!(!is_file_list_mime_type("image/png"));
+        assert!(!is_file_list_mime_type(state::IGNORED_MIME_TYPE));
+    }
+
+    #[test]
+    fn serve_permit_caps_concurrent_serves() {
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let mut permits = Vec::new();
+        for _ in 0..MAX_CONCURRENT_SERVES {
+            permits.push(ServePermit::try_acquire(in_flight.clone()).expect("slot below the cap"));
+        }
+        // At the cap the newest send is dropped...
+        assert!(ServePermit::try_acquire(in_flight.clone()).is_none());
+        assert_eq!(in_flight.load(Ordering::Relaxed), MAX_CONCURRENT_SERVES);
+        // ...until the oldest serve finishes and frees its slot for the next
+        // (retrying) request.
+        drop(permits.remove(0));
+        assert!(ServePermit::try_acquire(in_flight.clone()).is_some());
+    }
+
+    #[test]
+    fn serve_permit_releases_every_slot_on_drop() {
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        {
+            let _permits: Vec<_> = (0..MAX_CONCURRENT_SERVES)
+                .map(|_| ServePermit::try_acquire(in_flight.clone()).unwrap())
+                .collect();
+        }
+        assert_eq!(in_flight.load(Ordering::Relaxed), 0);
     }
 }
