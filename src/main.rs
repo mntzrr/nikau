@@ -49,12 +49,62 @@ enum Commands {
     /// machine-local settings (setup), updating monux, and removing it again
     /// (uninstall)
     System(SystemArgs),
+
+    /// Manages a running monux daemon through its control socket: switching
+    /// input between machines, pausing, restarting, and more
+    Daemon(DaemonArgs),
 }
 
 #[derive(Args)]
 struct SystemArgs {
     #[command(subcommand)]
     command: SystemCommands,
+}
+
+#[derive(Args)]
+struct DaemonArgs {
+    #[command(subcommand)]
+    command: DaemonCommands,
+}
+
+#[derive(Subcommand)]
+enum DaemonCommands {
+    /// Prints the daemon's live state (same as 'monux system status')
+    Status(StatusArgs),
+
+    /// Switches input to the next or previous client, the local machine, or a
+    /// client fingerprint prefix
+    Switch(DaemonSwitchArgs),
+
+    /// Pauses input handling: all devices ungrabbed (raw local input), the
+    /// daemon keeps listening. Resume with 'monux daemon resume'
+    Pause,
+
+    /// Resumes input handling after a pause
+    Resume,
+
+    /// Gracefully restarts the daemon into the installed binary (the session
+    /// resumes automatically)
+    Restart,
+
+    /// Gracefully stops the daemon (clients reconnect on its next start)
+    Exit,
+
+    /// Wakes the background update check immediately instead of waiting for
+    /// the daily tick
+    Update,
+}
+
+#[derive(Args)]
+struct DaemonSwitchArgs {
+    /// next, prev, local, or a client fingerprint prefix
+    #[arg(value_name = "target")]
+    target: String,
+
+    /// Query this explicit control socket path instead of the default
+    /// $XDG_RUNTIME_DIR/monux/{server,client}.sock locations
+    #[arg(long, value_name = "path")]
+    socket: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -518,6 +568,53 @@ fn main() -> Result<()> {
     // System commands and update don't need the config dir, devices, or the
     // async runtime.
     match &cli.command {
+        Commands::Daemon(args) => match &args.command {
+            DaemonCommands::Status(args) => {
+                let out = monux::control::status_cli(
+                    args.server,
+                    args.client,
+                    args.socket.as_deref(),
+                    args.json,
+                )?;
+                println!("{}", out);
+                return Ok(());
+            }
+            DaemonCommands::Switch(args) => {
+                let request = format!(r#"{{"cmd":"switch","target":"{}"}}"#, args.target);
+                let out = monux::control::daemon_cli(&request, "Switch requested", args.socket.as_deref())?;
+                println!("{}", out);
+                return Ok(());
+            }
+            DaemonCommands::Pause => {
+                let out = monux::control::daemon_cli(r#"{"cmd":"pause"}"#, "Input paused", None)?;
+                println!("{}", out);
+                return Ok(());
+            }
+            DaemonCommands::Resume => {
+                let out = monux::control::daemon_cli(r#"{"cmd":"resume"}"#, "Input resumed", None)?;
+                println!("{}", out);
+                return Ok(());
+            }
+            DaemonCommands::Restart => {
+                let out = monux::control::daemon_cli(
+                    r#"{"cmd":"restart"}"#,
+                    "Restarting the daemon (the session will resume automatically)",
+                    None,
+                )?;
+                println!("{}", out);
+                return Ok(());
+            }
+            DaemonCommands::Exit => {
+                let out = monux::control::daemon_cli(r#"{"cmd":"exit"}"#, "Shutting down the daemon", None)?;
+                println!("{}", out);
+                return Ok(());
+            }
+            DaemonCommands::Update => {
+                let out = monux::control::daemon_cli(r#"{"cmd":"update_now"}"#, "Update check started", None)?;
+                println!("{}", out);
+                return Ok(());
+            }
+        },
         Commands::System(args) => match &args.command {
             SystemCommands::Setup(args) => {
                 maybe_elevate("to persist system settings")?;
@@ -608,8 +705,8 @@ fn main() -> Result<()> {
     );
 
     match cli.command {
-        Commands::System(_) => {
-            unreachable!("system commands are handled before runtime initialization")
+        Commands::System(_) | Commands::Daemon(_) => {
+            unreachable!("system and daemon commands are handled before runtime initialization")
         }
         Commands::Server(args) => {
             if args.port == 0 {

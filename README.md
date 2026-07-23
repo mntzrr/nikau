@@ -191,6 +191,22 @@ The wire protocol is newline-delimited JSON, one request and one response per li
 echo '{"cmd":"pause"}' | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/monux/server.sock
 ```
 
+### Managing the daemon (`monux daemon`)
+
+The same socket backs the `monux daemon` management verbs — drive the running daemon without touching its terminal or signals:
+
+```bash
+monux daemon status              # live state (same as 'monux system status')
+monux daemon switch next         # or prev / local / a client fingerprint prefix
+monux daemon pause               # ungrab everything (raw local input)
+monux daemon resume
+monux daemon restart             # graceful restart into the installed binary
+monux daemon exit                # graceful stop
+monux daemon update              # wake the background update check now
+```
+
+Commands try the server socket first, then the client's (`--socket <path>` overrides where offered); server-only actions (switch/pause/resume) return the daemon's error when pointed at a client. Acknowledgement is immediate — `switch` is queued to the rotation, `exit`/`restart` ack before the daemon begins shutting down.
+
 ### Tray indicator (`monux system indicator`)
 
 `monux system indicator` puts a StatusNotifierItem (SNI) tray icon in your panel — any SNI host works: waybar (with a `tray` module), KDE Plasma, xfce4-panel, and so on. It is a thin client of the control socket: it polls `{"cmd":"status"}` every 2 seconds (server socket first, then the client's) and never talks to the daemon's event loops, so it can neither stall nor be stalled by monux.

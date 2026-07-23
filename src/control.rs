@@ -841,6 +841,28 @@ pub fn status_cli(
     format_status(&path, &raw, json)
 }
 
+/// Implements the `monux daemon` management verbs: sends a daemon-management
+/// command (switch/pause/resume/restart/exit/update_now) to the control
+/// socket (server socket first, then the client's) and returns the text to
+/// print. The daemon's error string propagates — e.g. switch/pause from a
+/// client socket, an unknown switch target, or --no-auto-update on update.
+pub fn daemon_cli(request: &str, ok_message: &str, socket: Option<&Path>) -> Result<String> {
+    let candidates: Vec<PathBuf> = match socket {
+        Some(path) => vec![path.to_path_buf()],
+        None => vec![socket_path(Role::Server), socket_path(Role::Client)],
+    };
+    let (path, raw) = query_first(&candidates, request)?;
+    let response: RawResponse = serde_json::from_str(&raw)
+        .with_context(|| format!("Malformed response from {}: {}", path.display(), raw))?;
+    if !response.ok {
+        bail!(
+            "The daemon reported an error: {}",
+            response.error.unwrap_or_default()
+        );
+    }
+    Ok(ok_message.to_string())
+}
+
 /// Implements `monux system tray hide|show`: sends the indicator hide/show
 /// command to the daemon's control socket (server socket first, then the
 /// client's, exactly like status discovery; `socket` overrides) and returns
@@ -1308,6 +1330,27 @@ mod tests {
         task.abort();
         let _ = task.await;
         assert!(!path.exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn daemon_cli_sends_commands_and_propagates_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.sock");
+        let listener = Listener::bind_at(&path, "server").unwrap();
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let task = tokio::spawn(listener.run(server_handler(event_tx, false)));
+        // Let the listener come up before querying (connect would EAGAIN).
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // ok:true passes the ok message through.
+        let out = daemon_cli(r#"{"cmd":"pause"}"#, "fine", Some(&path)).unwrap();
+        assert_eq!(out, "fine");
+        // A daemon-side error (update without auto-update) propagates.
+        let err = daemon_cli(r#"{"cmd":"update_now"}"#, "started", Some(&path)).unwrap_err();
+        assert!(err.to_string().contains("The daemon reported an error"));
+
+        task.abort();
+        let _ = task.await;
     }
 
     #[tokio::test]
