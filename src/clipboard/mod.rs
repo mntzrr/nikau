@@ -54,6 +54,12 @@ pub fn filter_shareable_mime_types(types: Vec<String>) -> Vec<String> {
 /// read timeout alone isn't enough.
 pub const CLIPBOARD_SERVE_TIMEOUT_SECS: u64 = 4;
 
+/// How long the writer dispatcher waits for a single store_types call before
+/// giving up. store_types does wayland roundtrips that can hang on a wedged
+/// compositor; without a bound, one hung advertisement blocks every
+/// subsequent one forever (and grows the channel unboundedly while waiting).
+const WRITER_DISPATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Clipboard writes (advertising types to the local environment) can block for
 /// a long time: each call opens a fresh wayland connection, does roundtrips,
 /// and spawns a serving thread. Running them on the rotation or client event
@@ -61,14 +67,49 @@ pub const CLIPBOARD_SERVE_TIMEOUT_SECS: u64 = 4;
 /// wl-clip-persist re-owning every clipboard, wl-paste --watch pollers), where
 /// dozens of advertisements arrive in bursts. This dispatcher serializes them
 /// on a dedicated thread instead.
+///
+/// Only the latest advertisement is served: while a store_types call is in
+/// flight, newer advertisements drain and replace older queued ones (a stale
+/// clipboard type list is pointless once a fresher one exists). A hung
+/// store_types call (wedged compositor) is abandoned after WRITER_DISPATCH_TIMEOUT
+/// so the dispatcher doesn't deadlock.
 pub(crate) fn spawn_writer_dispatcher(
     writer: Box<dyn ClipboardWriter>,
 ) -> std::sync::mpsc::Sender<Vec<String>> {
+    let writer = std::sync::Arc::<dyn ClipboardWriter>::from(writer);
     let (tx, rx) = std::sync::mpsc::channel::<Vec<String>>();
     std::thread::spawn(move || {
-        while let Ok(types) = rx.recv() {
-            if let Err(e) = writer.store_types(types) {
-                tracing::warn!("Failed to advertise clipboard types: {}", e);
+        while let Ok(mut types) = rx.recv() {
+            // Drain stale advertisements: only the latest matters. This
+            // bounds the queue under burst churn and skips pointless serves.
+            while let Ok(newer) = rx.try_recv() {
+                types = newer;
+            }
+            // Run store_types with a timeout so a wedged compositor can't
+            // deadlock the dispatcher forever. store_types does blocking
+            // wayland roundtrips; the timeout thread is abandoned (the
+            // serving thread it spawned will exit on its own when the
+            // connection drops).
+            let writer = writer.clone();
+            let (result_tx, result_rx) =
+                std::sync::mpsc::channel::<anyhow::Result<()>>();
+            let handle = std::thread::spawn(move || {
+                let _ = result_tx.send(writer.store_types(types));
+            });
+            match result_rx.recv_timeout(WRITER_DISPATCH_TIMEOUT) {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!("Failed to advertise clipboard types: {}", e);
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "Clipboard advertisement timed out after {:?} (wedged compositor?); abandoning",
+                        WRITER_DISPATCH_TIMEOUT
+                    );
+                    // The store_types thread is leaked but will exit when its
+                    // wayland connection drops; detach its handle.
+                    let _ = handle;
+                }
             }
         }
     });
@@ -89,7 +130,7 @@ pub trait ClipboardReader: Send {
 }
 
 /// Trait for advertising clipboard data to the local environment
-pub trait ClipboardWriter: Send {
+pub trait ClipboardWriter: Send + Sync {
     /// Advertises with the local environment that we have a new clipboard entry available
     fn store_types(&self, types: Vec<String>) -> Result<()>;
 }
