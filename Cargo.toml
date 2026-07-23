@@ -1,6 +1,6 @@
 [package]
 name = "monux"
-version = "5.4.1"
+version = "5.4.2"
 authors = ["Montazar <github.mdtk4@passmail.com>"]
 license = "AGPL-3.0-or-later"
 edition = "2021"
@@ -16,6 +16,8 @@ anyhow = "1.0"
 async-trait = "0.1"
 bit-vec = "0.9"
 bytes = "1.4"
+# clap "string" is load-bearing: the derive attributes in main.rs pass
+# format!-produced Strings to version/long_about (From<String> for Str).
 clap = { version = "4.4", features = ["derive", "string"] }
 evdev = { version = "0.13", features = ["tokio"] }
 hex = "0.4"
@@ -27,18 +29,22 @@ nonblock = "0.2"
 notify = "8.2"
 pem = "3.0"
 postcard = { version = "1.0", features = ["use-std"] }
-quinn = { version = "0.11" }
+# Defaults minus platform-verifier (unused; pulls rustls-platform-verifier +
+# webpki-root-certs): certs are pinned via our own approval flow instead.
+quinn = { version = "0.11", default-features = false, features = ["log", "runtime-tokio", "rustls-ring", "bloom"] }
 rcgen = "0.14"
 regex = "1.10"
 rustix = "1.1"
-rustls = "0.23"
+# ring-only provider (approval.rs uses rustls::crypto::ring): the aws-lc-rs /
+# prefer-post-quantum defaults only buy a heavy C/ASM build we never use.
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "logging", "ring"] }
 rustls-pemfile = "2.0"
 rustls-pki-types = "1.7"
 serde = { version = "1.0", default-features = false }
 serde_json = "1.0"
 sha2 = "0.11"
 signal-hook = "0.4"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "process", "net", "io-util"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "process", "net", "io-util", "time", "sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2.4"
@@ -46,7 +52,7 @@ walkdir = "2.3"
 zip = { version = "8.5", default-features = false, features = ["zstd"] }
 zstd = "0.13"
 
-os_pipe = { version = "1.1", features = ["io_safety"] }
+os_pipe = { version = "1.1" }
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
