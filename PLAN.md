@@ -368,3 +368,11 @@ Recorded 2026-07-22; no plan order — take any when wanted.
    (RTT/loss over the warn thresholds), restore when it recovers. Serves
    the recurring WiFi pain directly: fewer datagrams fighting a bad link
    means smoother cursor at exactly the moments the link is worst.
+5. **Property-based testing of the wire protocol (proptest).** Three
+   properties, in value order: (a) every decoder (events, bulk, version
+   bootstrap, COBS framing) errors cleanly — never panics — on arbitrary
+   byte sequences; (b) random instances of all wire message variants
+   round-trip serialize/deserialize equal; (c) motion-datagram healing
+   under random reorder/loss/duplication always converges to the newest
+   cursor position. ~2-3 days incl. Arbitrary impls; dev-dependency only,
+   runs in cargo test + CI.
