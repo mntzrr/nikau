@@ -263,6 +263,23 @@ When the link is degraded, monux says so in several places: a desktop notificati
 3. **Move the AP and clients to 5 GHz** — the single biggest fix when the hardware allows it.
 4. Read the trend around a spike in the client's debug-level `Link stats:` lines (rtt and window loss every 15s).
 
+What monux already marks for you: in local mode both endpoints run with `SO_PRIORITY=6` on the QUIC socket, which the WiFi driver maps to 802.11 UP 6 — the voice access category (AC_VO) — so monux packets cut ahead of best-effort traffic in each machine's own wireless uplink queue, no router cooperation needed. A DSCP mark on the wire is not possible from inside the process (quinn-udp overwrites the TOS byte per packet with its ECN codepoint), so if you also want the AP/router hop to schedule monux as voice-class (it picks the downlink queue from each packet's DSCP), mark it with netfilter, once per machine:
+
+```bash
+# nftables
+sudo nft 'add table inet monux-qos'
+sudo nft 'add chain inet monux-qos output { type filter hook output priority mangle; policy accept; }'
+sudo nft 'add rule inet monux-qos output udp sport 1213 ip dscp set cs6'
+sudo nft 'add rule inet monux-qos output udp dport 1213 ip dscp set cs6'
+# undo: sudo nft delete table inet monux-qos
+
+# or iptables
+sudo iptables -t mangle -A OUTPUT -p udp --sport 1213 -j DSCP --set-dscp-class CS6
+sudo iptables -t mangle -A OUTPUT -p udp --dport 1213 -j DSCP --set-dscp-class CS6
+```
+
+These rules don't persist across reboots on their own — wrap them in a systemd unit if you want them permanent.
+
 ## License
 
 This project is licensed under the AGPLv3 (or later versions) and is copyright Nicholas Parker.

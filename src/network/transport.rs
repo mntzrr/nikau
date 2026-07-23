@@ -139,9 +139,16 @@ fn create_socket(bind_addr: SocketAddr, mode: NetworkMode) -> Result<std::net::U
                 libc::SO_PRIORITY,
                 &SOCKET_PRIORITY,
             )?;
+            // SO_PRIORITY=6 is monux's WMM mark: the local WiFi driver maps
+            // skb->priority 6 onto 802.11 UP 6, i.e. the voice access category
+            // (AC_VO), on this machine's own egress link — no privileges
+            // needed, and it needs no router cooperation.
             // Note: no DSCP mark here. quinn-udp sets the ECN codepoint via a
-            // per-packet cmsg, which overrides any socket-level IP_TOS/IPV6_TCLASS,
-            // so a setsockopt DSCP mark would be dead code.
+            // per-packet cmsg (IP_TOS/IPV6_TCLASS carrying only the ECN bits),
+            // which overrides any socket-level TOS, so a setsockopt DSCP mark
+            // would be dead code. A wire-level DSCP mark for the AP/router hop
+            // needs netfilter instead (see README, "RTT spikes and degraded
+            // links").
         }
         Ok(())
     };
