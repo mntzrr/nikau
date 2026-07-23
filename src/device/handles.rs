@@ -89,12 +89,16 @@ impl<H: DeviceHandler> DeviceHandles<H> {
             device_info,
             class,
         )?;
-        match class {
+        let displaced = match class {
             device::DeviceClass::Keyboard => {
                 self.always_grabbed_devices.insert(path.clone(), join_handle)
             }
             device::DeviceClass::Toggled => self.toggled_devices.insert(path.clone(), join_handle),
         };
+        if let Some(old) = displaced {
+            debug!("Aborting displaced reader task for device {}", path.display());
+            old.handle.abort();
+        }
         Ok(())
     }
 

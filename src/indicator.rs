@@ -743,7 +743,6 @@ fn copy_to_clipboard(text: &str) -> Result<&'static str> {
 const CLIPBOARD_TOOL_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn pipe_into(tool: &str, args: &[&str], text: &str) -> Result<()> {
-    use std::io::Write;
     let mut child = Command::new(tool)
         .args(args)
         .stdin(Stdio::piped())
@@ -751,22 +750,45 @@ fn pipe_into(tool: &str, args: &[&str], text: &str) -> Result<()> {
         .stderr(Stdio::null())
         .spawn()
         .with_context(|| format!("failed to spawn {}", tool))?;
-    // A tool that rejects the session (no WAYLAND_DISPLAY/DISPLAY) exits
-    // immediately, breaking the pipe; that error moves us to the next tool.
-    child
+    let mut stdin = child
         .stdin
-        .as_mut()
-        .expect("stdin is piped")
-        .write_all(text.as_bytes())
-        .with_context(|| format!("failed to write to {}", tool))?;
-    match wait_with_timeout(&mut child, CLIPBOARD_TOOL_TIMEOUT)? {
-        Some(status) if status.success() => Ok(()),
-        Some(status) => bail!("{} exited with {}", tool, status),
-        None => {
-            // Wedged: kill and reap, then report like any other tool failure.
+        .take()
+        .expect("stdin is piped");
+    // Write on a worker thread so a wedged reader can't block the tray's
+    // service thread at the 64 KiB pipe-buffer boundary. The worker exits
+    // on write success, pipe-break (child killed), or EOF.
+    let (write_tx, write_rx) = std::sync::mpsc::channel();
+    let text = text.to_string();
+    let _worker = std::thread::spawn(move || {
+        use std::io::Write;
+        let _ = write_tx.send(stdin.write_all(text.as_bytes()));
+    });
+    match write_rx.recv_timeout(CLIPBOARD_TOOL_TIMEOUT) {
+        // Write succeeded: the pipe is closed (stdin dropped when the
+        // worker exits), so the tool sees EOF and exits in milliseconds.
+        Ok(Ok(())) => match wait_with_timeout(&mut child, CLIPBOARD_TOOL_TIMEOUT)? {
+            Some(status) if status.success() => Ok(()),
+            Some(status) => bail!("{} exited with {}", tool, status),
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("{} did not exit within {:?}", tool, CLIPBOARD_TOOL_TIMEOUT)
+            }
+        },
+        Ok(Err(e)) => {
+            let _ = child.wait();
+            Err(e).with_context(|| format!("failed to write to {}", tool))
+        }
+        Err(_) => {
+            // Write timed out (wedged reader): kill the child to break the
+            // pipe, which lets the leaked worker thread exit shortly after.
             let _ = child.kill();
             let _ = child.wait();
-            bail!("{} did not exit within {:?}", tool, CLIPBOARD_TOOL_TIMEOUT)
+            bail!(
+                "{} did not accept the clipboard data within {:?}",
+                tool,
+                CLIPBOARD_TOOL_TIMEOUT
+            )
         }
     }
 }

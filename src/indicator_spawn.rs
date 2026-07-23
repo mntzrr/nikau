@@ -312,11 +312,18 @@ fn exit_action(shared: &mut Shared, sigterm: bool, uptime: Duration) -> ExitActi
 
 /// Spawns the indicator and stores it as the supervised child; returns its
 /// pid. Callers have already decided a spawn is wanted (not hidden, no live
-/// child).
+/// child). Takes the lock before spawning so concurrent callers can't
+/// displace each other's child (which would leak an unreaped zombie).
 fn spawn_and_store(shared: &Arc<Mutex<Shared>>) -> Result<u32> {
     let child = spawn_indicator()?;
     let pid = child.id();
     let mut shared = shared.lock().unwrap();
+    // A prior child that's somehow still here (concurrent spawn raced in):
+    // reap it instead of orphaning it as a zombie.
+    if let Some(mut old) = shared.child.take() {
+        let _ = old.kill();
+        let _ = old.wait();
+    }
     shared.child = Some(child);
     shared.spawned_at = Instant::now();
     Ok(pid)

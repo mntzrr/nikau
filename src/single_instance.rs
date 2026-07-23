@@ -113,7 +113,7 @@ pub fn acquire(kind: &str) -> Result<InstanceLock> {
         fs::read_to_string(format!("/proc/{}/cmdline", pid)).map(|s| s.replace('\0', " "));
     let verified = matches!(
         (&comm, &cmdline),
-        (Ok(c), Ok(cl)) if c.trim() == "monux" && cl.contains(kind)
+        (Ok(c), Ok(cl)) if c.trim() == "monux" && cl.split_whitespace().any(|tok| tok == kind)
     );
     if !verified {
         if comm.is_err() && cmdline.is_err() {
@@ -133,6 +133,19 @@ pub fn acquire(kind: &str) -> Result<InstanceLock> {
         );
     }
     info!("Asking existing monux {} (pid {}) to shut down...", kind, pid);
+    // We re-exec'd after an auto-update (MONUX_RESTARTED). exec() released
+    // our flock (the fd is CLOEXEC), and a contender (autostart, systemd,
+    // manual restart) may have acquired the free lock during the startup
+    // gap before we reached acquire(). Yield instead of killing them — the
+    // updated binary is already on disk for their next restart, and a
+    // kill-and-takeover here ping-pongs indefinitely.
+    if std::env::var_os("MONUX_RESTARTED").is_some() {
+        info!(
+            "Update restart found another monux {} already running; yielding to avoid a takeover ping-pong",
+            kind
+        );
+        bail!("Another monux {} is already running", kind);
+    }
     if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
         let err = std::io::Error::last_os_error();
         if err.raw_os_error() == Some(libc::EPERM) {
@@ -193,8 +206,29 @@ fn read_pid(path: &PathBuf) -> Option<i32> {
 /// file records a pid and that process is alive and looks like monux running
 /// the matching kind. Read-only role detection (e.g. the update gate decides
 /// whether this machine is a pure server) — it never disturbs the lock.
+///
+/// The pid file is a human hint, not authority (flocks can't go stale, but
+/// the pid file can point at a reused pid). To reject a stale entry we probe
+/// the flock: if we can acquire it, the lock is free and the pid file is
+/// stale. We immediately release — this is a read-only check.
 pub fn live_holder(kind: &str) -> Option<i32> {
-    let pid = read_pid(&lock_path(kind))?;
+    let path = lock_path(kind);
+    // Probe the flock: if it's free, the pid file is stale (the old holder
+    // crashed without flock-release being an issue — flock auto-releases on
+    // process death — but the pid file survived). flock works on a read-only
+    // fd, so this handles the cross-user case too.
+    let probe = match fs::OpenOptions::new().read(true).open(&path) {
+        Ok(f) => {
+            if try_lock(&f) {
+                let _ = rustix::fs::flock(&f, rustix::fs::FlockOperation::Unlock);
+                return None;
+            }
+            true // locked by someone else
+        }
+        Err(_) => return None,
+    };
+    debug_assert!(probe);
+    let pid = read_pid(&path)?;
     if pid == std::process::id() as i32 {
         return None;
     }
@@ -202,7 +236,9 @@ pub fn live_holder(kind: &str) -> Option<i32> {
     let cmdline = fs::read_to_string(format!("/proc/{}/cmdline", pid))
         .map(|s| s.replace('\0', " "))
         .ok()?;
-    if comm.trim() == "monux" && cmdline.contains(kind) {
+    // Exact argv-token match: `monux client my-server-host` must NOT match
+    // live_holder("server") — a bare substring check would.
+    if comm.trim() == "monux" && cmdline.split_whitespace().any(|tok| tok == kind) {
         Some(pid)
     } else {
         None

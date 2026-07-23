@@ -121,14 +121,21 @@ pub fn run(force: bool, low_priority: bool, protocol_constraint: Option<u64>) ->
 
     let root = install_root();
     let cargo = find_cargo()?;
-    // Clean staging leftovers from previously killed installs.
+    // Clean staging leftovers from previously killed installs. Skip dirs whose
+    // pid suffix is a live process: a concurrent updater is building there.
+    let our_pid = std::process::id() as i32;
     if let Ok(entries) = std::fs::read_dir(&root) {
         for entry in entries.flatten() {
-            if entry
+            if let Some(pid_str) = entry
                 .file_name()
                 .to_string_lossy()
-                .starts_with(".monux-install-staging-")
+                .strip_prefix(".monux-install-staging-")
             {
+                if let Ok(pid) = pid_str.parse::<i32>() {
+                    if pid != our_pid && std::path::Path::new(&format!("/proc/{}", pid)).exists() {
+                        continue;
+                    }
+                }
                 let _ = std::fs::remove_dir_all(entry.path());
             }
         }

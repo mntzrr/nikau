@@ -255,6 +255,10 @@ fn collect_server_protocol_versions(daemon: &ServiceDaemon) -> Result<Vec<u64>> 
         .context("Failed to browse for Monux servers")?;
     let deadline = Instant::now() + SERVER_VERSION_DISCOVERY_TIMEOUT;
     let own_instance = get_hostname().unwrap_or_default();
+    let own_ips: std::collections::HashSet<IpAddr> = local_ipv4_addrs()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
     let mut versions = BTreeSet::new();
     loop {
         let remaining = match deadline.checked_duration_since(Instant::now()) {
@@ -266,7 +270,15 @@ fn collect_server_protocol_versions(daemon: &ServiceDaemon) -> Result<Vec<u64>> 
                 match protocol_version_of(resolved.get_properties()) {
                     Some(version) => {
                         let instance = instance_name_of(resolved.get_fullname());
-                        if instance == own_instance {
+                        // Our own advertisement must not gate our own update.
+                        // Match on hostname OR advertised IPs: cloned images
+                        // share a hostname, so the IP check is essential.
+                        let is_own = instance == own_instance
+                            || resolved
+                                .get_addresses()
+                                .iter()
+                                .any(|scoped| own_ips.contains(&scoped.to_ip_addr()));
+                        if is_own {
                             // Our own advertisement must not gate our own
                             // update: a server leads protocol upgrades — the
                             // gate exists for client machines.
