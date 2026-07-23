@@ -97,8 +97,10 @@ struct ClientInfo {
     /// Connection handle for sending unreliable/unordered QUIC datagrams
     /// (used for high-rate pointer motion; see MotionDatagram).
     conn: quinn::Connection,
-    /// Whether the peer accepts QUIC datagrams. Disabled permanently on the
-    /// first UnsupportedByPeer/Disabled error, falling back to the stream.
+    /// Whether the peer accepts QUIC datagrams. Defense-only: both peers run
+    /// the identical binary with identical quinn config, so datagram support
+    /// is symmetric and this is never false in normal operation. The fallback
+    /// to the ordered stream exists for forward-compatibility / safety.
     datagrams_ok: bool,
     /// Unique-per-process token of the accepted connection that owns this
     /// entry (see server.rs). A reconnect can reuse the same addr:port and
@@ -2377,8 +2379,11 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         let grab = format!("{:?}", *self.grab_tx.borrow());
         // Stay silent when completely idle on the local machine: a freeze
         // window always has non-zero counts, so silence loses no evidence.
+        // Use physical_grabbed (not physical) so an ungrabbed mouse moving
+        // while local doesn't look like activity — only forwarded or emitted
+        // input is meaningful.
         let idle_local = self.current_client.is_none()
-            && counts.physical == 0
+            && counts.physical_grabbed == 0
             && counts.forwarded == 0
             && counts.emitted_local == 0;
         if idle_local {
@@ -2785,8 +2790,11 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                     MotionSend::Fallback => {}
                 }
             }
-            // Ordering: coalesced motion must reach the client before this
-            // batch (e.g. a click lands after the motion that preceded it).
+            // Best-effort ordering: flush coalesced motion (as unreliable
+            // datagrams) before sending this batch on the ordered stream.
+            // The datagram can race the stream on the wire, so the ordering
+            // is not guaranteed — but the common case (click after motion on
+            // the same path) works well enough in practice.
             self.flush_pending_motion().await;
             self.send_event_to_remote_client(event::ServerEvent::Input(events))
                 .await?;

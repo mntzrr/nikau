@@ -425,7 +425,6 @@ async fn handle_connection(
     {
         return Err(VersionMismatch.into());
     }
-    transport::ensure_compatible_version(client_version)?;
 
     // Start second stream for bulk messages
     let (mut bulk_send, mut bulk_recv) = conn

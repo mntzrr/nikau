@@ -236,6 +236,9 @@ pub fn server_protocol_constraint(config_dir: &Path) -> Option<u64> {
 /// falling back to ~/.local.
 fn install_root() -> PathBuf {
     if let Ok(exe) = std::env::current_exe() {
+        // After an auto-update replaces the binary on disk while we run, Linux
+        // reports our exe as "<path> (deleted)"; trim that suffix.
+        let exe = PathBuf::from(exe.to_string_lossy().trim_end_matches(" (deleted)"));
         if exe.file_name().is_some_and(|name| name == "monux") {
             if let Some(bin_dir) = exe.parent() {
                 if bin_dir.file_name().is_some_and(|name| name == "bin") {

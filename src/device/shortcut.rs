@@ -80,6 +80,7 @@ fn parse_action(keys: &str, action: Event) -> Result<KeyCombo> {
     // The key combo handling waits for all keys to be held simultaneously in any order and
     // so doesn't check for keypress ordering. So sorting the keys here shouldn't affect that.
     keys.sort();
+    keys.dedup();
 
     Ok(KeyCombo { keys, action })
 }
@@ -97,6 +98,11 @@ pub(crate) enum ComboAction {
 /// Checks input events for a specified key combination.
 ///
 /// Keys may be pressed in any order, as long as there's a point where they're all being pressed at the same time.
+///
+/// Combo state is tracked per physical keyboard device (each evdev device gets
+/// its own ComboState), so all keys of a chord must reside on a single keyboard.
+/// Chords spanning multiple keyboards (e.g. Shift on keyboard A + P on keyboard B)
+/// intentionally do not fire — this is a wontfix design constraint.
 ///
 /// The combination fires the moment the last missing combo key is *pressed* (fire-on-prime):
 /// stuck-key protection doesn't depend on fire-on-release because both sides run release_all
