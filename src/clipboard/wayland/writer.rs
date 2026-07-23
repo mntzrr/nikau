@@ -21,12 +21,6 @@ use crate::clipboard::wayland::data_control::{
     self, impl_dispatch_device, impl_dispatch_manager, impl_dispatch_offer, impl_dispatch_source,
 };
 
-#[derive(Clone, Debug)]
-pub enum ClipboardType {
-    /// Write to the regular clipboard (Ctrl+C style)
-    Regular,
-}
-
 struct State {
     seats: HashMap<wl_seat::WlSeat, data_control::Device>,
     prepared_copy_state: Option<PreparedCopyState>,
@@ -34,8 +28,12 @@ struct State {
 
 /// Clipboard contents for the currently advertised clipboard, fetched in the
 /// background so that paste (Send) requests never block the dispatch thread
-/// waiting on a network/timeout fetch. Maps the requested mime type to its data.
-type ClipboardCache = std::sync::Arc<std::sync::Mutex<Option<(String, Vec<u8>)>>>;
+/// waiting on a network/timeout fetch. Maps each fetched mime type to its
+/// data for the lifetime of one advertisement (the epoch: a new advertisement
+/// replaces the PreparedCopyState and with it this map), so clipboard
+/// managers cycling A,B,A,B over the advertised types pay the serialized
+/// fetch only once per type per advertisement.
+type ClipboardCache = std::sync::Arc<std::sync::Mutex<HashMap<String, Vec<u8>>>>;
 
 /// Maximum number of paste (Send) requests served concurrently. Clipboard
 /// managers (wl-clip-persist, wl-paste --watch) can fire dozens of Send
@@ -139,7 +137,7 @@ fn spawn_fetch(
     std::thread::spawn(move || {
         if let Some(d) = fetch_sync(&mime_type, &fetch_data_tx, max_uncompressed_size_bytes, &config_dir, &serve_runtime) {
             debug!("Background-fetched clipboard type {}: {} bytes", d.requested_type, d.bytes.len());
-            *clipboard_data.lock().unwrap() = Some((d.requested_type, d.bytes));
+            clipboard_data.lock().unwrap().insert(d.requested_type, d.bytes);
         }
     });
 }
@@ -270,18 +268,18 @@ fn serve_send(
 ) {
     let started = std::time::Instant::now();
     let bytes = {
-        let cached = clipboard_data.lock().unwrap().clone();
+        let cached = clipboard_data.lock().unwrap().get(&mime_type).cloned();
         match cached {
-            Some((cached_type, cached_bytes)) if cached_type == mime_type => {
+            Some(cached_bytes) => {
                 debug!("Reusing cached clipboard with type {}: {} bytes", mime_type, cached_bytes.len());
                 cached_bytes
             }
-            _ => {
+            None => {
                 match fetch_sync(&mime_type, &fetch_data_tx, max_uncompressed_size_bytes, &config_dir, &serve_runtime) {
                     Some(d) => {
                         debug!("Background-fetched clipboard type {}: {} bytes", d.requested_type, d.bytes.len());
                         let bytes = d.bytes;
-                        *clipboard_data.lock().unwrap() = Some((d.requested_type, bytes.clone()));
+                        clipboard_data.lock().unwrap().insert(d.requested_type, bytes.clone());
                         bytes
                     }
                     // Retryable fetch failure: serve empty, the next request retries.
@@ -381,7 +379,6 @@ fn init_state() -> Result<(State, data_control::Manager, EventQueue<State>)> {
 /// Launches a thread to serve the provided clipboard data to wayland,
 /// automatically exiting the thread when the clipboard gets overridden
 fn write_clipboard(
-    clipboard_type: ClipboardType,
     mut mime_types: Vec<String>,
     fetch_data_tx: mpsc::Sender<data::ClipboardFetch>,
     config_dir: PathBuf,
@@ -395,7 +392,7 @@ fn write_clipboard(
     if mime_types.is_empty() {
         // Clearing the clipboard: explicitly release the selection, so compositors
         // that require an explicit clear don't keep offering the stale clipboard.
-        debug!("Clearing {:?} clipboard in wayland", clipboard_type);
+        debug!("Clearing clipboard in wayland");
         for device in state.seats.values() {
             device.set_selection(None);
         }
@@ -406,7 +403,7 @@ fn write_clipboard(
         if !mime_types.contains(&ignored_type) {
             mime_types.push(ignored_type);
         }
-        debug!("Advertising {:?} clipboard to wayland: {:?}", clipboard_type, mime_types);
+        debug!("Advertising clipboard to wayland: {:?}", mime_types);
 
         // One runtime shared by all fetches of this advertisement (pre-fetch
         // and paste serves) — see PreparedCopyState::serve_runtime. Two
@@ -436,7 +433,7 @@ fn write_clipboard(
             fetch_data_tx: fetch_data_tx.clone(),
             config_dir: config_dir.clone(),
             max_uncompressed_size_bytes,
-            clipboard_data: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            clipboard_data: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             send_stats: std::sync::Arc::new(std::sync::Mutex::new((std::time::Instant::now(), 0))),
             serve_in_flight: Arc::new(AtomicUsize::new(0)),
             serve_runtime: serve_runtime.clone(),
@@ -515,7 +512,6 @@ fn write_clipboard(
 /// Task that advertises received clipboard types to local programs,
 /// and fetches clipboard contents from monux in response to local type requests (pastes).
 pub struct ClipboardWriter {
-    clipboard_type: ClipboardType,
     config_dir: PathBuf,
     max_uncompressed_size_bytes: u64,
     /// Send available clipboard types, received from Monux server
@@ -524,13 +520,11 @@ pub struct ClipboardWriter {
 
 impl ClipboardWriter {
     pub fn new(
-        clipboard_type: ClipboardType,
         config_dir: PathBuf,
         max_uncompressed_size_bytes: u64,
         clipboard_fetch_tx: mpsc::Sender<data::ClipboardFetch>,
     ) -> Self {
         Self {
-            clipboard_type,
             config_dir,
             max_uncompressed_size_bytes,
             clipboard_fetch_tx,
@@ -542,7 +536,6 @@ impl ClipboardWriterTrait for ClipboardWriter {
     /// Advertises with the local environment that we have a new clipboard entry available
     fn store_types(&self, types: Vec<String>) -> Result<()> {
         write_clipboard(
-            self.clipboard_type.clone(),
             types,
             self.clipboard_fetch_tx.clone(),
             self.config_dir.clone(),

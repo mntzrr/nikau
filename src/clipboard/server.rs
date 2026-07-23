@@ -61,7 +61,6 @@ impl LocalClipboard {
         let reader = wayland::reader::ClipboardReader::new()?;
         let (clipboard_fetch_tx, clipboard_fetch_rx) = mpsc::channel::<data::ClipboardFetch>(32);
         let writer = wayland::writer::ClipboardWriter::new(
-            wayland::writer::ClipboardType::Regular,
             config_dir,
             max_uncompressed_size_bytes,
             clipboard_fetch_tx,
