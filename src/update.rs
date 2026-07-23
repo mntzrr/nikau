@@ -168,6 +168,10 @@ pub fn run(force: bool, low_priority: bool, protocol_constraint: Option<u64>) ->
         .arg("--root")
         .arg(&staging)
         .arg("--force")
+        // cargo warns when the install root's bin/ isn't on PATH. The staging
+        // root is transient (the binary is renamed out of it below), so put it
+        // on PATH just for this subprocess to silence the misleading warning.
+        .env("PATH", path_with(staging.join("bin")))
         .status()
         .context("Failed to run cargo install")?;
     if !status.success() {
@@ -342,6 +346,15 @@ fn place_binary_atomically(from: &Path, to: &Path) -> Result<()> {
     })
 }
 
+/// PATH with `dir` prepended, for a subprocess (see the cargo install call).
+fn path_with(dir: PathBuf) -> std::ffi::OsString {
+    let mut paths = vec![dir];
+    if let Some(path) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&path));
+    }
+    std::env::join_paths(paths).expect("PATH entries can't contain NUL")
+}
+
 /// cargo from PATH if runnable, else the rustup default location (PATH can be
 /// minimal depending on how monux was launched).
 fn find_cargo() -> Result<PathBuf> {
@@ -470,6 +483,16 @@ mod tests {
         // lets a pure server (nothing rewrites its file) update again.
         assert_eq!(server_protocol_constraint_fresh(&dir, Duration::ZERO), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn path_with_prepends_the_dir_and_preserves_path() {
+        let path = path_with(PathBuf::from("/tmp/monux-staging-bin"));
+        let paths: Vec<PathBuf> = std::env::split_paths(&path).collect();
+        assert_eq!(paths[0], PathBuf::from("/tmp/monux-staging-bin"));
+        let original: Vec<PathBuf> =
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
+        assert_eq!(&paths[1..], original.as_slice());
     }
 
     #[test]
