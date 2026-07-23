@@ -1617,6 +1617,33 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         Ok(())
     }
 
+    /// Fails an unservable clipboard content request fast: a local
+    /// requester's oneshot gets an empty answer (dropping it un-answered
+    /// surfaces as a stalled paste and a 'channel closed' error on the
+    /// fetching side), a remote requester gets the empty reply message its
+    /// own fetch would produce on timeout.
+    async fn fail_clipboard_fetch(
+        &mut self,
+        request_source: ClipboardRequestSource,
+        requested_type: &str,
+        request_id: Option<u64>,
+    ) {
+        match request_source {
+            ClipboardRequestSource::Local(tx) => {
+                let _ = tx.send(data::ClipboardData {
+                    requested_type: requested_type.to_string(),
+                    data_type: None,
+                    bytes: vec![],
+                    remaining_bytes: 0,
+                });
+            }
+            ClipboardRequestSource::Remote(client) => {
+                self.reply_empty_clipboard_fetch(&client, requested_type, request_id.unwrap_or(0))
+                    .await;
+            }
+        }
+    }
+
     /// Routes a request for clipboard content to a remote client or a local application.
     /// Fetches that can't be served get an immediate empty reply, so the
     /// requester's paste fails fast instead of waiting out its fetch timeout.
@@ -1632,16 +1659,14 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         let target = match &self.clipboard_target {
             Some(c) => c,
             None => {
-                if let ClipboardRequestSource::Remote(client) = &request_source {
-                    let client = *client;
-                    self.reply_empty_clipboard_fetch(&client, requested_type, request_id.unwrap_or(0))
-                        .await;
-                }
-                bail!(
+                let err = anyhow!(
                     "No clipboard types available: request from {} for requested type {}",
                     request_source,
                     requested_type
                 );
+                self.fail_clipboard_fetch(request_source, requested_type, request_id)
+                    .await;
+                return Err(err);
             }
         };
         // Sanity check: Is the requested type among the list of supported types?
@@ -1654,11 +1679,8 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                 request_source,
                 target.types
             );
-            if let ClipboardRequestSource::Remote(client) = &request_source {
-                let client = *client;
-                self.reply_empty_clipboard_fetch(&client, requested_type, request_id.unwrap_or(0))
-                    .await;
-            }
+            self.fail_clipboard_fetch(request_source, requested_type, request_id)
+                .await;
             return Err(err);
         }
 
@@ -1756,10 +1778,13 @@ impl<O: device::output::OutputHandler> Rotation<O> {
                 // The monux server process is getting asked for a clipboard from itself.
                 // The server should only locally serve clipboards from remote clients, but there isn't one.
                 // This may mean that the serving client disconnected, but we should have cleared the status.
-                bail!(
+                let err = anyhow!(
                     "Server got local clipboard request against itself? current_clipboard={:?}",
                     target
                 );
+                self.fail_clipboard_fetch(request_source, requested_type, request_id)
+                    .await;
+                return Err(err);
             };
             // Echo the requesting client's id back in the response.
             let request_id = match request_id {
@@ -2001,6 +2026,14 @@ impl<O: device::output::OutputHandler> Rotation<O> {
     /// Goes through the steps of notifying the new client that it's active (if new_client is Some),
     /// then notifying any old client that it's inactive (if old_client is Some).
     async fn update_current_client(&mut self, new_client: Option<SocketAddr>) {
+        // A switch settles the clipboard state: apply any local update held
+        // for the debounce's trailing edge BEFORE the clipboard reconcile
+        // below. Otherwise switching away and back inside the debounce window
+        // re-advertises the stale pre-copy target on the server, leaving
+        // monux's writer owning the selection while the target says the
+        // server itself owns the clipboard — every local paste then fails
+        // 'against itself' until the next copy.
+        self.flush_pending_local_clipboard().await;
         // Either we automatically reenabled a client, or the user manually did.
         // In either case, clear up any history of previously enabled disconnected clients.
         self.removed_current_client = None;
@@ -4148,6 +4181,65 @@ mod tests {
         rotation.clipboard_clear().await;
         assert!(rx.await.is_err());
         assert!(rotation.pending_clipboard_requests.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn local_paste_fetch_gets_empty_answer_not_dropped_channel() {
+        let (dir, mut rotation) = clipboard_rotation("clip-local-fail-fast").await;
+
+        // No clipboard at all: an unservable local paste must be answered
+        // empty, not dropped — a dropped oneshot surfaces as 'channel closed'
+        // on the fetching side and the paste stalls for the fetch timeout.
+        let (tx, rx) = oneshot::channel::<data::ClipboardData>();
+        let result = rotation
+            .clipboard_request_content(ClipboardRequestSource::Local(tx), "text/plain", 1024, None)
+            .await;
+        assert!(result.is_err());
+        let answered = rx.await.expect("the fetch must be answered, not dropped");
+        assert!(answered.bytes.is_empty());
+
+        // The server is tracked as owning the clipboard, yet a local paste
+        // fetch arrived (a stale monux advertisement was still up): the same
+        // fail-fast answer, instead of the 'against itself' drop.
+        rotation
+            .clipboard_update_source(None, vec!["text/plain".to_string()], 1024)
+            .await
+            .unwrap();
+        let (tx, rx) = oneshot::channel::<data::ClipboardData>();
+        let result = rotation
+            .clipboard_request_content(ClipboardRequestSource::Local(tx), "text/plain", 1024, None)
+            .await;
+        assert!(result.is_err());
+        let answered = rx.await.expect("the fetch must be answered, not dropped");
+        assert!(answered.bytes.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn switch_flushes_held_local_clipboard_update() {
+        let (dir, mut rotation) = clipboard_rotation("clip-switch-flush").await;
+
+        rotation
+            .clipboard_update_source(None, vec!["one".to_string()], 1024)
+            .await
+            .unwrap();
+        // A second local copy inside the debounce window is held for the
+        // trailing edge.
+        rotation
+            .clipboard_update_source(None, vec!["two".to_string()], 1024)
+            .await
+            .unwrap();
+        assert!(rotation.pending_local_clipboard.is_some());
+        // A switch settles the held state immediately: otherwise switching
+        // away and back inside the window reconciles (and re-advertises) the
+        // stale pre-copy target over the new local clipboard.
+        rotation.update_current_client(None).await;
+        assert!(rotation.pending_local_clipboard.is_none());
+        assert_eq!(
+            rotation.clipboard_target.as_ref().unwrap().types,
+            vec!["two".to_string()]
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
