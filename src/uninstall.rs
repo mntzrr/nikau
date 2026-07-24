@@ -275,6 +275,30 @@ fn remove_hotspot_profile() {
         .args(["nmcli", "connection", "delete", setup::HOTSPOT_CON_NAME])
         .status();
     println!("Removed the '{}' NetworkManager profile (if it was installed).", setup::HOTSPOT_CON_NAME);
+    // The VPN workaround rules setup may have installed: the tagged rule in
+    // Mullvad's table, and the policy rule by its priority. Best-effort —
+    // anything already gone is skipped silently.
+    let priority = setup::VPN_WORKAROUND_RULE_PRIORITY.to_string();
+    let _ = Command::new("sudo")
+        .args(["ip", "rule", "del", "priority", &priority])
+        .status();
+    if let Some(list) = sudo_output(&["nft", "-a", "list", "table", "inet", "mullvad"]) {
+        for handle in setup::monux_rule_handles(&list) {
+            let rule = format!("delete rule inet mullvad forward handle {}", handle);
+            let _ = Command::new("sudo").args(["nft", &rule]).status();
+        }
+    }
+}
+
+/// Runs sudo non-interactively with output captured; None when sudo needs a
+/// password or the command fails (best-effort cleanup treats it as "skip").
+fn sudo_output(args: &[&str]) -> Option<String> {
+    let out = Command::new("sudo").arg("-n").args(args).output().ok()?;
+    if out.status.success() {
+        Some(String::from_utf8_lossy(&out.stdout).to_string())
+    } else {
+        None
+    }
 }
 
 /// Asks any running monux server and client to shut down gracefully, waiting

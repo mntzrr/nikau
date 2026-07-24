@@ -40,6 +40,78 @@ pub(crate) const SYSCTL_BUF_CONF_PATH: &str = "/etc/sysctl.d/90-monux-udp-buffer
 /// keeps uninstall trivial: delete the profile.
 pub(crate) const HOTSPOT_CON_NAME: &str = "monux-direct";
 
+/// Priority of the policy rule that routes the hotspot subnet around a VPN
+/// (one above Mullvad's 32764 suppress rule, so it wins).
+pub(crate) const VPN_WORKAROUND_RULE_PRIORITY: u32 = 32763;
+
+/// The comment tag on the nftables rule we insert into Mullvad's table, so
+/// teardown finds it even after Mullvad regenerates everything around it.
+pub(crate) const VPN_WORKAROUND_COMMENT: &str = "monux-hotspot";
+
+/// Masks the host bits out of an "A.B.C.D/plen" address, yielding the subnet
+/// in the same form ("10.42.0.1/24" -> "10.42.0.0/24").
+fn subnet_of(addr: &str) -> Option<String> {
+    let (ip, plen) = addr.split_once('/')?;
+    let plen: u32 = plen.parse().ok()?;
+    if plen > 32 {
+        return None;
+    }
+    let octets: Vec<u8> = ip.split('.').map(|o| o.parse().ok()).collect::<Option<Vec<_>>>()?;
+    if octets.len() != 4 {
+        return None;
+    }
+    let addr_u32 = u32::from_be_bytes([octets[0], octets[1], octets[2], octets[3]]);
+    let mask = if plen == 0 { 0 } else { u32::MAX << (32 - plen) };
+    let net = addr_u32 & mask;
+    Some(format!(
+        "{}.{}.{}.{}/{}",
+        (net >> 24) & 0xff,
+        (net >> 16) & 0xff,
+        (net >> 8) & 0xff,
+        net & 0xff,
+        plen
+    ))
+}
+
+/// Handles of our comment-tagged rules in `nft -a list table inet mullvad`
+/// output (the tag lets teardown find the rules after Mullvad rewrites the
+/// rest of its table).
+pub(crate) fn monux_rule_handles(nft_list_output: &str) -> Vec<u64> {
+    nft_list_output
+        .lines()
+        .filter(|line| line.contains(VPN_WORKAROUND_COMMENT))
+        .filter_map(|line| {
+            line.rsplit_once("handle ")
+                .and_then(|(_, handle)| handle.trim().parse().ok())
+        })
+        .collect()
+}
+
+/// The hotspot's live subnet: NetworkManager's shared mode assigns a 10.42.x
+/// address to the AP interface on activation. Polled briefly — the address
+/// can lag 'connection up' by a moment.
+fn hotspot_live_subnet() -> Option<String> {
+    for attempt in 0..4 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        let out = run_cmd("ip", &["-o", "-4", "addr", "show", "scope", "global"]).ok()?;
+        for line in out.lines() {
+            let tokens: Vec<&str> = line.split_whitespace().collect();
+            let Some(pos) = tokens.iter().position(|t| *t == "inet") else {
+                continue;
+            };
+            let Some(addr) = tokens.get(pos + 1) else {
+                continue;
+            };
+            if addr.starts_with("10.42.") {
+                return subnet_of(addr);
+            }
+        }
+    }
+    None
+}
+
 /// Where per-user systemd units live, relative to the target user's home.
 const SYSTEMD_USER_UNIT_DIR: &str = ".config/systemd/user";
 
@@ -841,6 +913,81 @@ fn tunnel_iface_names(ip_link_output: &str) -> Vec<String> {
         .collect()
 }
 
+/// Installs the workaround for Mullvad's VPN breaking the hotspot client's
+/// internet: accept forwards from the hotspot subnet in Mullvad's own forward
+/// chain (its drop hooks see all forwarded traffic, so the accept must live
+/// in ITS table), and policy-route the subnet via the main table so the
+/// client's traffic exits through the router like un-VPN'd traffic instead of
+/// the tunnel. Best-effort and idempotent; a tunnel bounce wipes Mullvad's
+/// table, so re-running setup re-installs (noted in the output).
+fn install_vpn_workaround(failures: &mut u32) {
+    let subnet = match hotspot_live_subnet() {
+        Some(subnet) => subnet,
+        None => {
+            println!("[warn] hotspot: couldn't read the hotspot subnet yet; re-run 'monux system setup --hotspot' once the AP is up to install the VPN workaround");
+            return;
+        }
+    };
+    // nftables: accept forwards from the hotspot subnet, tagged for teardown.
+    let list = run_cmd("nft", &["-a", "list", "table", "inet", "mullvad"]).unwrap_or_default();
+    if list.contains(&subnet) {
+        println!("[ok]   hotspot: VPN forward rule already installed");
+    } else {
+        let rule = format!(
+            "insert rule inet mullvad forward ip saddr {} accept comment \"{}\"",
+            subnet, VPN_WORKAROUND_COMMENT
+        );
+        match run_cmd("nft", &[&rule]) {
+            Ok(_) => println!(
+                "[done] hotspot: Mullvad VPN workaround installed (forward-accept for {} in its table)",
+                subnet
+            ),
+            Err(e) => {
+                *failures += 1;
+                println!("[fail] hotspot: could not install the VPN forward rule: {}", e);
+            }
+        }
+    }
+    // Policy routing: the hotspot subnet uses the main table (router), ahead
+    // of Mullvad's rules — the client's internet no longer depends on the
+    // tunnel at all.
+    let rules = run_cmd("ip", &["rule", "show"]).unwrap_or_default();
+    if rules.contains(&subnet) {
+        println!("[ok]   hotspot: hotspot subnet already routed around the VPN");
+    } else {
+        let priority = VPN_WORKAROUND_RULE_PRIORITY.to_string();
+        let from = format!("from {}", subnet);
+        match run_cmd("ip", &["rule", "add", &from, "lookup", "main", "priority", &priority]) {
+            Ok(_) => println!(
+                "[done] hotspot: hotspot subnet routed around the VPN (ip rule priority {})",
+                priority
+            ),
+            Err(e) => {
+                *failures += 1;
+                println!("[fail] hotspot: could not add the ip rule: {}", e);
+            }
+        }
+    }
+    println!("[note] hotspot: Mullvad regenerates its firewall when the tunnel reconnects; re-run 'monux system setup --hotspot' then to re-install the workaround");
+}
+
+/// Removes the VPN workaround pieces (tagged nft rule + the policy rule).
+/// Best-effort: anything already gone (e.g. Mullvad rewrote its table) is
+/// skipped silently.
+pub(crate) fn remove_vpn_workaround() {
+    if let Ok(list) = run_cmd("nft", &["-a", "list", "table", "inet", "mullvad"]) {
+        for handle in monux_rule_handles(&list) {
+            let rule = format!("delete rule inet mullvad forward handle {}", handle);
+            let _ = run_cmd("nft", &[&rule]);
+        }
+    }
+    let priority = VPN_WORKAROUND_RULE_PRIORITY.to_string();
+    let rules = run_cmd("ip", &["rule", "show"]).unwrap_or_default();
+    if rules.contains(&format!("{}:", priority)) {
+        let _ = run_cmd("ip", &["rule", "del", "priority", &priority]);
+    }
+}
+/// NATs the peer through this machine, so its internet keeps working over the
 /// Hosts the 'monux-direct' WiFi hotspot (--hotspot, server side): the KVM
 /// link then bypasses the router entirely. NetworkManager's shared IPv4 mode
 /// NATs the peer through this machine, so its internet keeps working over the
@@ -865,19 +1012,15 @@ fn setup_hotspot(failures: &mut u32) {
     }
     // A VPN tunnel on this machine (Mullvad/WireGuard/OpenVPN) hijacks
     // routing and drops forwarded packets: the KVM link would work, but the
-    // NAT that gives hotspot clients internet would not. Warn loudly now
-    // rather than letting the client lose internet mysteriously.
-    if let Ok(out) = run_cmd("ip", &["-o", "link", "show", "up"]) {
-        let tunnels = tunnel_iface_names(&out);
-        if !tunnels.is_empty() {
-            println!(
-                "[warn] hotspot: VPN tunnel(s) up ({}): a VPN's policy routing and forward-dropping firewall typically break the NAT that gives hotspot clients internet — the KVM link will work, the client's internet may not. Disconnect the VPN while using the hotspot (see README).",
-                tunnels.join(", ")
-            );
-        }
-    }
+    // NAT that gives hotspot clients internet would not. Mullvad's layout is
+    // auto-fixed after the profile is up (install_vpn_workaround); anything
+    // else gets a loud warning.
+    let tunnels = run_cmd("ip", &["-o", "link", "show", "up"])
+        .map(|out| tunnel_iface_names(&out))
+        .unwrap_or_default();
     if nmcli_con_exists(HOTSPOT_CON_NAME) {
         println!("[ok]   hotspot: profile '{}' already exists", HOTSPOT_CON_NAME);
+        handle_vpn_after_up(&tunnels, failures);
         return;
     }
     let ifname = match run_cmd("iw", &["dev"]) {
@@ -923,8 +1066,26 @@ fn setup_hotspot(failures: &mut u32) {
         return;
     }
     println!("[done] hotspot: hosting '{}' (WPA2) on {} — the KVM link now bypasses the router", ssid, ifname);
+    handle_vpn_after_up(&tunnels, failures);
     println!("       Join the other machine with: sudo monux system setup --hotspot-join '{}' '{}'", ssid, psk);
     println!("       Its internet keeps working through this machine (NAT); the WiFi may hiccup for a second while the AP starts. Revert with: sudo nmcli connection delete {}", HOTSPOT_CON_NAME);
+}
+
+/// After the AP is up: install the Mullvad workaround when its table is
+/// present (the only layout we can auto-fix), otherwise warn loudly — the KVM
+/// link works either way, but the hotspot client's internet rides on it.
+fn handle_vpn_after_up(tunnels: &[String], failures: &mut u32) {
+    if tunnels.is_empty() {
+        return;
+    }
+    if run_cmd("nft", &["list", "table", "inet", "mullvad"]).is_ok() {
+        install_vpn_workaround(failures);
+    } else {
+        println!(
+            "[warn] hotspot: VPN tunnel(s) up ({}): a VPN's policy routing and forward-dropping firewall typically break the NAT that gives hotspot clients internet — the KVM link will work, the client's internet may not. Only Mullvad's layout is auto-fixed (no 'inet mullvad' table found); disconnect the VPN while using the hotspot (see README).",
+            tunnels.join(", ")
+        );
+    }
 }
 
 /// Joins this machine to the other machine's 'monux-direct' hotspot
@@ -971,8 +1132,11 @@ fn setup_hotspot_join(ssid: &str, psk: &str, failures: &mut u32) {
 
 /// Removes the hotspot profile (either role) without touching anything else
 /// (`--hotspot off`): the targeted undo for the hotspot steps, as opposed to
-/// 'monux system uninstall', which removes the whole installation.
+/// 'monux system uninstall', which removes the whole installation. Also
+/// removes the VPN workaround rules, which linger independently of the
+/// profile.
 fn remove_hotspot(failures: &mut u32) {
+    remove_vpn_workaround();
     if !nmcli_con_exists(HOTSPOT_CON_NAME) {
         println!("[ok]   hotspot: no '{}' profile installed", HOTSPOT_CON_NAME);
         return;
@@ -1108,6 +1272,26 @@ mod tests {
         assert!(tunnel_iface_names(plain).is_empty());
         // 'wgp0' starts with 'wg' too (prefix match, like VIRTUAL_IFACE_PREFIXES).
         assert_eq!(tunnel_iface_names("2: wgpia0: <POINTOPOINT,UP>\n"), vec!["wgpia0".to_string()]);
+    }
+
+    #[test]
+    fn subnet_masks_host_bits() {
+        assert_eq!(subnet_of("10.42.0.1/24"), Some("10.42.0.0/24".to_string()));
+        assert_eq!(subnet_of("192.168.1.187/24"), Some("192.168.1.0/24".to_string()));
+        assert_eq!(subnet_of("10.64.1.5/16"), Some("10.64.0.0/16".to_string()));
+        assert_eq!(subnet_of("10.42.0.1/32"), Some("10.42.0.1/32".to_string()));
+        assert_eq!(subnet_of("10.42.0.1/33"), None);
+        assert_eq!(subnet_of("not-an-address"), None);
+        assert_eq!(subnet_of("10.42.0.300/24"), None);
+    }
+
+    #[test]
+    fn tagged_rule_handles_are_found() {
+        let list = "table inet mullvad {\n\tchain forward {\n\t\ttype filter hook forward priority filter; policy drop;\n\t\tip saddr 10.42.0.0/24 accept comment \"monux-hotspot\" # handle 7\n\t\tct state established,related accept # handle 2\n\t}\n}\n";
+        assert_eq!(monux_rule_handles(list), vec![7]);
+        let untagged = "table inet mullvad {\n\tchain forward {\n\t\tct state established,related accept # handle 2\n\t}\n}\n";
+        assert!(monux_rule_handles(untagged).is_empty());
+        assert!(monux_rule_handles("").is_empty());
     }
 
     #[test]
