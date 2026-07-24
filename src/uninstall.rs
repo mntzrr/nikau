@@ -69,6 +69,7 @@ fn plan(home: &Path, current_exe: &Path) -> Plan {
         PathBuf::from(setup::MODULES_LOAD_PATH),
         PathBuf::from(setup::NM_POWERSAVE_CONF_PATH),
         PathBuf::from(setup::SYSCTL_BUF_CONF_PATH),
+        PathBuf::from(setup::IP_FORWARD_SYSCTL_PATH),
     ];
     plan_impl(
         home,

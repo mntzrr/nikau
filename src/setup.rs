@@ -35,6 +35,11 @@ pub(crate) const UDEV_RULE_PATH: &str = "/etc/udev/rules.d/99-monux-uinput.rules
 pub(crate) const MODULES_LOAD_PATH: &str = "/etc/modules-load.d/monux-uinput.conf";
 pub(crate) const SYSCTL_BUF_CONF_PATH: &str = "/etc/sysctl.d/90-monux-udp-buffers.conf";
 
+/// Persistent net.ipv4.ip_forward enablement for the hotspot's NAT (NM shared
+/// mode can set it too, but a VPN teardown can reset the live value behind
+/// everyone's back — the drop-in re-asserts it on every boot).
+pub(crate) const IP_FORWARD_SYSCTL_PATH: &str = "/etc/sysctl.d/90-monux-ip-forward.conf";
+
 /// Name of the NetworkManager connection profile for the direct, routerless
 /// KVM link (see setup_hotspot / setup_hotspot_join). One name for both roles
 /// keeps uninstall trivial: delete the profile.
@@ -85,6 +90,13 @@ pub(crate) fn monux_rule_handles(nft_list_output: &str) -> Vec<u64> {
                 .and_then(|(_, handle)| handle.trim().parse().ok())
         })
         .collect()
+}
+
+/// Whether the hotspot profile exists AND its AP is currently up.
+fn hotspot_profile_active() -> bool {
+    run_cmd("nmcli", &["-t", "-f", "NAME", "connection", "show", "--active"])
+        .map(|out| out.lines().any(|line| line == HOTSPOT_CON_NAME))
+        .unwrap_or(false)
 }
 
 /// The hotspot's live subnet: NetworkManager's shared mode assigns a 10.42.x
@@ -913,6 +925,42 @@ fn tunnel_iface_names(ip_link_output: &str) -> Vec<String> {
         .collect()
 }
 
+/// Enables IPv4 forwarding, persistently and immediately: the hotspot's NAT
+/// needs it to give clients internet. The live sysctl is shared global state
+/// (a VPN teardown can reset it behind our back), so it is also verified
+/// after the AP comes up (verify_ip_forward_still_on).
+fn ensure_ip_forward(failures: &mut u32) {
+    if read_proc_sysctl("/proc/sys/net/ipv4/ip_forward") == Some(1) {
+        println!("[ok]   ip forward: already enabled");
+        return;
+    }
+    if let Err(e) = std::fs::write(IP_FORWARD_SYSCTL_PATH, "net.ipv4.ip_forward = 1\n") {
+        *failures += 1;
+        println!("[fail] ip forward: could not write {}: {}", IP_FORWARD_SYSCTL_PATH, e);
+        return;
+    }
+    println!("[done] ip forward: wrote {}", IP_FORWARD_SYSCTL_PATH);
+    match run_cmd("sysctl", &["-w", "net.ipv4.ip_forward=1"]) {
+        Ok(_) => println!("[done] ip forward: enabled immediately"),
+        Err(e) => {
+            *failures += 1;
+            println!("[fail] ip forward: persisted but immediate apply failed (takes effect on reboot): {}", e);
+        }
+    }
+}
+
+/// Post-activation check: a VPN (or its teardown) can flip ip_forward back
+/// off after we enabled it, silently killing the hotspot's NAT. Catch that
+/// state and say exactly how to fix it instead of letting the client lose
+/// internet mysteriously.
+fn verify_ip_forward_still_on(failures: &mut u32) {
+    if read_proc_sysctl("/proc/sys/net/ipv4/ip_forward") == Some(1) {
+        return;
+    }
+    *failures += 1;
+    println!("[fail] ip forward: net.ipv4.ip_forward is OFF although the hotspot is up — hotspot clients get no internet in this state. Something (VPN teardown?) reset it after it was enabled. Fix with: sudo sysctl -w net.ipv4.ip_forward=1 (or re-run 'monux system setup --hotspot')");
+}
+
 /// Installs the workaround for Mullvad's VPN breaking the hotspot client's
 /// internet: accept forwards from the hotspot subnet in Mullvad's own forward
 /// chain (its drop hooks see all forwarded traffic, so the accept must live
@@ -1010,6 +1058,9 @@ fn setup_hotspot(failures: &mut u32) {
         println!("[skip] hotspot: the WiFi card does not support AP mode (no '#{{ AP }}' in its valid interface combinations)");
         return;
     }
+    // The NAT that gives hotspot clients internet needs kernel forwarding;
+    // a VPN teardown can have left it off.
+    ensure_ip_forward(failures);
     // A VPN tunnel on this machine (Mullvad/WireGuard/OpenVPN) hijacks
     // routing and drops forwarded packets: the KVM link would work, but the
     // NAT that gives hotspot clients internet would not. Mullvad's layout is
@@ -1020,6 +1071,9 @@ fn setup_hotspot(failures: &mut u32) {
         .unwrap_or_default();
     if nmcli_con_exists(HOTSPOT_CON_NAME) {
         println!("[ok]   hotspot: profile '{}' already exists", HOTSPOT_CON_NAME);
+        if hotspot_profile_active() {
+            verify_ip_forward_still_on(failures);
+        }
         handle_vpn_after_up(&tunnels, failures);
         return;
     }
@@ -1066,6 +1120,7 @@ fn setup_hotspot(failures: &mut u32) {
         return;
     }
     println!("[done] hotspot: hosting '{}' (WPA2) on {} — the KVM link now bypasses the router", ssid, ifname);
+    verify_ip_forward_still_on(failures);
     handle_vpn_after_up(&tunnels, failures);
     println!("       Join the other machine with: sudo monux system setup --hotspot-join '{}' '{}'", ssid, psk);
     println!("       Its internet keeps working through this machine (NAT); the WiFi may hiccup for a second while the AP starts. Revert with: sudo nmcli connection delete {}", HOTSPOT_CON_NAME);
@@ -1137,6 +1192,17 @@ fn setup_hotspot_join(ssid: &str, psk: &str, failures: &mut u32) {
 /// profile.
 fn remove_hotspot(failures: &mut u32) {
     remove_vpn_workaround();
+    match std::fs::remove_file(IP_FORWARD_SYSCTL_PATH) {
+        Ok(()) => println!(
+            "[done] ip forward: removed {} (the live sysctl is left alone — other tools like docker or a VPN may need it on)",
+            IP_FORWARD_SYSCTL_PATH
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            *failures += 1;
+            println!("[fail] ip forward: could not remove {}: {}", IP_FORWARD_SYSCTL_PATH, e);
+        }
+    }
     if !nmcli_con_exists(HOTSPOT_CON_NAME) {
         println!("[ok]   hotspot: no '{}' profile installed", HOTSPOT_CON_NAME);
         return;
