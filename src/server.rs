@@ -34,6 +34,12 @@ impl std::error::Error for VersionMismatch {}
 /// How often to repeat the friendly refusal log for the same client.
 const REFUSAL_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
+/// How often the background hotspot-credentials probe re-reads the
+/// NetworkManager profile state (see run_server_events_loop). The profile
+/// rarely changes; this only bounds how long a setup/teardown takes to be
+/// advertised.
+const HOTSPOT_PROBE_INTERVAL: Duration = Duration::from_secs(30);
+
 /// Tracks per-client protocol versions so a version-mismatched client reads
 /// like the self-healing flow it is (it will auto-update and return), not
 /// like a broken connection erroring every few seconds — and so the moment
@@ -117,6 +123,24 @@ pub async fn run_server_events_loop<O: output::OutputHandler>(
 
     let mut rotation =
         rotation::Rotation::new(grab_tx, output_handler, local_clipboard, &config_dir, rotation_tx, motion_mode, throttle_mode, mode, diagnostics).await?;
+    // The hotspot credential probe runs nmcli subprocesses, which can block
+    // for many seconds on a busy NetworkManager (WiFi churn, profile
+    // activation): it must NEVER run on the rotation loop — a parked probe
+    // there swallows all grabbed input and stalls client accepts. This
+    // refresher keeps the shared slot warm off-loop; the advertisement path
+    // only reads the slot.
+    {
+        let slot = rotation.hotspot_credentials_handle();
+        task::spawn(async move {
+            loop {
+                let creds = task::spawn_blocking(crate::setup::active_hotspot_credentials)
+                    .await
+                    .unwrap_or(None);
+                *slot.lock().unwrap_or_else(|e| e.into_inner()) = creds;
+                time::sleep(HOTSPOT_PROBE_INTERVAL).await;
+            }
+        });
+    }
     if let Some(tx) = edge_client_tx {
         rotation.set_edge_client_publisher(tx);
     }

@@ -533,6 +533,19 @@ pub(crate) fn run_cmd(program: &str, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+/// Runs a command with a hard timeout (via coreutils `timeout`). A busy
+/// NetworkManager can park nmcli on D-Bus for many seconds (WiFi churn,
+/// profile activation), and callers near critical paths must not inherit
+/// that stall; expiry (exit 124) is just a command failure to them.
+pub(crate) fn run_cmd_timeout(program: &str, args: &[&str], timeout_secs: u32) -> Result<String> {
+    let secs = timeout_secs.to_string();
+    let full_args: Vec<&str> = std::iter::once(secs.as_str())
+        .chain(std::iter::once(program))
+        .chain(args.iter().copied())
+        .collect();
+    run_cmd("timeout", &full_args)
+}
+
 /// Checks `id -nG` output for group membership.
 fn groups_contain(id_ng_output: &str, group: &str) -> bool {
     id_ng_output
@@ -949,13 +962,13 @@ fn remove_hotspot(failures: &mut u32) {
 /// the AP is currently up: advertising a down hotspot would flap clients
 /// between profiles. Reading the passphrase needs root (the server has it).
 pub fn active_hotspot_credentials() -> Option<(String, String)> {
-    let active = run_cmd("nmcli", &["-t", "-f", "NAME", "connection", "show", "--active"])
+    let active = run_cmd_timeout("nmcli", &["-t", "-f", "NAME", "connection", "show", "--active"], 5)
         .map(|out| out.lines().any(|line| line == HOTSPOT_CON_NAME))
         .unwrap_or(false);
     if !active {
         return None;
     }
-    let out = run_cmd(
+    let out = run_cmd_timeout(
         "nmcli",
         &[
             "--show-secrets",
@@ -966,6 +979,7 @@ pub fn active_hotspot_credentials() -> Option<(String, String)> {
             "show",
             HOTSPOT_CON_NAME,
         ],
+        5,
     )
     .ok()?;
     parse_hotspot_credentials(&out)
@@ -1062,6 +1076,17 @@ mod tests {
         // No easily-confused characters ever appear.
         assert!(!psk.contains('0') && !psk.contains('1') && !psk.contains('l') && !psk.contains('o'));
         assert_eq!(psk_from_bytes(&[9; 16]), psk_from_bytes(&[9; 16]));
+    }
+
+    #[test]
+    fn run_cmd_timeout_bounds_execution() {
+        assert!(run_cmd_timeout("true", &[], 1).is_ok());
+        assert!(run_cmd_timeout("false", &[], 1).is_err());
+        // A command outliving the timeout fails (exit 124) in ~the timeout,
+        // not in the command's own sweet time.
+        let start = std::time::Instant::now();
+        assert!(run_cmd_timeout("sleep", &["10"], 1).is_err());
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
     }
 
     #[test]

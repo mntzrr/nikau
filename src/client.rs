@@ -1296,20 +1296,22 @@ fn provision_hotspot(ssid: String, psk: String) {
             debug!("Hotspot profile '{}' already exists; nothing to provision", con);
             return;
         }
-        let result = crate::setup::run_cmd(
+        let result = crate::setup::run_cmd_timeout(
             "nmcli",
             &[
                 "connection", "add", "type", "wifi", "con-name", con, "autoconnect", "yes",
                 "connection.autoconnect-priority", "10", "ssid", &ssid,
             ],
+            10,
         )
         .and_then(|_| {
-            crate::setup::run_cmd(
+            crate::setup::run_cmd_timeout(
                 "nmcli",
                 &["connection", "modify", con, "wifi-sec.key-mgmt", "wpa-psk", "wifi-sec.psk", &psk],
+                10,
             )
         })
-        .and_then(|_| crate::setup::run_cmd("nmcli", &["connection", "up", con]));
+        .and_then(|_| crate::setup::run_cmd_timeout("nmcli", &["connection", "up", con], 30));
         match result {
             Ok(_) => {
                 info!(
@@ -1333,7 +1335,7 @@ fn provision_hotspot(ssid: String, psk: String) {
                     ssid, e
                 );
                 // Don't leave a half-configured profile behind.
-                let _ = crate::setup::run_cmd("nmcli", &["connection", "delete", con]);
+                let _ = crate::setup::run_cmd_timeout("nmcli", &["connection", "delete", con], 10);
             }
         }
     });

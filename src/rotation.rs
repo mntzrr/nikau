@@ -629,11 +629,12 @@ pub struct Rotation<O: device::output::OutputHandler> {
     /// testable — ClientInfo embeds quinn handles and can't be fabricated in
     /// a unit test.
     link_quality: HashMap<SocketAddr, ClientLinkState>,
-    /// The 'monux-direct' hotspot credentials, probed lazily on the first
-    /// client connect (None = not probed yet, Some(None) = no active
-    /// hotspot). Advertised to every approved client so it can join the
-    /// direct link without the user copying anything (ServerEvent::HotspotInfo).
-    hotspot_credentials: Option<Option<(String, String)>>,
+    /// The 'monux-direct' hotspot credentials, shared with a background
+    /// refresher that probes nmcli OFF this loop (a busy NetworkManager can
+    /// park nmcli for seconds; a probe on this loop would swallow all grabbed
+    /// input and stall client accepts). None until the refresher finds an
+    /// active hotspot. Advertised to approved clients (ServerEvent::HotspotInfo).
+    hotspot_credentials: Arc<std::sync::Mutex<Option<(String, String)>>>,
     /// When the last next/prev switch was processed (see SWITCH_DEBOUNCE).
     last_switch_at: Option<Instant>,
     /// Per-client liveness tracking for the Ping/Pong check (see
@@ -885,7 +886,7 @@ impl<O: device::output::OutputHandler> Rotation<O> {
             motion_mode,
             throttle_mode,
             link_quality: HashMap::new(),
-            hotspot_credentials: None,
+            hotspot_credentials: Arc::new(std::sync::Mutex::new(None)),
             last_switch_at: None,
             liveness: HashMap::new(),
             pong_miss_limit: match mode {
@@ -999,16 +1000,26 @@ impl<O: device::output::OutputHandler> Rotation<O> {
         }
     }
 
+    /// Handle to the shared hotspot-credentials slot (see the field): the
+    /// server events loop feeds it with a background nmcli probe, so the
+    /// advertisement path below only ever reads memory — the rotation loop
+    /// never blocks on a subprocess.
+    pub fn hotspot_credentials_handle(&self) -> Arc<std::sync::Mutex<Option<(String, String)>>> {
+        self.hotspot_credentials.clone()
+    }
+
     /// Sends the 'monux-direct' hotspot credentials to a newly connected
     /// client (ServerEvent::HotspotInfo), so it can join the direct,
     /// routerless link without the user copying anything. No-op when no
     /// hotspot is active; the credentials travel only over this
     /// authenticated, encrypted connection to an already-approved client.
     async fn advertise_hotspot_info(&mut self, endpoint: &SocketAddr) {
-        if self.hotspot_credentials.is_none() {
-            self.hotspot_credentials = Some(crate::setup::active_hotspot_credentials());
-        }
-        let Some((ssid, psk)) = self.hotspot_credentials.clone().flatten() else {
+        let creds = self
+            .hotspot_credentials
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let Some((ssid, psk)) = creds else {
             return;
         };
         info!(
@@ -4357,6 +4368,20 @@ mod tests {
         let (dir, rotation) = clipboard_rotation("pinned-motion").await;
         // Pinned(None) = --motion-hz 0: every event, never an interval.
         assert_eq!(rotation.motion_flush_interval(), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn hotspot_advertisement_reads_the_slot_without_blocking() {
+        let (dir, mut rotation) = clipboard_rotation("hotspot-advertise").await;
+        let endpoint: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        // Empty slot (no active hotspot): a quiet no-op.
+        rotation.advertise_hotspot_info(&endpoint).await;
+        // Filled slot but the client is gone already: the lookup-miss path
+        // returns quietly instead of sending.
+        *rotation.hotspot_credentials_handle().lock().unwrap() =
+            Some(("monux-direct-x".to_string(), "psk".to_string()));
+        rotation.advertise_hotspot_info(&endpoint).await;
         let _ = fs::remove_dir_all(&dir);
     }
 
