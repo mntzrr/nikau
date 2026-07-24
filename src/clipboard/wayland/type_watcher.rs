@@ -12,6 +12,12 @@ use crate::clipboard::wayland::{common, state};
 /// Maximum backoff between reconnect attempts.
 const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(10);
 
+/// How long start() waits for the watcher's first readiness signal. The
+/// handshake must never deadlock a server start: a missed signal would
+/// otherwise leave the process parked before the rotation loop exists, with
+/// the keyboards already grabbed.
+const READY_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Task that listens for updates to the clipboard types (local cut or copy).
 /// Sends out an event when an update occurs, indicating a new clipboard is available.
 /// If wayland is unavailable, this returns Ok(None).
@@ -31,7 +37,7 @@ pub fn start(
         let mut backoff = Duration::from_secs(1);
         let mut signalled_ready = false;
         loop {
-            match connect_and_watch(&regular_types_tx) {
+            match connect_and_watch(&regular_types_tx, &thread_ready_tx, &mut signalled_ready) {
                 WatchOutcome::Unavailable => {
                     if !signalled_ready {
                         let _ = thread_ready_tx.send(());
@@ -53,8 +59,20 @@ pub fn start(
             }
         }
     });
-    thread_ready_rx.recv()?;
-    Ok(Some(()))
+    // Bounded handshake: the watcher signals on its first outcome — connected,
+    // unavailable, or error — but a startup must never hinge on that signal
+    // arriving. On timeout, start without clipboard sharing rather than
+    // deadlocking the server with the keyboards already grabbed.
+    match thread_ready_rx.recv_timeout(READY_HANDSHAKE_TIMEOUT) {
+        Ok(()) => Ok(Some(())),
+        Err(e) => {
+            warn!(
+                "Wayland clipboard type watcher did not report readiness ({}); clipboard sharing disabled",
+                e
+            );
+            Ok(None)
+        }
+    }
 }
 
 /// Result of one connect + watch cycle.
@@ -67,9 +85,15 @@ enum WatchOutcome {
 
 /// Connects to wayland, sets up the clipboard registry, and dispatches events
 /// until the connection is lost. Returns Unavailable if wayland or the
-/// clipboard protocols aren't present, Error on a dispatch failure.
+/// clipboard protocols aren't present, Error on a dispatch failure. Signals
+/// readiness on the FIRST successful connect too: previously only the
+/// Unavailable/Error arms signalled, so a first-try success (a healthy,
+/// fast compositor — e.g. right after a reboot) left start()'s readiness
+/// recv blocked forever, deadlocking the server with the keyboards grabbed.
 fn connect_and_watch(
     regular_types_tx: &Option<watch::Sender<Vec<String>>>,
+    thread_ready_tx: &std::sync::mpsc::SyncSender<()>,
+    signalled_ready: &mut bool,
 ) -> WatchOutcome {
     let conn = match Connection::connect_to_env() {
         Ok(conn) => conn,
@@ -110,6 +134,12 @@ fn connect_and_watch(
         return WatchOutcome::Error(e);
     }
     info!("Wayland clipboard type watcher connected");
+    // Report readiness on the first successful connect as well (see the fn
+    // docs): start()'s recv unblocks here, on Unavailable, or on first Error.
+    if !*signalled_ready {
+        *signalled_ready = true;
+        let _ = thread_ready_tx.send(());
+    }
     loop {
         if let Err(e) = queue.blocking_dispatch(&mut state) {
             return WatchOutcome::Error(anyhow::anyhow!(
