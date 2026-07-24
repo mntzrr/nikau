@@ -276,6 +276,10 @@ fn remove_hotspot_profile() {
         .args(["nmcli", "connection", "delete", setup::HOTSPOT_CON_NAME])
         .status();
     println!("Removed the '{}' NetworkManager profile (if it was installed).", setup::HOTSPOT_CON_NAME);
+    // The dedicated AP interface (a kernel vif) goes too; absent is fine.
+    let _ = Command::new("sudo")
+        .args(["iw", "dev", setup::AP_IFACE_NAME, "del"])
+        .status();
     // The VPN workaround rules setup may have installed: the tagged rule in
     // Mullvad's table, and the policy rule by its priority. Best-effort —
     // anything already gone is skipped silently.

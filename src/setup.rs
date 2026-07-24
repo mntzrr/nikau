@@ -53,6 +53,42 @@ pub(crate) const VPN_WORKAROUND_RULE_PRIORITY: u32 = 32763;
 /// teardown finds it even after Mullvad regenerates everything around it.
 pub(crate) const VPN_WORKAROUND_COMMENT: &str = "monux-hotspot";
 
+/// Name of the dedicated AP interface the hotspot runs on. Binding the AP
+/// profile to wlan0 itself makes NetworkManager REPLACE the managed
+/// connection with the AP (one profile per netdev), killing the host's own
+/// internet — the managed+AP combo the card supports only happens with a
+/// second virtual interface. Kernel vifs don't persist across reboots;
+/// re-running setup recreates this one.
+pub(crate) const AP_IFACE_NAME: &str = "monux-ap";
+
+/// Creates the dedicated AP interface for the hotspot (idempotent).
+fn ensure_ap_interface(wifi_ifname: &str, failures: &mut u32) -> bool {
+    if run_cmd("ip", &["link", "show", AP_IFACE_NAME]).is_ok() {
+        println!("[ok]   hotspot: AP interface {} already exists", AP_IFACE_NAME);
+        return true;
+    }
+    match run_cmd(
+        "iw",
+        &["dev", wifi_ifname, "interface", "add", AP_IFACE_NAME, "type", "__ap"],
+    ) {
+        Ok(_) => {
+            println!(
+                "[done] hotspot: created AP interface {} ({} keeps its managed connection)",
+                AP_IFACE_NAME, wifi_ifname
+            );
+            true
+        }
+        Err(e) => {
+            *failures += 1;
+            println!(
+                "[fail] hotspot: could not create the AP interface on {}: {}",
+                wifi_ifname, e
+            );
+            false
+        }
+    }
+}
+
 /// Masks the host bits out of an "A.B.C.D/plen" address, yielding the subnet
 /// in the same form ("10.42.0.1/24" -> "10.42.0.0/24").
 fn subnet_of(addr: &str) -> Option<String> {
@@ -1095,10 +1131,16 @@ fn setup_hotspot(failures: &mut u32) {
         .unwrap_or_else(|_| "server".to_string());
     let ssid = format!("monux-direct-{}", hostname);
     let psk = gen_psk();
+    // The AP runs on its own virtual interface: binding it to the managed
+    // interface itself would replace the host's WiFi connection (see
+    // AP_IFACE_NAME).
+    if !ensure_ap_interface(&ifname, failures) {
+        return;
+    }
     if let Err(e) = run_cmd(
         "nmcli",
         &[
-            "connection", "add", "type", "wifi", "ifname", &ifname, "con-name", HOTSPOT_CON_NAME,
+            "connection", "add", "type", "wifi", "ifname", AP_IFACE_NAME, "con-name", HOTSPOT_CON_NAME,
             "autoconnect", "yes", "ssid", &ssid,
         ],
     )
@@ -1119,7 +1161,7 @@ fn setup_hotspot(failures: &mut u32) {
         let _ = run_cmd("nmcli", &["connection", "delete", HOTSPOT_CON_NAME]);
         return;
     }
-    println!("[done] hotspot: hosting '{}' (WPA2) on {} — the KVM link now bypasses the router", ssid, ifname);
+    println!("[done] hotspot: hosting '{}' (WPA2) on {} — the KVM link now bypasses the router ({} keeps its normal WiFi)", ssid, AP_IFACE_NAME, ifname);
     verify_ip_forward_still_on(failures);
     handle_vpn_after_up(&tunnels, failures);
     println!("       Join the other machine with: sudo monux system setup --hotspot-join '{}' '{}'", ssid, psk);
@@ -1192,6 +1234,13 @@ fn setup_hotspot_join(ssid: &str, psk: &str, failures: &mut u32) {
 /// profile.
 fn remove_hotspot(failures: &mut u32) {
     remove_vpn_workaround();
+    // The dedicated AP interface (a kernel vif) goes too; absent is fine.
+    if run_cmd("ip", &["link", "show", AP_IFACE_NAME]).is_ok() {
+        match run_cmd("iw", &["dev", AP_IFACE_NAME, "del"]) {
+            Ok(_) => println!("[done] hotspot: removed AP interface {}", AP_IFACE_NAME),
+            Err(e) => println!("[warn] hotspot: could not remove AP interface {}: {}", AP_IFACE_NAME, e),
+        }
+    }
     match std::fs::remove_file(IP_FORWARD_SYSCTL_PATH) {
         Ok(()) => println!(
             "[done] ip forward: removed {} (the live sysctl is left alone — other tools like docker or a VPN may need it on)",
