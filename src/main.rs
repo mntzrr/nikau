@@ -696,6 +696,15 @@ fn main() -> Result<()> {
             }
             let server_lock = single_instance::acquire("server")?;
             settle_after_takeover(&server_lock);
+            // A machine running only a server has no use for the client-side
+            // update-gate file: its content can only be stale history (a
+            // client machine's handshakes re-record it), and a stale entry
+            // vetoes manual updates while the daemon is down (mDNS then finds
+            // no live server to refresh it). Clear it unless a client also
+            // runs here.
+            if single_instance::live_holder("client").is_none() {
+                monux::update::clear_protocol_constraint(&config_dir);
+            }
             if !args.no_auto_update {
                 // The server leads protocol upgrades: no compatibility gate.
                 rt.spawn(monux::autoupdate::run(None));

@@ -255,6 +255,22 @@ fn server_protocol_constraint_fresh(config_dir: &Path, max_age: Duration) -> Opt
     (age <= max_age).then_some(version)
 }
 
+/// Deletes the recorded server protocol version (the update gate file).
+/// Called at server startup when no client runs on this machine: on a pure
+/// server the record is stale history that cannot heal by itself — nothing
+/// ever rewrites it — and it vetoes manual updates while the daemon happens
+/// to be down (mDNS finds no live server to refresh it then).
+pub fn clear_protocol_constraint(config_dir: &Path) {
+    let path = config_dir.join(SERVER_PROTOCOL_VERSION_FILE);
+    match std::fs::remove_file(&path) {
+        Ok(()) => info!(
+            "Cleared the recorded server protocol version: this machine runs only a server, so the client-side update gate does not apply"
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!("Failed to clear the server protocol version gate file: {:?}", e),
+    }
+}
+
 /// The server protocol version to gate an update on: the minimum of the
 /// versions Monux servers currently advertise via mDNS (also recorded, healing
 /// a stale gate file), falling back to the version this client recorded at its
@@ -482,6 +498,22 @@ mod tests {
         // A record not refreshed within the max age is ignored: this is what
         // lets a pure server (nothing rewrites its file) update again.
         assert_eq!(server_protocol_constraint_fresh(&dir, Duration::ZERO), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clear_protocol_constraint_removes_the_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "monux-test-constraint-clear-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        record_server_protocol_version(&dir, 9);
+        assert_eq!(server_protocol_constraint(&dir), Some(9));
+        clear_protocol_constraint(&dir);
+        assert_eq!(server_protocol_constraint(&dir), None);
+        // Idempotent: a missing file is not an error.
+        clear_protocol_constraint(&dir);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
